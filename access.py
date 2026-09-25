@@ -29,6 +29,9 @@
   累计；查询不认证、不老化、不改态。runtime_stats 全局只读快照：同口径
   会话视图、建立新 key 首次计数与万分比成功率、跨用户失败聚合与各池
   总量/占用/可用/保留；查询不认证、不老化、不改态。
+  batch_offline 批量下线：非原子依序下线现存会话（未知记“未知”且不
+  影响后项），原子全存在才提交、有未知则回滚不执行（保留老化）；首果
+  独立域永久缓存，同参重放不改态，不记审计或容量事件。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -720,6 +723,15 @@ _TIMEOUT_NORMAL = "正常"
 _TIMEOUT_OP_INJECT = "超时注入"
 _TIMEOUT_OP_RECOVER = "超时恢复"
 
+# batch_offline 批级结果（提交/部分/回滚）与项结果补充（项“下线”复用
+# 会话状态名 _STATE_OFFLINE，项“回滚”复用 _BATCH_ROLLBACK）。
+_BATCH_COMMIT = "提交"
+_BATCH_PARTIAL = "部分"
+_BATCH_ROLLBACK = "回滚"
+_BATCH_UNKNOWN = "未知"
+# sids 批项数上限。
+_MAX_BATCH = 1000
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -876,6 +888,17 @@ class Sessions:
     认证/资源/状态/后端；池按标识 Unicode 升序，项为标识/总量/占用/可用/
     保留，总量为可用地址数、占用为有效租约数、可用=总量-保留-占用。建立
     更新 O(1)，查询 O(S+Q+U+P log P)、无池时为 O(P) 的空列表。
+    batch_offline(key, sids, now_ms, atomic=False) 批量下线：sids 为
+    1..1000 个互异 sid 的 tuple，now_ms 为非 bool 非负 int，atomic 为
+    bool；类型错 TypeError，值、长度、重复错 ValueError。验 key 后以
+    独立域永久缓存首果（含验参异常），同型同参重放不老化、不改态，
+    异参 ValueError。首次合法调用先老化；非原子依序处理，现存项置
+    下线、期限清零并释放地址租约记“下线”，未知记“未知”且不影响
+    后项；原子先查老化后快照，有未知则未知记“未知”、其余记“回滚”，
+    不执行但保留老化，全存在即提交；未知不抛异常。返回 LF 尾紧凑
+    JSON，顶层键序时刻/原子/结果/项目，结果仅提交/部分/回滚，项目
+    依输入顺序、项结果仅下线/未知/回滚；不记审计或容量事件。时间
+    O(S+B log A)、辅助空间 O(B)。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -964,6 +987,9 @@ class Sessions:
         self._timeout_at = None
         self._timeout_fault_cache = {}
         self._timeout_fault_chain_index = {}
+        # batch_offline 的重放缓存，与 do/meter/capacity/fault/pool_fault/
+        # timeout_fault 分域：key -> (sids, now_ms, atomic, outcome)。
+        self._batch_offline_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -1541,6 +1567,114 @@ class Sessions:
         self._release(session)
         address = "" if self._pools else None
         return self._render(sid, _STATE_OFFLINE, now_ms, 0, address, 0)
+
+    def batch_offline(self, key, sids, now_ms, atomic=False):
+        """批量下线一批会话，返回 LF 结尾的 JSON 字符串。
+
+        key/sid 沿用凭据约束；sids 为含 1..1000 个互异 sid 的 tuple，
+        now_ms 为非 bool 非负 int，atomic 为 bool；类型错 TypeError，
+        值、长度、重复错 ValueError。验 key 后以独立域（与 do/meter/
+        capacity/fault/pool_fault/timeout_fault 分域）永久缓存首果
+        （含验参异常）：同型同参重放不老化、不改态，直接返回或重抛，
+        异参抛 ValueError。首次合法调用先老化；非原子依序处理：现存项
+        置下线、期限清零并释放地址租约记“下线”，未知记“未知”且不影响
+        后项；原子先查老化后快照：有未知项则未知记“未知”、其余记
+        “回滚”，不执行但保留老化，全存在即提交。未知不抛异常。
+        返回 ensure_ascii=False、separators=(',',':') 的 LF 尾 JSON，
+        顶层键序时刻/原子/结果/项目，结果仅提交/部分/回滚（全成功、
+        非原子含未知、原子含未知），项目依输入顺序，项为会话/结果，
+        项结果仅下线/未知/回滚；不记审计或容量事件。时间
+        O(S+B log A)、辅助空间 O(B)，S/B/A 为会话/批项/池地址数。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_offline_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不改态，仅按缓存返回或重抛。
+            c_sids, c_now_ms, c_atomic, outcome = cached
+            if not _strict_equal(
+                (sids, now_ms, atomic), (c_sids, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存。
+        try:
+            self._validate_batch_offline_params(sids, now_ms, atomic)
+        except (TypeError, ValueError) as exc:
+            self._batch_offline_cache[key] = (
+                sids,
+                now_ms,
+                atomic,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 首次合法调用先老化。
+        self._age(now_ms)
+
+        if atomic:
+            # 先查老化后快照：有未知项则不执行（保留老化），全存在即提交。
+            missing = {sid for sid in sids if sid not in self._sessions}
+            if missing:
+                items = [
+                    {
+                        "会话": sid,
+                        "结果": _BATCH_UNKNOWN if sid in missing else _BATCH_ROLLBACK,
+                    }
+                    for sid in sids
+                ]
+                result = _BATCH_ROLLBACK
+            else:
+                for sid in sids:
+                    self._batch_offline_session(sid)
+                items = [{"会话": sid, "结果": _STATE_OFFLINE} for sid in sids]
+                result = _BATCH_COMMIT
+        else:
+            items = []
+            any_unknown = False
+            for sid in sids:
+                if sid in self._sessions:
+                    self._batch_offline_session(sid)
+                    items.append({"会话": sid, "结果": _STATE_OFFLINE})
+                else:
+                    # 未知不影响后项。
+                    items.append({"会话": sid, "结果": _BATCH_UNKNOWN})
+                    any_unknown = True
+            result = _BATCH_PARTIAL if any_unknown else _BATCH_COMMIT
+
+        payload = {"时刻": now_ms, "原子": atomic, "结果": result, "项目": items}
+        output = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._batch_offline_cache[key] = (sids, now_ms, atomic, ("ok", output))
+        return output
+
+    @staticmethod
+    def _validate_batch_offline_params(sids, now_ms, atomic):
+        """校验 batch_offline 三参数：sids 为 1..1000 个互异凭据 sid 的
+        tuple，now_ms 为非 bool 非负 int，atomic 为 bool。"""
+        if not isinstance(sids, tuple):
+            raise TypeError(f"sids must be a tuple, got {type(sids).__name__}")
+        for sid in sids:
+            _check_credential("sid", sid)
+        if not (1 <= len(sids) <= _MAX_BATCH):
+            raise ValueError(
+                f"sids must contain 1..{_MAX_BATCH} items, got {len(sids)}"
+            )
+        if len(set(sids)) != len(sids):
+            raise ValueError("sids must be distinct")
+        _check_int("now_ms", now_ms, 0)
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
+
+    def _batch_offline_session(self, sid):
+        """置下线、期限清零并释放地址租约；调用前须确认 sid 存在。"""
+        session = self._sessions[sid]
+        session["state"] = _STATE_OFFLINE
+        session["deadline"] = 0
+        self._release(session)
 
     def pool_stats(self, now_ms):
         """返回各池占用统计 JSON；无池抛 StateError，否则先老化再统计。"""
