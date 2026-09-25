@@ -6,7 +6,7 @@
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
   export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
-  令牌桶加配额计量 meter）。
+  令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -508,7 +508,11 @@ class Sessions:
     不受配置替换影响，新配置仅作用于后续操作与查询。qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
     会话所绑模板做令牌桶加配额计量：通过则提交累计，超限取模板动作
-    （拒绝不提交，下线原子清场），重放缓存与 do 分域。
+    （拒绝不提交，下线原子清场），重放缓存与 do 分域。meter 新 key 首次
+    返回 通过/拒绝/下线 时按当时会话用户与当次模板标识各记一次统计
+    （通过另累计字节），异常、同参重放与异参 key 复用均不记，配置热
+    加载或回滚不迁移历史计数；meter_stats(now_ms, group) 按用户或模板
+    分组汇总历史计数与老化后在线会话数。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -548,6 +552,11 @@ class Sessions:
         self._chain_tail = "0" * 64
         # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None。
         self._rollback = None
+        # 计量统计：用户/模板标识 -> [通过, 拒绝, 下线, 通过字节]；
+        # 仅 meter 新 key 首次返回 通过/拒绝/下线 时记一次，配置热加载
+        # 或回滚不迁移历史计数。
+        self._meter_user_stats = {}
+        self._meter_template_stats = {}
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -1118,7 +1127,78 @@ class Sessions:
                 session["deadline"] = 0
                 self._release(session)
             # 拒绝：不提交任何计量态。
+        # 事件按当时会话用户与当次模板标识各记一次；下线时计数与会话、
+        # 地址、租约同点提交，中间无异常点，天然原子。
+        self._record_meter(user, template_id, result, size)
         return self._render_meter(sid, now_ms, size, result, used)
+
+    def _record_meter(self, user, template_id, result, size):
+        """按用户组与模板组各记一次计量事件，O(1) 时空。
+
+        通过累加次数与 size 字节，拒绝与下线仅累加各自次数；历史计数
+        存于会话之外，配置热加载或回滚不迁移。
+        """
+        for stats, ident in (
+            (self._meter_user_stats, user),
+            (self._meter_template_stats, template_id),
+        ):
+            entry = stats.get(ident)
+            if entry is None:
+                entry = stats[ident] = [0, 0, 0, 0]
+            if result == "通过":
+                entry[0] += 1
+                entry[3] += size
+            elif result == "拒绝":
+                entry[1] += 1
+            else:
+                entry[2] += 1
+
+    def meter_stats(self, now_ms, group="用户"):
+        """返回计量统计 JSON；先验参再老化，O(S+GlogG) 时间、O(G) 空间。
+
+        now_ms 为非 bool 非负 int，group 为 str 且仅“用户”或“模板”；
+        类型错抛 TypeError，group 取值错抛 ValueError。汇总老化后状态
+        恰为在线的会话与有历史计数的标识之并：用户组按会话用户，模板组
+        按查询时生效绑定（未绑定归入空串标识）。项按标识 Unicode 码点
+        升序，键序为“标识/在线/通过/拒绝/下线/通过字节”；顶层键序为
+        “时刻/分组/汇总”。
+        """
+        _check_int("now_ms", now_ms, 0)
+        if not isinstance(group, str):
+            raise TypeError(f"group must be a str, got {type(group).__name__}")
+        if group not in ("用户", "模板"):
+            raise ValueError(f"group must be 用户 or 模板, got {group!r}")
+
+        self._age(now_ms)
+        stats = (
+            self._meter_user_stats if group == "用户" else self._meter_template_stats
+        )
+        online = {}
+        for session in self._sessions.values():
+            if session["state"] != _STATE_ONLINE:
+                continue
+            if group == "用户":
+                ident = session["user"]
+            else:
+                # 查询时生效绑定；未绑定归入空串标识。
+                ident = self._user_templates.get(session["user"], "")
+            online[ident] = online.get(ident, 0) + 1
+
+        summary = []
+        for ident in sorted(set(stats) | set(online)):
+            passed, denied, offlined, passed_bytes = stats.get(ident, (0, 0, 0, 0))
+            summary.append(
+                {
+                    "标识": ident,
+                    "在线": online.get(ident, 0),
+                    "通过": passed,
+                    "拒绝": denied,
+                    "下线": offlined,
+                    "通过字节": passed_bytes,
+                }
+            )
+        payload = {"时刻": now_ms, "分组": group, "汇总": summary}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
