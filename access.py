@@ -29,6 +29,9 @@
   累计；查询不认证、不老化、不改态。runtime_stats 全局只读快照：同口径
   会话视图、建立新 key 首次计数与万分比成功率、跨用户失败聚合与各池
   总量/占用/可用/保留；查询不认证、不老化、不改态。
+- Sessions.batch_offline 批量下线：按 key 独立重放缓存，首果（含参数异常）
+  永久缓存；首次合法先老化，非原子逐项下线/未知、原子全存在才提交否则整批
+  回滚（保留老化），不记审计或容量事件。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -720,6 +723,14 @@ _TIMEOUT_NORMAL = "正常"
 _TIMEOUT_OP_INJECT = "超时注入"
 _TIMEOUT_OP_RECOVER = "超时恢复"
 
+# batch_offline 批量下线：单批 sid 数上界。
+_BATCH_MAX_SIDS = 1000
+# 顶层结果仅 提交/部分/回滚；项结果沿用 "下线"（_STATE_OFFLINE）、
+# "未知"（_CAP_UNKNOWN），回滚为 "回滚"。
+_BATCH_COMMIT = "提交"
+_BATCH_PARTIAL = "部分"
+_BATCH_ROLLBACK = "回滚"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -876,6 +887,17 @@ class Sessions:
     认证/资源/状态/后端；池按标识 Unicode 升序，项为标识/总量/占用/可用/
     保留，总量为可用地址数、占用为有效租约数、可用=总量-保留-占用。建立
     更新 O(1)，查询 O(S+Q+U+P log P)、无池时为 O(P) 的空列表。
+    batch_offline(key, sids, now_ms, atomic=False) 批量下线：key/sid 沿用
+    凭据约束，sids 为 1..1000 个互异 sid 的 tuple，now_ms 为非 bool 非负
+    int，atomic 为 bool；类型错 TypeError，取值/长度/重复错 ValueError。
+    验 key 后以独立域永久缓存首果（含参数异常），同型同参重放不老化、不改态，
+    异参 ValueError。首次合法先老化；非原子逐项处理，现存项（在线/挂起/
+    下线墓碑）置下线、期限 0、释放地址租约并记“下线”，未知记“未知”不影响
+    后项；原子先查老化后快照，有未知则未知记“未知”、其余记“回滚”且不执行
+    （保留老化），全存在才提交。未知不抛异常；不记审计或容量事件。返回键序
+    时刻/原子/结果/项目的 LF 尾紧凑 JSON，结果仅提交/部分/回滚，项为
+    会话/结果（下线/未知/回滚）。首次 O(S+B log A) 时间、O(B) 辅助空间，
+    S/B/A 为会话/批项/池地址数。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -964,6 +986,9 @@ class Sessions:
         self._timeout_at = None
         self._timeout_fault_cache = {}
         self._timeout_fault_chain_index = {}
+        # batch_offline 批量下线的重放缓存，与 do/meter/capacity/fault/
+        # pool_fault/timeout_fault 分域：key -> (sids, now_ms, atomic, outcome)。
+        self._batch_offline_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -2126,6 +2151,164 @@ class Sessions:
         # 触发后清除待触发值。
         self._timeout_at = None
         return [order for _sid, order in timed_out]
+
+    def batch_offline(self, key, sids, now_ms, atomic=False):
+        """批量下线一批会话，返回 LF 结尾的 JSON 字符串。
+
+        key 沿用凭据约束；sids 为含 1..1000 个互异 sid 的 tuple（sid 沿用
+        凭据约束）；now_ms 为非 bool 非负 int，atomic 为 bool。依序校验：
+        类型错 TypeError，取值、长度、重复 sid 错 ValueError。key 有效后以
+        独立域（与 do/meter/capacity/fault/pool_fault/timeout_fault 分域）
+        永久缓存首果（含参数异常）：同型同参重放不老化、不改态，直接返回或
+        重抛；异参抛 ValueError。
+
+        首次合法调用先老化（在线期限到先挂起释址、租期到释址）。非原子时依
+        输入顺序逐项处理：现存项（在线/挂起/下线墓碑）置下线、期限 0 并释放
+        地址租约，记“下线”；未知 sid 记“未知”，不影响后项。原子时基于老化
+        后快照先查全部项：有未知项则未知项记“未知”、其余现存项记“回滚”，
+        不执行任何下线（但保留老化结果）；全部存在才逐项提交下线。未知不抛
+        异常。不记审计或容量事件。返回顶层键序“时刻/原子/结果/项目”：结果
+        仅提交（全部项处理成功）、部分（非原子含未知）、回滚（原子含未知）；
+        项目依输入顺序，项键序“会话/结果”，项结果仅下线/未知/回滚。首次
+        调用 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_offline_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不下线、不记审计/事件，仅按缓存返回或重抛。
+            c_sids, c_now_ms, c_atomic, outcome = cached
+            if not _strict_equal(
+                (sids, now_ms, atomic), (c_sids, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存；校验失败不老化、不改态。
+        try:
+            self._validate_batch_offline_params(sids, now_ms, atomic)
+        except (TypeError, ValueError) as exc:
+            self._batch_offline_cache[key] = (
+                sids,
+                now_ms,
+                atomic,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 首次合法调用：先老化（与其他写接口一致，老化先于业务处理）。
+        self._age(now_ms)
+
+        if atomic:
+            items, commit = self._batch_offline_atomic(sids)
+        else:
+            items, commit = self._batch_offline_sequential(sids)
+        if commit:
+            result = _BATCH_COMMIT
+        else:
+            result = _BATCH_PARTIAL if not atomic else _BATCH_ROLLBACK
+        output = self._render_batch_offline(now_ms, atomic, result, items)
+        self._batch_offline_cache[key] = (
+            sids,
+            now_ms,
+            atomic,
+            ("ok", output),
+        )
+        return output
+
+    @staticmethod
+    def _validate_batch_offline_params(sids, now_ms, atomic):
+        """校验 batch_offline 三参数：类型错先于取值/长度/重复错。
+
+        sids 须为 tuple，含 1..1000 个满足凭据约束且互异的 sid；now_ms 为
+        非 bool 非负 int；atomic 为 bool。类型阶段先查容器/各 sid/now_ms/
+        atomic 的类型；取值阶段依序查 sid 取值与 now_ms 下界、长度上下界、
+        sid 重复。
+        """
+        # 类型阶段：任一类型错先于任何取值错抛出。
+        if not isinstance(sids, tuple):
+            raise TypeError(f"sids must be a tuple, got {type(sids).__name__}")
+        for sid in sids:
+            if not isinstance(sid, str):
+                raise TypeError(
+                    f"sid must be a str, got {type(sid).__name__}"
+                )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
+
+        # 取值阶段：值、长度、重复。
+        for sid in sids:
+            _check_credential("sid", sid)
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(sids) <= _BATCH_MAX_SIDS):
+            raise ValueError(
+                f"sids must contain 1..{_BATCH_MAX_SIDS} items, got {len(sids)}"
+            )
+        if len(set(sids)) != len(sids):
+            raise ValueError("sids must not contain duplicate sid")
+
+    def _batch_offline_sequential(self, sids):
+        """非原子逐项处理：现存项下线释址记“下线”，未知记“未知”，不影响后项。
+
+        返回 (items, commit)：commit 恒为是否无未知项。
+        """
+        items = []
+        commit = True
+        for sid in sids:
+            session = self._sessions.get(sid)
+            if session is None:
+                items.append({"会话": sid, "结果": _CAP_UNKNOWN})
+                commit = False
+                continue
+            # 现存项（在线/挂起/下线墓碑）：置下线、期限 0 并释放地址租约。
+            session["state"] = _STATE_OFFLINE
+            session["deadline"] = 0
+            self._release(session)
+            items.append({"会话": sid, "结果": _STATE_OFFLINE})
+        return items, commit
+
+    def _batch_offline_atomic(self, sids):
+        """原子批量：基于老化后快照先查全部项。
+
+        有未知项则不执行任何下线（保留老化结果），未知记“未知”、现存记
+        “回滚”，commit=False；全部存在才逐项提交下线，commit=True。
+        返回 (items, commit)。
+        """
+        unknown = [sid for sid in sids if sid not in self._sessions]
+        if unknown:
+            unknown_set = set(unknown)
+            items = [
+                {"会话": sid, "结果": _CAP_UNKNOWN if sid in unknown_set else _BATCH_ROLLBACK}
+                for sid in sids
+            ]
+            return items, False
+        # 全部存在：逐项提交下线（置下线、期限 0、释放地址租约）。
+        items = []
+        for sid in sids:
+            session = self._sessions[sid]
+            session["state"] = _STATE_OFFLINE
+            session["deadline"] = 0
+            self._release(session)
+            items.append({"会话": sid, "结果": _STATE_OFFLINE})
+        return items, True
+
+    @staticmethod
+    def _render_batch_offline(now_ms, atomic, result, items):
+        # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
+        # 结果为 str，项目为项（会话/结果）列表，依输入顺序。
+        payload = {
+            "时刻": now_ms,
+            "原子": atomic,
+            "结果": result,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def fault_stats(self, now_ms):
         """返回后端故障统计 JSON；查询不认证、不老化、不改退避、不审计、
