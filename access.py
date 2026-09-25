@@ -4,7 +4,7 @@
 - Authenticator：带失败计数与锁定的用户认证器。
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
-  takeover_audit）。
+  takeover_audit、防篡改审计链 audit/verify_audit）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -259,7 +259,10 @@ class Sessions:
     在两池间原子换址。接管先老化：旧会话持址则新会话继承其池/地址/租约，
     无址则自 default 池新分配，租期 = now_ms+lease_ms；认证或资源失败仅保留
     老化结果。按 key 永久缓存重放。takeover_audit 记录首次成功/认证失败/资源
-    失败及同参重放，查询不老化。
+    失败及同参重放，查询不老化。do 验参后的首次结果（成功或
+    AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
+    审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
+    参数错与异参 key 重放不入链。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -285,6 +288,11 @@ class Sessions:
         # 接管审计事件追加序列（序号自 1）；key -> 首次事件序号，供重放指认。
         self._audit_events = []
         self._audit_index = {}
+        # 防篡改审计链：事件九元组序列（序号自 1）、key -> 首次事件序号、
+        # 末项哈希（空链为 64 个 0，即首项前哈希）。
+        self._chain_events = []
+        self._chain_index = {}
+        self._chain_tail = "0" * 64
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -315,6 +323,17 @@ class Sessions:
             if c_op == _OP_TAKEOVER and key in self._audit_index:
                 self._audit_append(
                     key, c_args[0], c_sid, "重放", now_ms, self._audit_index[key]
+                )
+            # 防篡改链：可记结果（成功/四类异常）的同参重放沿用首次结果入链，
+            # 原序号指认首次事件；参数错重放不在链索引中，自然跳过。
+            chain_origin = self._chain_index.get(key)
+            if chain_origin is not None:
+                if outcome[0] == "ok":
+                    chain_result = "成功"
+                else:
+                    chain_result = outcome[1][0].__name__
+                self._chain_append(
+                    key, c_op, c_sid, chain_result, now_ms, chain_origin
                 )
             if outcome[0] == "ok":
                 return outcome[1]
@@ -361,10 +380,13 @@ class Sessions:
             if is_takeover and isinstance(exc, (AuthError, ResourceError)):
                 verdict = "认证失败" if isinstance(exc, AuthError) else "资源失败"
                 self._audit_append(key, args[0], sid, verdict, now_ms)
+            # 防篡改链：验参后的四类异常结果均入链（参数错已在上方提前返回）。
+            self._chain_append(key, op, sid, type(exc).__name__, now_ms)
             raise
         self._cache[key] = (op, sid, args, now_ms, ("ok", result))
         if is_takeover:
             self._audit_append(key, args[0], sid, "成功", now_ms)
+        self._chain_append(key, op, sid, "成功", now_ms)
         return result
 
     def _validate_params(self, op, sid, args, now_ms):
@@ -748,6 +770,95 @@ class Sessions:
         next_seq = window[-1][0] if window else after
         payload = {"下个序号": next_seq, "事件": events}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    @staticmethod
+    def _chain_hash(seq, now_ms, key, op, sid, result, origin, prev_hash):
+        """由前八字段（键序固定）的紧凑 JSON 之 UTF-8 字节算 sha256 十六进制串。"""
+        head = {
+            "序号": seq,
+            "时刻": now_ms,
+            "键": key,
+            "操作": op,
+            "会话": sid,
+            "结果": result,
+            "原序号": origin,
+            "前哈希": prev_hash,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _chain_append(self, key, op, sid, result, now_ms, origin=0):
+        """追加一条防篡改审计事件，O(1) 时空。
+
+        序号自 1 递增；首次事件登记 key -> 序号且原序号为 0，重放事件沿用
+        首次结果、原序号指认首次事件序号。前哈希首项为 64 个 0，余取前项哈希。
+        """
+        seq = len(self._chain_events) + 1
+        prev_hash = self._chain_tail
+        digest = self._chain_hash(
+            seq, now_ms, key, op, sid, result, origin, prev_hash
+        )
+        if origin == 0:
+            self._chain_index[key] = seq
+        self._chain_events.append(
+            (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
+        )
+        self._chain_tail = digest
+
+    def audit(self, after=0, limit=100):
+        """返回防篡改审计事件 JSON；查询不老化，O(limit) 时空。
+
+        取序号 > after 的前 limit 项。after/limit 须为非 bool 的 int：类型不符
+        TypeError，after<0 或 limit ∉ [1,1000] 抛 ValueError。顶层键序为
+        “下个序号/事件”，游标为末项序号、无项为 after；事件键序为
+        “序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希”，序号/时刻/原序号
+        为 int，余为 str。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        # 序号即位置+1，序号 > after 的事件自下标 after 起，直接切片。
+        window = self._chain_events[after : after + limit]
+        events = [
+            {
+                "序号": seq,
+                "时刻": now_ms,
+                "键": key,
+                "操作": op,
+                "会话": sid,
+                "结果": result,
+                "原序号": origin,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for seq, now_ms, key, op, sid, result, origin, prev_hash, digest in window
+        ]
+        # 有项取下一序号为末项序号，无项取 after。
+        next_seq = window[-1][0] if window else after
+        payload = {"下个序号": next_seq, "事件": events}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def verify_audit(self):
+        """校验审计链序号连续、前哈希衔接、哈希无误；空链为 True。
+
+        O(N) 时间、O(1) 空间：逐项重算，不另建序列。
+        """
+        prev_hash = "0" * 64
+        for expect, event in enumerate(self._chain_events, start=1):
+            seq, now_ms, key, op, sid, result, origin, stored_prev, digest = event
+            if seq != expect or stored_prev != prev_hash:
+                return False
+            if (
+                self._chain_hash(
+                    seq, now_ms, key, op, sid, result, origin, stored_prev
+                )
+                != digest
+            ):
+                return False
+            prev_hash = digest
+        return True
 
     @staticmethod
     def _render(sid, state, now_ms, deadline, address=None, lease=0):
