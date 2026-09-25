@@ -13,6 +13,10 @@
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
+  pool_fault 注入/恢复指定地址池的可恢复耗尽演练（不改真实租约及配置）：
+  注入期该池视为无可分配地址，建立、迁入、无址接管在既有认证与老化后抛
+  ResourceError，capacity 申请排队、推进跳过，到刻自动正常；首果独立域
+  永久缓存，首次成功与重放写防篡改审计链（池注入/池恢复）。
   user_stats 按用户只读快照：按 now_ms 取视图（在线期限到计挂起、租期或
   期限到不计占用、队项截止到不计排队、墓碑计下线），并给出该用户
   do/meter/capacity 新 key 首次且已定位用户的认证/资源/状态/后端失败
@@ -696,6 +700,13 @@ _OP_RECOVER = "恢复"
 _BACKEND_FAULT = "故障"
 _BACKEND_NORMAL = "正常"
 
+# pool_fault 池演练状态：仅耗尽/正常。
+_POOL_EXHAUSTED = "耗尽"
+_POOL_NORMAL = "正常"
+# pool_fault 入防篡改审计链的操作名。
+_POOL_OP_INJECT = "池注入"
+_POOL_OP_RECOVER = "池恢复"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -805,6 +816,21 @@ class Sessions:
     后端检查抛 BackendError 时计数（now_ms<retry_at 归退避，否则归
     故障），注入/恢复/配置变更不清零；查询不认证、不老化、不改退避、
     不审计、不记事件、不动缓存，O(U) 时间、O(1) 辅助空间。
+    pool_fault(key, op, pool, ms, now_ms) 对指定地址池做可恢复耗尽演练，
+    不改真实租约及配置：key/pool 沿用凭据约束，op 仅注入/恢复，注入 ms
+    为非 bool 正 int、置截至 now_ms+ms，恢复 ms 须为 None 并清零，
+    now_ms 为非 bool 非负 int；类型、值、未知池错依次抛 TypeError、
+    ValueError、KeyError，校验失败不改池状态。后续同池调用可覆盖。
+    now_ms < 截至时该池无可分配地址、到刻（含同刻）自动正常：既有租约、
+    续租、下线及从该池迁出不受影响，建立、迁入、无址接管在既有认证与
+    老化后抛 ResourceError，capacity 申请排队、推进跳过，均不半分配，
+    真实耗尽行为不变。成功 JSON 键序“池/状态/时刻/截至”，状态仅
+    耗尽/正常，恢复截至 0，序列化沿基线。验 key 后以独立域永久缓存
+    余参与首次成败（含验参异常与未知池），同参重放不改状态、异参
+    ValueError；首次成功及成功重放写现有防篡改审计链，操作池注入/池
+    恢复、会话记 pool，结果成功/重放、原序号沿用，异常不记。配置加载/
+    回滚成功后保留同名池故障、清除已删池，失败不改故障。故障判定及
+    变更 O(1) 时空。
     user_stats(user, now_ms) 返回按用户只读快照 JSON：按 now_ms 取视图
     （不老化），在线期限 <= now_ms 计挂起，租期或期限 <= now_ms 不计
     占用，队项截止 <= now_ms 不计排队，墓碑计下线；失败为该用户
@@ -893,6 +919,15 @@ class Sessions:
         # 后端失败累计 [故障, 退避]：仅新 key 首次后端检查抛 BackendError
         # 时按类归计；注入/恢复/配置变更不清零。
         self._fault_fail = [0, 0]
+        # 地址池可恢复耗尽演练：pool_id -> 截至时刻（不存即无演练）；
+        # now_ms < 截至时该池视为无可分配地址，既有租约、续租、下线与从该池
+        # 迁出不受影响，到刻自动正常。pool_fault 的重放缓存与 do/meter/
+        # capacity/fault 分域：key -> (pool, op, ms, now_ms, outcome)。
+        self._pool_fault = {}
+        self._pool_fault_cache = {}
+        # pool_fault 写现有防篡改链，但原序号索引与 do 分域，避免同名字符串
+        # key 跨域互相指认首次事件。
+        self._pool_fault_chain_index = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -1192,17 +1227,25 @@ class Sessions:
                     user_count += 1
         return total_count, user_count
 
-    def _default_candidate(self, user):
+    def _pool_is_exhausted(self, pool_id, now_ms):
+        """池耗尽演练判定，O(1) 时空：注入后 now_ms < 截至即视为无可分配
+        地址，到刻（含同刻）自动正常；不演练或已恢复无记录。只读不改态。"""
+        until = self._pool_fault.get(pool_id)
+        return until is not None and now_ms < until
+
+    def _default_candidate(self, user, now_ms):
         """判定 default 池此刻能否为 user 取址，不改动任何状态。
 
         返回 (pool_id, ip)：(None, None) 表示缺 default 池；
-        ("default", None) 表示有池但动态耗尽或静态址已占用；
-        ip 非 None 为可取址（动态仅窥堆顶、不弹出），落库由
-        _commit_session 完成。
+        ("default", None) 表示有池但动态耗尽、静态址已占用或池处于耗尽
+        演练（now_ms < 注入截至）；ip 非 None 为可取址（动态仅窥堆顶、
+        不弹出），落库由 _commit_session 完成。
         """
         pool = self._pools.get(_DEFAULT_POOL_ID)
         if pool is None:
             return None, None
+        if self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
+            return _DEFAULT_POOL_ID, None
         ip_int = pool.static.get(user)
         if ip_int is None:
             ip_int = pool.free[0] if pool.free else None
@@ -1249,11 +1292,13 @@ class Sessions:
             raise StateError(f"duplicate sid: {sid!r}")
 
         # 建立须经 default 池分配地址；缺 default 池为 StateError。
-        pool_id, ip_int = self._default_candidate(user)
+        pool_id, ip_int = self._default_candidate(user, now_ms)
         if pool_id is None:
             raise StateError("no default pool: cannot establish session")
         if ip_int is None:
             pool = self._pools[pool_id]
+            if self._pool_is_exhausted(pool_id, now_ms):
+                raise ResourceError("address pool exhausted")
             static_ip = pool.static.get(user)
             if static_ip is not None:
                 raise ResourceError(
@@ -1315,6 +1360,11 @@ class Sessions:
         _, status, _ = self._auth.authenticate(user, password, now_ms)
         if status != "ok":
             raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        # 耗尽演练：目标池在注入期视为无址可分配，先于任何池变更，无半换址。
+        # 从故障池迁出不受影响（仅查目标池）。
+        if self._pool_is_exhausted(target, now_ms):
+            raise ResourceError(f"target pool {target!r} exhausted")
 
         source_pool = self._pools[source_id]
         old_ip = session["ip"]
@@ -1393,6 +1443,8 @@ class Sessions:
             pool = self._pools.get(_DEFAULT_POOL_ID)
             if pool is None:
                 raise StateError("no default pool: cannot assign address")
+            if self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
+                raise ResourceError("address pool exhausted")
             ip_int = pool.static.get(user)
             if ip_int is None:
                 if not pool.free:
@@ -1748,6 +1800,146 @@ class Sessions:
     def _render_fault(state, now_ms, until):
         # 键序：状态、时刻、截至；状态为 str，余为 int。
         payload = {"状态": state, "时刻": now_ms, "截至": until}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def pool_fault(self, key, op, pool, ms, now_ms):
+        """对指定地址池注入可恢复耗尽演练或恢复，返回 LF 结尾 JSON。
+
+        不改真实租约与配置，仅令该池在注入期被视为无可分配地址。key/pool
+        沿用凭据约束；op 仅“注入/恢复”：注入 ms 为非 bool 正 int，置截至
+        = now_ms+ms，恢复 ms 须为 None 并清零（移除演练）；now_ms 为非 bool
+        非负 int。类型、值、未知池错依次抛 TypeError、ValueError、KeyError，
+        校验失败不改池状态。后续同池调用可覆盖。now_ms < 截至时该池无可
+        分配地址、到刻（含同刻）自动正常；既有租约、续租、下线及从该池迁出
+        不受影响，建立、迁入、无址接管在既有认证与老化后抛 ResourceError，
+        capacity 申请排队、推进跳过，均不半分配。
+
+        成功 JSON 键序“池/状态/时刻/截至”，状态仅“耗尽/正常”，恢复截至为 0。
+        验 key 后以独立域（与 do/meter/capacity/fault 分域）永久缓存余参与
+        首次成败（含验参异常与未知池）：同参重放不改状态、直接返回或重抛，
+        异参抛 ValueError。首次成功及成功的同参重放写现有防篡改审计链：
+        操作“池注入/池恢复”、会话记 pool，结果“成功/重放”，重放原序号沿用
+        首次；异常不记。配置加载/回滚成功后保留同名池故障、清除已删池。
+        故障判定与变更均 O(1) 时空。
+        """
+        _check_credential("key", key)
+
+        cached = self._pool_fault_cache.get(key)
+        if cached is not None:
+            # 重放：不改池故障态，仅按缓存返回或重抛。
+            c_op, c_pool, c_ms, c_now_ms, outcome = cached
+            if not _strict_equal(
+                (op, pool, ms, now_ms), (c_op, c_pool, c_ms, c_now_ms)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 仅首次成功的同参重放入链记“重放”，原序号沿用首次；
+            # 首次异常不在本域链索引中，自然跳过。
+            origin = self._pool_fault_chain_index.get(key)
+            if origin is not None:
+                chain_op = (
+                    _POOL_OP_INJECT if c_op == _OP_INJECT else _POOL_OP_RECOVER
+                )
+                self._chain_append(
+                    key,
+                    chain_op,
+                    c_pool,
+                    "重放",
+                    now_ms,
+                    origin,
+                    self._pool_fault_chain_index,
+                )
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存；校验失败不改池故障态。
+        try:
+            self._validate_pool_fault_params(op, pool, ms, now_ms)
+        except (TypeError, ValueError) as exc:
+            self._pool_fault_cache[key] = (
+                op,
+                pool,
+                ms,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 类型、值校验全过后方查池存在：未知池 KeyError（业务失败，缓存、不审计）。
+        if pool not in self._pools:
+            exc = KeyError(f"unknown pool: {pool!r}")
+            self._pool_fault_cache[key] = (
+                op,
+                pool,
+                ms,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise exc
+
+        if op == _OP_INJECT:
+            until = now_ms + ms
+            self._pool_fault[pool] = until
+            state = _POOL_EXHAUSTED
+            chain_op = _POOL_OP_INJECT
+        else:
+            self._pool_fault.pop(pool, None)
+            until = 0
+            state = _POOL_NORMAL
+            chain_op = _POOL_OP_RECOVER
+        result = self._render_pool_fault(pool, state, now_ms, until)
+        self._pool_fault_cache[key] = (
+            op,
+            pool,
+            ms,
+            now_ms,
+            ("ok", result),
+        )
+        self._chain_append(
+            key,
+            chain_op,
+            pool,
+            "成功",
+            now_ms,
+            index=self._pool_fault_chain_index,
+        )
+        return result
+
+    @staticmethod
+    def _validate_pool_fault_params(op, pool, ms, now_ms):
+        """校验 pool_fault 四参数：类型错先于值错，未知池由调用方查。
+
+        op 限注入/恢复，pool 为凭据约束的池标识，注入 ms 为非 bool 正 int、
+        恢复 ms 须为 None（任何非 None 皆值错），now_ms 为非 bool 非负 int。
+        """
+        # 类型阶段：任一类型错先于任何值错抛出。
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if not isinstance(pool, str):
+            raise TypeError(f"pool must be a str, got {type(pool).__name__}")
+        if op == _OP_INJECT and (isinstance(ms, bool) or not isinstance(ms, int)):
+            raise TypeError(f"ms must be an int, got {type(ms).__name__}")
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值阶段。
+        if op not in (_OP_INJECT, _OP_RECOVER):
+            raise ValueError(f"op must be one of 注入/恢复, got {op!r}")
+        # pool 已确认为 str，此处仅做凭据取值（字节长度、U+0000）校验。
+        _check_credential("pool", pool)
+        if op == _OP_INJECT:
+            if ms < 1:
+                raise ValueError(f"ms must be >= 1, got {ms}")
+        elif ms is not None:
+            raise ValueError(f"ms must be None for 恢复, got {ms!r}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+
+    @staticmethod
+    def _render_pool_fault(pool, state, now_ms, until):
+        # 键序：池、状态、时刻、截至；池/状态为 str，余为 int。
+        payload = {"池": pool, "状态": state, "时刻": now_ms, "截至": until}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def fault_stats(self, now_ms):
@@ -2139,7 +2331,7 @@ class Sessions:
         # 截止对在线与排队一致：申请时刻 + 等待。
         deadline = now_ms + wait
         total_count, user_count = self._capacity_counts(user)
-        pool_id, ip_int = self._default_candidate(user)
+        pool_id, ip_int = self._default_candidate(user, now_ms)
         servable = (
             total_count < self._total
             and user_count < self._per
@@ -2201,7 +2393,7 @@ class Sessions:
         for queued_sid in survivors:
             entry = self._capacity_queue[queued_sid]
             user = entry[0]
-            pool_id, ip_int = self._default_candidate(user)
+            pool_id, ip_int = self._default_candidate(user, now_ms)
             if (
                 total_count < self._total
                 and per_user.get(user, 0) < self._per
@@ -3259,6 +3451,13 @@ class Sessions:
         self._user_templates = dict(user_templates)
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
+        # 配置加载/回滚成功后保留同名池的耗尽演练、清除已删池（截至不改）；
+        # 加载失败不经过本方法，故障态不变。
+        self._pool_fault = {
+            pool_id: until
+            for pool_id, until in self._pool_fault.items()
+            if pool_id in new_pools
+        }
 
     def load_config(self, text):
         """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v4 JSON。
@@ -3360,19 +3559,23 @@ class Sessions:
         blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-    def _chain_append(self, key, op, sid, result, now_ms, origin=0):
+    def _chain_append(self, key, op, sid, result, now_ms, origin=0, index=None):
         """追加一条防篡改审计事件，O(1) 时空。
 
         序号自 1 递增；首次事件登记 key -> 序号且原序号为 0，重放事件沿用
         首次结果、原序号指认首次事件序号。前哈希首项为 64 个 0，余取前项哈希。
+        index 给定时写入该域的 key -> 首次序号索引（供 pool_fault 与 do 分域
+        指认），缺省用 do 的 _chain_index；事件始终追加到同一条链。
         """
+        if index is None:
+            index = self._chain_index
         seq = len(self._chain_events) + 1
         prev_hash = self._chain_tail
         digest = self._chain_hash(
             seq, now_ms, key, op, sid, result, origin, prev_hash
         )
         if origin == 0:
-            self._chain_index[key] = seq
+            index[key] = seq
         self._chain_events.append(
             (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
         )
