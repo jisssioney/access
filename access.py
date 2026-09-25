@@ -6,7 +6,8 @@
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
   export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
-  令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats）。
+  令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats、容量申请
+  capacity：1024 项等待队列的申请/取消/推进，截止超时与按入队序晋升）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -453,6 +454,16 @@ _OP_TAKEOVER = "接管"
 
 _DEFAULT_POOL_ID = "default"
 
+# capacity 操作与其结果；结果仅限在线/排队/取消/超时。
+_OP_APPLY = "申请"
+_OP_CANCEL = "取消"
+_OP_ADVANCE = "推进"
+_CAP_ONLINE = "在线"
+_CAP_QUEUED = "排队"
+_CAP_CANCELLED = "取消"
+_CAP_TIMEOUT = "超时"
+_MAX_QUEUE = 1024
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -512,7 +523,12 @@ class Sessions:
     结果为通过/拒绝/下线时按当时会话用户与当次模板标识各记一次统计
     （通过另计字节），配置热加载或回滚不迁移历史计数；meter_stats
     (now_ms, group) 老化后按用户或查询时生效绑定（未绑定归空串）汇总
-    历史计数与当前在线数。
+    历史计数与当前在线数。capacity(key, op, sid, args, now_ms) 在既有
+    认证、老化、上限与 default 池取址规则之上提供 1024 项等待队列：
+    申请可立即服务则原子建立、否则入队（队满 ResourceError），取消仅
+    撤销排队项，推进先老化再清超时（截止=申请时刻+等待，含同刻）并依
+    入队序晋升容量允许且可取址者至全局满；按 key 重放缓存与 do/meter
+    分域；既有 do 建立仍立即拒绝、绝不入队。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -556,6 +572,15 @@ class Sessions:
         self._chain_tail = "0" * 64
         # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None。
         self._rollback = None
+
+        # capacity 等待队列：sid -> [user, 申请时刻, 等待, 截止, 入队序]，
+        # _queue_order 为按入队序的 sid 列表，_queue_seq 为下一入队序。
+        self._capacity_queue = {}
+        self._queue_order = []
+        self._queue_seq = 0
+        # capacity 的重放缓存，与 do/meter 分域：
+        # key -> (op, sid, args, now_ms, outcome)。
+        self._capacity_cache = {}
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -729,49 +754,47 @@ class Sessions:
         session["lease"] = 0
         session["pool"] = None
 
-    def _establish(self, sid, user, password, now_ms):
-        """初始→认证中→在线；任一失败不留会话与租约残留。"""
-        # 先认证。
-        _, status, _ = self._auth.authenticate(user, password, now_ms)
-        if status != "ok":
-            raise AuthError(f"authentication not ok for user {user!r}: {status}")
-        # 后查 total 及用户 per，均计非下线会话。
+    def _capacity_counts(self, user=None):
+        """非下线会话计数（排队项不计数）：返回 (总数, 该用户数)。"""
         total_count = 0
         user_count = 0
         for session in self._sessions.values():
             if session["state"] != _STATE_OFFLINE:
                 total_count += 1
-                if session["user"] == user:
+                if user is not None and session["user"] == user:
                     user_count += 1
-        if total_count >= self._total:
-            raise ResourceError(f"total session limit {self._total} reached")
-        if user_count >= self._per:
-            raise ResourceError(f"per-user session limit {self._per} reached for {user!r}")
-        if sid in self._sessions:
-            raise StateError(f"duplicate sid: {sid!r}")
+        return total_count, user_count
 
-        # 建立须经 default 池分配地址；缺 default 池为 StateError。
+    def _default_candidate(self, user):
+        """判定 default 池此刻能否为 user 取址，不改动任何状态。
+
+        返回 (pool_id, ip)：(None, None) 表示缺 default 池；
+        ("default", None) 表示有池但动态耗尽或静态址已占用；
+        ip 非 None 为可取址（动态仅窥堆顶、不弹出），落库由
+        _commit_session 完成。
+        """
         pool = self._pools.get(_DEFAULT_POOL_ID)
         if pool is None:
-            raise StateError("no default pool: cannot establish session")
-        pool_id = _DEFAULT_POOL_ID
+            return None, None
         ip_int = pool.static.get(user)
         if ip_int is None:
-            # 非静态用户：取最小未租用的非保留非静态地址。
-            if not pool.free:
-                raise ResourceError("address pool exhausted")
-            ip_int = heapq.heappop(pool.free)
+            ip_int = pool.free[0] if pool.free else None
         elif ip_int in pool.leases:
             # 静态地址专属该用户，但同一时刻只能租给一个会话。
-            raise ResourceError(
-                f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
-                "already in use"
-            )
-        lease = now_ms + self._lease_ms
+            ip_int = None
+        return _DEFAULT_POOL_ID, ip_int
 
-        # 全部校验通过后再落库，杜绝失败残留。
+    def _commit_session(self, sid, user, pool_id, ip_int, now_ms):
+        """全部校验通过后原子落库：登记租约（动态弹出堆顶）并建在线会话。
+
+        返回 (期限, 租期)；失败路径不到达此方法，故无半分配残留。
+        """
+        pool = self._pools[pool_id]
+        if pool.static.get(user) != ip_int:
+            heapq.heappop(pool.free)
         pool.leases[ip_int] = sid
         deadline = now_ms + self._idle_ms
+        lease = now_ms + self._lease_ms
         self._sessions[sid] = {
             "user": user,
             "state": _STATE_ONLINE,
@@ -781,6 +804,39 @@ class Sessions:
             "pool": pool_id,
             "meter": None,
         }
+        return deadline, lease
+
+    def _establish(self, sid, user, password, now_ms):
+        """初始→认证中→在线；任一失败不留会话与租约残留。"""
+        # 先认证。
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+        # 后查 total 及用户 per，均计非下线会话。
+        total_count, user_count = self._capacity_counts(user)
+        if total_count >= self._total:
+            raise ResourceError(f"total session limit {self._total} reached")
+        if user_count >= self._per:
+            raise ResourceError(f"per-user session limit {self._per} reached for {user!r}")
+        if sid in self._sessions:
+            raise StateError(f"duplicate sid: {sid!r}")
+
+        # 建立须经 default 池分配地址；缺 default 池为 StateError。
+        pool_id, ip_int = self._default_candidate(user)
+        if pool_id is None:
+            raise StateError("no default pool: cannot establish session")
+        if ip_int is None:
+            pool = self._pools[pool_id]
+            static_ip = pool.static.get(user)
+            if static_ip is not None:
+                raise ResourceError(
+                    f"static address {ipaddress.IPv4Address(static_ip)} for {user!r} "
+                    "already in use"
+                )
+            raise ResourceError("address pool exhausted")
+
+        # 全部校验通过后再落库，杜绝失败残留。
+        deadline, lease = self._commit_session(sid, user, pool_id, ip_int, now_ms)
         address = str(ipaddress.IPv4Address(ip_int))
         return self._render(sid, _STATE_ONLINE, now_ms, deadline, address, lease)
 
@@ -1196,6 +1252,219 @@ class Sessions:
                 }
             )
         payload = {"时刻": now_ms, "分组": group, "汇总": summary}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def capacity(self, key, op, sid, args, now_ms):
+        """容量申请：1024 项等待队列的申请/取消/推进，返回 LF 结尾的 JSON 字符串。
+
+        key/sid 沿用凭据约束（推进 sid 恒为空串）；now_ms 为非 bool 非负 int，
+        类型错 TypeError、取值错 ValueError。op 仅“申请/取消/推进”：申请 args 为
+        (user, password, 等待)，等待为非 bool 正 int；取消 args 须为 None；
+        推进 sid 须为 ""、args 须为 None。
+
+        申请先老化再认证：认证非 ok 抛 AuthError，sid 已存在（在线/挂起/下线
+        会话或排队项）抛 StateError。任一会话上限已满或缺 default 池、无可取址
+        则入队等待，队满（1024 项）抛 ResourceError；否则原子建立在线会话，
+        失败不留半分配。取消未知 sid 抛 KeyError，sid 为非排队项抛 StateError。
+        推进先老化，再清除截止（=申请时刻+等待）≤ now_ms 的排队项，随后依入队
+        序晋升上限允许且可取址者，直至全局上限满；变更仅含本次推进超时与晋升
+        项的入队序。新 key 首次结果（成功或 AuthError/ResourceError/StateError/
+        KeyError，含验参异常）永久缓存，同参重放无副作用、直接返回或重抛，
+        异参抛 ValueError；缓存与 do/meter 分域。时间复杂度：申请 O(S+log A)、
+        取消 O(Q)、推进 O(S+Q log A)，辅助空间 O(Q)。
+        """
+        _check_credential("key", key)
+
+        cached = self._capacity_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不申请、不推进，仅按缓存返回或重抛。
+            c_op, c_sid, c_args, c_now_ms, outcome = cached
+            if not _strict_equal(
+                (op, sid, args, now_ms), (c_op, c_sid, c_args, c_now_ms)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存。
+        try:
+            self._validate_capacity_params(op, sid, args, now_ms)
+        except (TypeError, ValueError) as exc:
+            self._capacity_cache[key] = (
+                op,
+                sid,
+                args,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 申请与推进先老化（取消不老化）；取消结果不受老化影响。
+        if op != _OP_CANCEL:
+            self._age(now_ms)
+        try:
+            if op == _OP_APPLY:
+                result = self._cap_apply(sid, args[0], args[1], args[2], now_ms)
+            elif op == _OP_CANCEL:
+                result = self._cap_cancel(sid, now_ms)
+            else:
+                result = self._cap_advance(now_ms)
+        except (AuthError, ResourceError, StateError, KeyError) as exc:
+            self._capacity_cache[key] = (
+                op,
+                sid,
+                args,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+        self._capacity_cache[key] = (op, sid, args, now_ms, ("ok", result))
+        return result
+
+    def _validate_capacity_params(self, op, sid, args, now_ms):
+        """校验 capacity 四参数：op 限三项，申请三参、取消/推进 args=None。"""
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if op not in (_OP_APPLY, _OP_CANCEL, _OP_ADVANCE):
+            raise ValueError(
+                f"op must be one of 申请/取消/推进, got {op!r}"
+            )
+        if op == _OP_ADVANCE:
+            if not isinstance(sid, str):
+                raise TypeError(f"sid must be a str, got {type(sid).__name__}")
+            if sid != "":
+                raise ValueError(f'sid must be "" for 推进, got {sid!r}')
+        else:
+            _check_credential("sid", sid)
+        if op == _OP_APPLY:
+            if not isinstance(args, tuple):
+                raise TypeError(f"args must be a tuple, got {type(args).__name__}")
+            if len(args) != 3:
+                raise ValueError(
+                    "args must be a 3-tuple (user, password, 等待), "
+                    f"got {len(args)} items"
+                )
+            _check_credential("user", args[0])
+            _check_credential("password", args[1])
+            _check_int("等待", args[2], 1)
+        elif args is not None:
+            raise ValueError(f"args must be None for {op}, got {args!r}")
+        _check_int("now_ms", now_ms, 0)
+
+    def _cap_apply(self, sid, user, password, wait, now_ms):
+        """认证后能立即服务则原子建立，否则入队；失败不留半分配。"""
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+        if sid in self._sessions or sid in self._capacity_queue:
+            raise StateError(f"sid already exists: {sid!r}")
+
+        # 截止对在线与排队一致：申请时刻 + 等待。
+        deadline = now_ms + wait
+        total_count, user_count = self._capacity_counts(user)
+        pool_id, ip_int = self._default_candidate(user)
+        servable = (
+            total_count < self._total
+            and user_count < self._per
+            and pool_id is not None
+            and ip_int is not None
+        )
+        if servable:
+            self._commit_session(sid, user, pool_id, ip_int, now_ms)
+            return self._render_capacity(sid, _CAP_ONLINE, now_ms, deadline)
+
+        # 上限满或缺址：入队等待，队列本身满则 ResourceError。
+        if len(self._capacity_queue) >= _MAX_QUEUE:
+            raise ResourceError(f"capacity queue limit {_MAX_QUEUE} reached")
+        self._queue_seq += 1
+        self._capacity_queue[sid] = [user, now_ms, wait, deadline, self._queue_seq]
+        self._queue_order.append(sid)
+        return self._render_capacity(sid, _CAP_QUEUED, now_ms, deadline)
+
+    def _cap_cancel(self, sid, now_ms):
+        """撤销排队项：未知 sid KeyError，非排队项（在线/挂起/下线）StateError。"""
+        entry = self._capacity_queue.pop(sid, None)
+        if entry is None:
+            if sid in self._sessions:
+                raise StateError(f"sid {sid!r} is not a queued item")
+            raise KeyError(f"unknown sid: {sid!r}")
+        self._queue_order.remove(sid)
+        return self._render_capacity(sid, _CAP_CANCELLED, now_ms, entry[3])
+
+    def _cap_advance(self, now_ms):
+        """先清超时项再依入队序晋升，返回时刻/在线/排队/变更 JSON。"""
+        # 超时（含同刻）：按入队序摘除截止 <= now_ms 者，记录入队序。
+        timed_out = []
+        survivors = []
+        for queued_sid in self._queue_order:
+            entry = self._capacity_queue[queued_sid]
+            if entry[3] <= now_ms:
+                timed_out.append(entry[4])
+                del self._capacity_queue[queued_sid]
+            else:
+                survivors.append(queued_sid)
+
+        # 晋升：计数只扫一次会话表，晋升时增量维护；取址落库每弹一堆 O(log A)。
+        total_count, per_user = self._active_counts()
+        promoted = []
+        remaining = []
+        for queued_sid in survivors:
+            entry = self._capacity_queue[queued_sid]
+            user = entry[0]
+            pool_id, ip_int = self._default_candidate(user)
+            if (
+                total_count < self._total
+                and per_user.get(user, 0) < self._per
+                and pool_id is not None
+                and ip_int is not None
+            ):
+                self._commit_session(queued_sid, user, pool_id, ip_int, now_ms)
+                promoted.append(entry[4])
+                del self._capacity_queue[queued_sid]
+                total_count += 1
+                per_user[user] = per_user.get(user, 0) + 1
+            else:
+                remaining.append(queued_sid)
+        self._queue_order = remaining
+
+        # 在线计老化后非下线会话数（total_count 已含全部新晋升）；排队为余留项。
+        return self._render_capacity_advance(
+            now_ms, total_count, len(remaining), timed_out + promoted
+        )
+
+    def _active_counts(self):
+        """非下线会话总数与按用户计数（排队项不计），单次 O(S)。"""
+        total_count = 0
+        per_user = {}
+        for session in self._sessions.values():
+            if session["state"] != _STATE_OFFLINE:
+                total_count += 1
+                user = session["user"]
+                per_user[user] = per_user.get(user, 0) + 1
+        return total_count, per_user
+
+    @staticmethod
+    def _render_capacity(sid, result, now_ms, deadline):
+        # 键序：会话、结果、时刻、截止；会话/结果为 str，时刻/截止为 int。
+        payload = {
+            "会话": sid,
+            "结果": result,
+            "时刻": now_ms,
+            "截止": deadline,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    @staticmethod
+    def _render_capacity_advance(now_ms, online, queued, changed):
+        # 键序：时刻、在线、排队、变更；变更为入队序（int）列表。
+        payload = {
+            "时刻": now_ms,
+            "在线": online,
+            "排队": queued,
+            "变更": changed,
+        }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _current_spec(self):
