@@ -16,7 +16,9 @@
   user_stats 按用户只读快照：按 now_ms 取视图（在线期限到计挂起、租期或
   期限到不计占用、队项截止到不计排队、墓碑计下线），并给出该用户
   do/meter/capacity 新 key 首次且已定位用户的认证/资源/状态/后端失败
-  累计；查询不认证、不老化、不改态。
+  累计；查询不认证、不老化、不改态。runtime_stats 全局只读快照：同口径
+  会话视图、建立新 key 首次计数与万分比成功率、跨用户失败聚合与各池
+  总量/占用/可用/保留；查询不认证、不老化、不改态。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -662,6 +664,17 @@ class Sessions:
     四类异常累计（参数错、KeyError、fault、重放与异参 key 不计），
     查询不认证、不老化、不改租约、退避、审计、事件、缓存与计数，
     O(S+Q) 时间、O(1) 辅助空间。
+    runtime_stats(now_ms, pool=None) 返回全局只读快照 JSON：pool=None
+    列全部池（无池列空），给定凭据约束的池标识仅列该池，未知池 KeyError；
+    按 now_ms 取视图（不老化）：在线期限到计挂起，租期或期限到不计占用，
+    截止到的队项不计排队。建立统计仅计已注册用户验参成功的新 key 首次
+    do 建立：总数 +1，成功则成功 +1；参数错、未知用户与重放不计；成功率
+    为万分比 floor(成功*10000/总数)（总数为 0 取 0），配置变更不清计数。
+    失败为全部用户的 user_stats 口径聚合。顶层键序时刻/会话/建立/失败/池，
+    会话键序在线/挂起/下线/排队，建立键序总数/成功/成功率万分比；失败恒按
+    认证/资源/状态/后端；池按标识 Unicode 升序，项为标识/总量/占用/可用/
+    保留，总量为可用地址数、占用为有效租约数、可用=总量-保留-占用。建立
+    更新 O(1)，查询 O(S+Q+U+P log P)、无池时为 O(P) 的空列表。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -736,6 +749,11 @@ class Sessions:
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
         self._user_fail = {}
+        # 建立统计 [总数, 成功]：仅已注册用户验参成功的新 key 首次 do 建立
+        # 计总数，成功再计成功；参数错、未知用户（认证失败的已注册用户照计）
+        # 与重放不计；配置变更不清零。
+        self._establish_total = 0
+        self._establish_success = 0
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -800,6 +818,13 @@ class Sessions:
             )
             raise
 
+        # 建立统计：已注册用户验参成功的新 key 首次 do 建立即计总数（参数错、
+        # 未知用户与重放均不到此）；成功路径再计成功，故后端故障等各类失败
+        # 计总数但不计成功。
+        count_establish = op == _OP_ESTABLISH and args[0] in self._auth
+        if count_establish:
+            self._establish_total += 1
+
         # 建立/迁移/接管：验参后、老化前查后端。迁移/接管由 sid/old 只读
         # 定位，未知 KeyError（不退避，仍缓存并入链）；定位后 BackendError
         # 先于状态、目标池与新 sid 错误；健康才老化并循旧序。
@@ -856,6 +881,8 @@ class Sessions:
         try:
             if op == _OP_ESTABLISH:
                 result = self._establish(sid, args[0], args[1], now_ms)
+                if count_establish:
+                    self._establish_success += 1
             elif op == _OP_RENEW:
                 result = self._renew(sid, now_ms)
             elif op == _OP_MIGRATE:
@@ -1693,6 +1720,109 @@ class Sessions:
                 {"类型": "状态", "次数": state_fail},
                 {"类型": "后端", "次数": backend_fail},
             ],
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def runtime_stats(self, now_ms, pool=None):
+        """返回运行期只读全局快照 JSON；查询不认证、不老化、不改任何状态。
+
+        now_ms 为非 bool 非负 int：类型错 TypeError、取值错 ValueError；pool
+        限 None 或凭据约束的池标识：类型错 TypeError、取值错 ValueError，未知
+        池抛 KeyError。pool=None 列全部池，未配置任何池时池列表为空；给定池
+        标识则仅列该池。按 now_ms 取视图（不老化）：在线期限 <= now_ms 计
+        挂起；租期或期限 <= now_ms 不计占用；队项截止 <= now_ms 不计排队。
+        顶层键序为“时刻/会话/建立/失败/池”：会话键序“在线/挂起/下线/排队”，
+        建立键序“总数/成功/成功率万分比”，均 int；失败恒按认证/资源/状态/
+        后端排列，项键序“类型/次数”，次数为全部用户的 user_stats 口径累计；
+        池按标识 Unicode 升序，项键序“标识/总量/占用/可用/保留”，总量为
+        可用地址数，占用为视图内有效租约数，可用 = 总量-保留-占用。
+        LF 结尾紧凑 JSON；同状态同时刻查询逐字节相同。更新（建立）O(1)，
+        查询 O(S+Q+U+P log P) 时间、O(P) 辅助空间，无池时 O(P)=O(0)。
+        """
+        _check_int("now_ms", now_ms, 0)
+        if pool is not None:
+            _check_credential("pool", pool)
+            if pool not in self._pools:
+                raise KeyError(f"unknown pool: {pool!r}")
+
+        # 会话表单扫：全局在线/挂起/下线视图计数与各池有效租约数。有效租约
+        # 须持址、在线且未挂起、期限与租期均未到（含同刻不计）。
+        online = 0
+        suspended = 0
+        offline = 0
+        pool_leased = {}
+        for session in self._sessions.values():
+            state = session["state"]
+            if state == _STATE_ONLINE and session["deadline"] > now_ms:
+                online += 1
+            elif state == _STATE_OFFLINE:
+                offline += 1
+            else:
+                # 挂起，或在线但期限已到（视图为挂起）。
+                suspended += 1
+            if (
+                state == _STATE_ONLINE
+                and session["ip"] is not None
+                and session["deadline"] > now_ms
+                and session["lease"] > now_ms
+            ):
+                pool_id = session["pool"]
+                pool_leased[pool_id] = pool_leased.get(pool_id, 0) + 1
+
+        # 队列表单扫：截止 > now_ms 的队项计排队（截止到的不摘队、仅不计）。
+        queued = 0
+        for entry in self._capacity_queue.values():
+            if entry[3] > now_ms:
+                queued += 1
+
+        # 建立成功率万分比：无尝试为 0，否则 floor(成功*10000/总数)。
+        if self._establish_total == 0:
+            rate = 0
+        else:
+            rate = self._establish_success * 10000 // self._establish_total
+
+        # 失败按 user_stats 口径跨全部用户聚合，恒按认证/资源/状态/后端。
+        fail_totals = [0, 0, 0, 0]
+        for counts in self._user_fail.values():
+            for i in range(4):
+                fail_totals[i] += counts[i]
+
+        pool_ids = sorted(self._pools) if pool is None else [pool]
+        pool_rows = []
+        for pool_id in pool_ids:
+            target = self._pools[pool_id]
+            occupied = pool_leased.get(pool_id, 0)
+            reserved = len(target.reserved)
+            pool_rows.append(
+                {
+                    "标识": pool_id,
+                    "总量": target.capacity,
+                    "占用": occupied,
+                    "可用": target.capacity - reserved - occupied,
+                    "保留": reserved,
+                }
+            )
+
+        payload = {
+            "时刻": now_ms,
+            "会话": {
+                "在线": online,
+                "挂起": suspended,
+                "下线": offline,
+                "排队": queued,
+            },
+            "建立": {
+                "总数": self._establish_total,
+                "成功": self._establish_success,
+                "成功率万分比": rate,
+            },
+            "失败": [
+                {"类型": "认证", "次数": fail_totals[0]},
+                {"类型": "资源", "次数": fail_totals[1]},
+                {"类型": "状态", "次数": fail_totals[2]},
+                {"类型": "后端", "次数": fail_totals[3]},
+            ],
+            "池": pool_rows,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
