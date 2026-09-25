@@ -12,15 +12,15 @@ def make(pool=("10.0.0.0/24", ("10.0.0.9",), (("alice", "10.0.0.2"),))):
 
 
 class ConfigTest(unittest.TestCase):
-    def test_export_v2_key_order_and_sorting(self):
+    def test_export_v3_key_order_and_sorting(self):
         s = make()
         s.add_pool("bpool", ("192.168.0.0/24", ("192.168.0.5", "192.168.0.3"),
                              (("zoe", "192.168.0.8"), ("amy", "192.168.0.9"))))
         out = s.export_config()
         self.assertTrue(out.endswith("\n"))
         doc = json.loads(out)
-        self.assertEqual(list(doc), ["版本", "会话", "地址池"])
-        self.assertEqual(doc["版本"], 2)
+        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板"])
+        self.assertEqual(doc["版本"], 3)
         self.assertEqual(list(doc["会话"]), ["总数", "每用户", "空闲毫秒", "租期毫秒"])
         self.assertEqual(doc["会话"], {"总数": 4, "每用户": 2, "空闲毫秒": 5000, "租期毫秒": 1000})
         self.assertEqual([p["标识"] for p in doc["地址池"]], ["bpool", "default"])
@@ -31,8 +31,11 @@ class ConfigTest(unittest.TestCase):
         p1 = doc["地址池"][1]
         self.assertEqual(p1["保留"], ["10.0.0.9"])
         self.assertEqual(p1["静态"], [["alice", "10.0.0.2"]])
+        # 无模板时两项为空
+        self.assertEqual(doc["模板"], [])
+        self.assertEqual(doc["用户模板"], [])
         # 紧凑分隔符
-        self.assertIn('"版本":2,', out)
+        self.assertIn('"版本":3,', out)
         self.assertNotIn(" ", out.strip())
 
     def test_export_zero_pools(self):
@@ -61,11 +64,14 @@ class ConfigTest(unittest.TestCase):
         }, ensure_ascii=False)
         out = s.load_config(v1)
         doc = json.loads(out)
-        self.assertEqual(doc["版本"], 2)
+        self.assertEqual(doc["版本"], 3)
         self.assertEqual(doc["会话"], {"总数": 3, "每用户": 2, "空闲毫秒": 0, "租期毫秒": 7})
         self.assertEqual(len(doc["地址池"]), 1)
         self.assertEqual(doc["地址池"][0]["标识"], "default")
         self.assertEqual(doc["地址池"][0]["CIDR"], "10.9.0.0/24")
+        # v1 迁移：模板与用户模板为空
+        self.assertEqual(doc["模板"], [])
+        self.assertEqual(doc["用户模板"], [])
         # 新租期作用于后续建立
         s._auth.add("alice", "pw")
         r = json.loads(s.do("k1", "建立", "s1", ("alice", "pw"), 0))
@@ -271,6 +277,163 @@ class ConfigTest(unittest.TestCase):
         self.assertIn('"CIDR":"10.0.0.0/24"', s.export_config())
         r = json.loads(s.do("k2", "下线", "s1", None, 99999))
         self.assertEqual(r["状态"], "下线")
+
+
+def make_v3(s):
+    """在 s 的当前导出上附加两个模板与 alice 的绑定（故意乱序）。"""
+    doc = json.loads(s.export_config())
+    doc["模板"] = [
+        {"标识": "gold", "限速": 1000, "突发": 500, "配额": 10000, "超限": "拒绝"},
+        {"标识": "basic", "限速": 100, "突发": 0, "配额": 1, "超限": "下线"},
+    ]
+    doc["用户模板"] = [["alice", "gold"]]
+    return json.dumps(doc, ensure_ascii=False)
+
+
+class QosTemplateTest(unittest.TestCase):
+    def test_export_templates_sorted_and_key_order(self):
+        s = make()
+        s.load_config(make_v3(s))
+        out = s.export_config()
+        doc = json.loads(out)
+        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板"])
+        self.assertEqual(doc["版本"], 3)
+        self.assertEqual([t["标识"] for t in doc["模板"]], ["basic", "gold"])
+        t0 = doc["模板"][0]
+        self.assertEqual(list(t0), ["标识", "限速", "突发", "配额", "超限"])
+        self.assertEqual(t0, {"标识": "basic", "限速": 100, "突发": 0,
+                              "配额": 1, "超限": "下线"})
+        self.assertEqual(doc["用户模板"], [["alice", "gold"]])
+        # 往返一致
+        self.assertEqual(s.load_config(out), out)
+
+    def test_load_v2_migrates_empty_templates(self):
+        s = make()
+        v2 = json.dumps({
+            "版本": 2,
+            "会话": {"总数": 4, "每用户": 2, "空闲毫秒": 5000, "租期毫秒": 1000},
+            "地址池": [],
+        }, ensure_ascii=False)
+        doc = json.loads(s.load_config(v2))
+        self.assertEqual(doc["版本"], 3)
+        self.assertEqual(doc["模板"], [])
+        self.assertEqual(doc["用户模板"], [])
+
+    def test_load_template_value_errors(self):
+        s = make()
+        good = json.loads(make_v3(s))
+
+        def bad(mutate):
+            doc = json.loads(json.dumps(good, ensure_ascii=False))
+            mutate(doc)
+            with self.assertRaises(ValueError):
+                s.load_config(json.dumps(doc, ensure_ascii=False))
+
+        # 顶层缺/多键
+        bad(lambda d: d.pop("模板"))
+        bad(lambda d: d.pop("用户模板"))
+        bad(lambda d: d.__setitem__("多", 1))
+        # 模板结构
+        bad(lambda d: d.__setitem__("模板", {}))
+        bad(lambda d: d["模板"][0].pop("限速"))
+        bad(lambda d: d["模板"][0].__setitem__("多", 1))
+        bad(lambda d: d["模板"][0].__setitem__("标识", ""))
+        bad(lambda d: d["模板"][0].__setitem__("标识", 1))
+        # 数值约束：限速/配额正 int，突发非负 int，均拒 bool
+        bad(lambda d: d["模板"][0].__setitem__("限速", True))
+        bad(lambda d: d["模板"][0].__setitem__("限速", 0))
+        bad(lambda d: d["模板"][0].__setitem__("限速", 1.5))
+        bad(lambda d: d["模板"][0].__setitem__("突发", -1))
+        bad(lambda d: d["模板"][0].__setitem__("突发", False))
+        bad(lambda d: d["模板"][0].__setitem__("配额", 0))
+        # 超限仅 拒绝/下线
+        bad(lambda d: d["模板"][0].__setitem__("超限", "丢包"))
+        bad(lambda d: d["模板"][0].__setitem__("超限", 1))
+        # 重复模板标识
+        bad(lambda d: d["模板"].append(dict(d["模板"][0])))
+        # 用户模板结构、重复用户、未知标识、未注册用户
+        bad(lambda d: d.__setitem__("用户模板", {}))
+        bad(lambda d: d.__setitem__("用户模板", [["alice"]]))
+        bad(lambda d: d.__setitem__("用户模板", [["alice", "gold", 1]]))
+        bad(lambda d: d.__setitem__("用户模板", [["alice", "gold"], ["alice", "basic"]]))
+        bad(lambda d: d.__setitem__("用户模板", [["alice", "nosuch"]]))
+        bad(lambda d: d.__setitem__("用户模板", [["carol", "gold"]]))
+        # 全部失败，配置不变
+        self.assertEqual(json.loads(s.export_config())["模板"], [])
+
+    def test_load_templates_atomic_rollback_point(self):
+        s = make()
+        before = s.export_config()
+        s.load_config(make_v3(s))
+        good = s.export_config()
+        # 失败加载不改配置与回滚点
+        doc = json.loads(good)
+        doc["用户模板"] = [["carol", "gold"]]
+        with self.assertRaises(ValueError):
+            s.load_config(json.dumps(doc, ensure_ascii=False))
+        self.assertEqual(s.export_config(), good)
+        # 回滚点仍指向首次加载前的无模板配置
+        self.assertEqual(s.rollback_config(), before)
+        self.assertEqual(json.loads(s.export_config())["用户模板"], [])
+
+    def test_rollback_restores_templates(self):
+        s = make()
+        s.load_config(make_v3(s))
+        with_templates = s.export_config()
+        doc = json.loads(with_templates)
+        doc["模板"] = []
+        doc["用户模板"] = []
+        s.load_config(json.dumps(doc, ensure_ascii=False))
+        self.assertEqual(json.loads(s.export_config())["模板"], [])
+        self.assertEqual(s.rollback_config(), with_templates)
+
+    def test_qos(self):
+        s = make()
+        s.load_config(make_v3(s))
+        s.do("k1", "建立", "s1", ("alice", "pw"), 0)
+        out = s.qos("s1")
+        self.assertTrue(out.endswith("\n"))
+        self.assertNotIn(" ", out.strip())
+        doc = json.loads(out)
+        self.assertEqual(list(doc), ["会话", "用户", "模板", "限速", "突发", "配额", "超限"])
+        self.assertEqual(doc, {"会话": "s1", "用户": "alice", "模板": "gold",
+                               "限速": 1000, "突发": 500, "配额": 10000, "超限": "拒绝"})
+        # bob 未绑定模板
+        s.do("k2", "建立", "s2", ("bob", "pw"), 0)
+        with self.assertRaises(StateError):
+            s.qos("s2")
+        # 未知 sid
+        with self.assertRaises(KeyError):
+            s.qos("nope")
+        # 非在线
+        s.do("k3", "下线", "s1", None, 1)
+        with self.assertRaises(StateError):
+            s.qos("s1")
+        # sid 类型/取值
+        with self.assertRaises(TypeError):
+            s.qos(123)
+        with self.assertRaises(ValueError):
+            s.qos("")
+
+    def test_qos_follows_config_not_session(self):
+        s = make()
+        s.do("k1", "建立", "s1", ("alice", "pw"), 0)
+        # 无绑定：StateError
+        with self.assertRaises(StateError):
+            s.qos("s1")
+        # 加载绑定后同一会话可查；加载不改会话
+        s.load_config(make_v3(s))
+        self.assertEqual(json.loads(s.qos("s1"))["模板"], "gold")
+        # 换绑 basic 后查询跟随新配置
+        doc = json.loads(s.export_config())
+        doc["用户模板"] = [["alice", "basic"]]
+        s.load_config(json.dumps(doc, ensure_ascii=False))
+        self.assertEqual(json.loads(s.qos("s1"))["模板"], "basic")
+        # 解除绑定后恢复 StateError
+        doc["用户模板"] = []
+        s.load_config(json.dumps(doc, ensure_ascii=False))
+        with self.assertRaises(StateError):
+            s.qos("s1")
 
 
 if __name__ == "__main__":

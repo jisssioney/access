@@ -5,7 +5,7 @@
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
-  export_config/load_config/rollback_config）。
+  export_config/load_config/rollback_config、QoS 模板查询 qos）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -197,27 +197,111 @@ def _parse_config_pool(obj):
     return (str(network), canonical_reserved, canonical_static)
 
 
+def _parse_config_templates(doc):
+    """校验 v3 的模板与用户模板，返回规范化 (templates, user_templates)。
+
+    templates 为按标识升序的 (标识, 限速, 突发, 配额, 超限) 元组：标识沿用
+    凭据约束，限速/配额为非 bool 正 int（限速为字节/秒、配额为字节），突发为
+    非 bool 非负 int（字节），超限仅“拒绝”或“下线”。user_templates 为按用户
+    升序的 (user, 标识) 元组：用户唯一，标识须已定义。结构、类型、值、重复项
+    或标识引用错均抛 ValueError；用户是否在认证器中由调用方校验。
+    """
+    raw_templates = doc["模板"]
+    if not isinstance(raw_templates, list):
+        raise ValueError(f"模板 must be a list, got {type(raw_templates).__name__}")
+    templates = []
+    seen_ids = set()
+    for item in raw_templates:
+        if not isinstance(item, dict) or set(item) != {
+            "标识",
+            "限速",
+            "突发",
+            "配额",
+            "超限",
+        }:
+            raise ValueError("template entry keys must be exactly 标识/限速/突发/配额/超限")
+        template_id = item["标识"]
+        try:
+            _check_credential("template id", template_id)
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
+        if template_id in seen_ids:
+            raise ValueError(f"duplicate template id: {template_id!r}")
+        seen_ids.add(template_id)
+        numbers = {}
+        for name, minimum in (("限速", 1), ("突发", 0), ("配额", 1)):
+            value = item[name]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an int, got {type(value).__name__}")
+            if value < minimum:
+                raise ValueError(f"{name} must be >= {minimum}, got {value}")
+            numbers[name] = value
+        exceed = item["超限"]
+        if exceed not in ("拒绝", "下线"):
+            raise ValueError(f"超限 must be 拒绝 or 下线, got {exceed!r}")
+        templates.append(
+            (template_id, numbers["限速"], numbers["突发"], numbers["配额"], exceed)
+        )
+    templates.sort(key=lambda item: item[0])
+
+    raw_pairs = doc["用户模板"]
+    if not isinstance(raw_pairs, list):
+        raise ValueError(f"用户模板 must be a list, got {type(raw_pairs).__name__}")
+    template_ids = {item[0] for item in templates}
+    user_templates = []
+    seen_users = set()
+    for entry in raw_pairs:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not isinstance(entry[1], str)
+        ):
+            raise ValueError("用户模板 entries must be [user, 标识] string pairs")
+        user, template_id = entry
+        try:
+            _check_credential("user", user)
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
+        if user in seen_users:
+            raise ValueError(f"duplicate user template user: {user!r}")
+        seen_users.add(user)
+        if template_id not in template_ids:
+            raise ValueError(f"unknown template id: {template_id!r}")
+        user_templates.append((user, template_id))
+    user_templates.sort(key=lambda item: item[0])
+    return tuple(templates), tuple(user_templates)
+
+
 def _parse_config(text):
     """解析配置文本为规范化 spec；text 非 str 抛 TypeError，余错抛 ValueError。
 
-    spec 为 (total, per, idle_ms, lease_ms, pools)，pools 为按标识升序的
-    (标识, cidr, reserved, static) 元组，reserved/static 已规范化排序。
-    v1（版本=1）地址池为无标识单池对象，迁移为 default 池；v2（版本=2）
-    地址池为池对象列表。JSON 解析错（JSONDecodeError 系 ValueError 子类）、
-    重复/未知/缺失键、结构、值或池规则错均抛 ValueError。
+    spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates)，
+    pools 为按标识升序的 (标识, cidr, reserved, static) 元组，reserved/static
+    已规范化排序；templates 为按标识升序的 (标识, 限速, 突发, 配额, 超限) 元组，
+    user_templates 为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为无
+    标识单池对象，迁移为 default 池；v2（版本=2）地址池为池对象列表；v3
+    （版本=3）增模板与用户模板，v1/v2 迁移时二者为空。JSON 解析错
+    （JSONDecodeError 系 ValueError 子类）、重复/未知/缺失键、结构、值或
+    池规则错均抛 ValueError。
     """
     if not isinstance(text, str):
         raise TypeError(f"text must be a str, got {type(text).__name__}")
     doc = json.loads(text, object_pairs_hook=_unique_object)
     if not isinstance(doc, dict):
         raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
-    if set(doc) != {"版本", "会话", "地址池"}:
-        raise ValueError("config keys must be exactly 版本/会话/地址池")
-    version = doc["版本"]
+    version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2):
-        raise ValueError(f"版本 must be 1 or 2, got {version}")
+    if version not in (1, 2, 3):
+        raise ValueError(f"版本 must be 1, 2 or 3, got {version}")
+    if version == 3:
+        if set(doc) != {"版本", "会话", "地址池", "模板", "用户模板"}:
+            raise ValueError(
+                "config keys must be exactly 版本/会话/地址池/模板/用户模板"
+            )
+    elif set(doc) != {"版本", "会话", "地址池"}:
+        raise ValueError("config keys must be exactly 版本/会话/地址池")
 
     session = doc["会话"]
     if not isinstance(session, dict) or set(session) != {
@@ -266,12 +350,19 @@ def _parse_config(text):
         cidr, reserved, static = _parse_config_pool(obj)
         pool_specs.append((pool_id, cidr, reserved, static))
     pool_specs.sort(key=lambda item: item[0])
+    if version == 3:
+        templates, user_templates = _parse_config_templates(doc)
+    else:
+        # v1/v2 迁移：模板与用户模板均为空。
+        templates, user_templates = (), ()
     return (
         numbers["总数"],
         numbers["每用户"],
         numbers["空闲毫秒"],
         numbers["租期毫秒"],
         tuple(pool_specs),
+        templates,
+        user_templates,
     )
 
 
@@ -289,6 +380,10 @@ class Authenticator:
         # 不能用 0 作哨兵，否则零时锁（lock_ms=0 于 now_ms=0）到期后
         # failed 永不清零。
         self._users = {}
+
+    def __contains__(self, user):
+        """用户是否已注册（供配置引用校验）。"""
+        return user in self._users
 
     def add(self, user, password):
         """注册新用户，返回 (user, "created", 0)。"""
@@ -402,11 +497,15 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v2 配置 JSON；
-    load_config 校验后原子替换并保存旧配置为回滚点，上限或租约承载不满足
-    抛 ResourceError，失败不改状态；rollback_config 经同样校验恢复旧配置
-    并清除回滚点，无回滚点抛 StateError。三者成功均返回 v2 配置 JSON，
-    会话状态、期限、地址、租期不受配置替换影响。
+    参数错与异参 key 重放不入链。export_config 导出 v3 配置 JSON（顶层键序
+    版本/会话/地址池/模板/用户模板；会话与地址池沿用 v2，模板按标识升序、
+    用户模板按用户升序）；load_config 全验后原子替换并保存旧配置为回滚点，
+    引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限或租约
+    承载不满足抛 ResourceError，失败不改配置、回滚点、会话与租约；
+    rollback_config 经同样校验恢复旧配置并清除回滚点，无回滚点抛
+    StateError。三者成功均返回 v3 配置 JSON，会话状态、期限、地址、租期
+    不受配置替换影响，新配置仅作用于后续操作与查询。qos(sid) 以 O(1) 返回
+    在线会话用户所绑 QoS 模板的生效值。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -422,6 +521,10 @@ class Sessions:
         if pool is not None:
             self._pools[_DEFAULT_POOL_ID] = _Pool(_check_pool(pool))
         self._lease_ms = _check_int("lease_ms", lease_ms, 1)
+
+        # QoS 模板：标识 -> (限速, 突发, 配额, 超限)；用户模板：user -> 标识。
+        self._templates = {}
+        self._user_templates = {}
 
         # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
         #         "lease": int, "pool": str|None}
@@ -875,8 +978,40 @@ class Sessions:
         payload = {"时刻": now_ms, "池": pools}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def qos(self, sid):
+        """返回会话用户所绑 QoS 模板的生效值 JSON，O(1) 时空；查询不老化。
+
+        sid 类型/取值错抛 TypeError/ValueError，未知 sid 抛 KeyError，会话非
+        在线或其用户未绑定模板抛 StateError。键序为
+        “会话/用户/模板/限速/突发/配额/超限”，文本为 str、数值为 int。
+        """
+        _check_credential("sid", sid)
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        if session["state"] != _STATE_ONLINE:
+            raise StateError(
+                f"cannot query qos for sid {sid!r} in state {session['state']!r}"
+            )
+        user = session["user"]
+        template_id = self._user_templates.get(user)
+        if template_id is None:
+            raise StateError(f"no qos template bound for user {user!r}")
+        rate, burst, quota, exceed = self._templates[template_id]
+        payload = {
+            "会话": sid,
+            "用户": user,
+            "模板": template_id,
+            "限速": rate,
+            "突发": burst,
+            "配额": quota,
+            "超限": exceed,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _current_spec(self):
-        """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序。"""
+        """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
+        模板按标识、用户模板按用户升序。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -888,22 +1023,42 @@ class Sessions:
                 for user in sorted(pool.static)
             )
             pool_specs.append((pool_id, pool.cidr, reserved, static))
+        templates = tuple(
+            (template_id,) + self._templates[template_id]
+            for template_id in sorted(self._templates)
+        )
+        user_templates = tuple(
+            (user, self._user_templates[user])
+            for user in sorted(self._user_templates)
+        )
         return (
             self._total,
             self._per,
             self._idle_ms,
             self._lease_ms,
             tuple(pool_specs),
+            templates,
+            user_templates,
         )
 
     def export_config(self):
-        """导出当前配置为 v2 JSON（LF 结尾），O((P+A)log(P+A)+S)/O(P+A)。
+        """导出当前配置为 v3 JSON（LF 结尾），O(n log n + S)/O(n)。
 
-        顶层键序为“版本/会话/地址池”；会话键序为“总数/每用户/空闲毫秒/
-        租期毫秒”；地址池为按标识升序的列表，项键序为“标识/CIDR/保留/静态”，
-        保留为按 IPv4 整数升序的串列表，静态为按用户再 IP 升序的二元串列表。
+        顶层键序为“版本/会话/地址池/模板/用户模板”；会话键序为“总数/每用户/
+        空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为“标识/CIDR/
+        保留/静态”，保留为按 IPv4 整数升序的串列表，静态为按用户再 IP 升序的
+        二元串列表；模板为按标识升序的列表，项键序为“标识/限速/突发/配额/
+        超限”；用户模板为按用户升序的 [user, 标识] 二元串列表。
         """
-        total, per, idle_ms, lease_ms, pool_specs = self._current_spec()
+        (
+            total,
+            per,
+            idle_ms,
+            lease_ms,
+            pool_specs,
+            templates,
+            user_templates,
+        ) = self._current_spec()
         pools = [
             {
                 "标识": pool_id,
@@ -914,7 +1069,7 @@ class Sessions:
             for pool_id, cidr, reserved, static in pool_specs
         ]
         payload = {
-            "版本": 2,
+            "版本": 3,
             "会话": {
                 "总数": total,
                 "每用户": per,
@@ -922,6 +1077,19 @@ class Sessions:
                 "租期毫秒": lease_ms,
             },
             "地址池": pools,
+            "模板": [
+                {
+                    "标识": template_id,
+                    "限速": rate,
+                    "突发": burst,
+                    "配额": quota,
+                    "超限": exceed,
+                }
+                for template_id, rate, burst, quota, exceed in templates
+            ],
+            "用户模板": [
+                [user, template_id] for user, template_id in user_templates
+            ],
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
@@ -932,7 +1100,7 @@ class Sessions:
         在租租约（池缺失、地址不可用/被保留、静态址易主），均抛
         ResourceError；本方法不改任何状态。
         """
-        total, per, _idle_ms, _lease_ms, pool_specs = spec
+        total, per, _idle_ms, _lease_ms, pool_specs, _templates, _user_templates = spec
         total_count = 0
         per_user = {}
         for session in self._sessions.values():
@@ -1003,29 +1171,41 @@ class Sessions:
         return new_pools
 
     def _install_spec(self, spec, new_pools):
-        """原子替换配置数值与池表；会话状态、期限、地址、租期不变。"""
-        total, per, idle_ms, lease_ms, _pool_specs = spec
+        """原子替换配置数值、池表与 QoS 模板；会话状态、期限、地址、租期不变。"""
+        (total, per, idle_ms, lease_ms, _pool_specs, templates, user_templates) = spec
         self._total = total
         self._per = per
         self._idle_ms = idle_ms
         self._lease_ms = lease_ms
         self._pools = new_pools
+        self._templates = {
+            template_id: (rate, burst, quota, exceed)
+            for template_id, rate, burst, quota, exceed in templates
+        }
+        self._user_templates = dict(user_templates)
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为回滚点，返回新配置 v2 JSON。
+        """校验并原子加载配置文本，保存旧配置为回滚点，返回新配置 v3 JSON。
 
-        text 非 str 抛 TypeError；JSON 解析、重复/未知/缺失键、结构、值或
-        池规则错抛 ValueError；上限或租约承载不满足抛 ResourceError。
-        失败不改状态；成功后新值作用于后续操作，会话与租约不变。
+        text 非 str 抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、
+        值、重复项或引用（用户模板引用未注册用户或未知模板标识）错抛
+        ValueError；上限或租约承载不满足抛 ResourceError。全部校验通过后
+        原子提交：失败不改配置、回滚点、会话与租约；成功不改会话与租约，
+        新值仅作用于后续操作与查询。
         """
         spec = _parse_config(text)
+        for user, _template_id in spec[6]:
+            if user not in self._auth:
+                raise ValueError(
+                    f"user template user not in authenticator: {user!r}"
+                )
         new_pools = self._build_pools(spec)
         self._rollback = self._current_spec()
         self._install_spec(spec, new_pools)
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复回滚点配置并清除回滚点，返回恢复后的 v2 JSON。
+        """经同样校验恢复回滚点配置并清除回滚点，返回恢复后的 v3 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改状态，
         回滚点保留。
