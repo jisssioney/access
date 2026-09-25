@@ -19,10 +19,12 @@ class ConfigTest(unittest.TestCase):
         out = s.export_config()
         self.assertTrue(out.endswith("\n"))
         doc = json.loads(out)
-        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板"])
-        self.assertEqual(doc["版本"], 3)
+        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量"])
+        self.assertEqual(doc["版本"], 4)
         self.assertEqual(list(doc["会话"]), ["总数", "每用户", "空闲毫秒", "租期毫秒"])
         self.assertEqual(doc["会话"], {"总数": 4, "每用户": 2, "空闲毫秒": 5000, "租期毫秒": 1000})
+        self.assertEqual(list(doc["容量"]), ["队列上限", "最大等待毫秒"])
+        self.assertEqual(doc["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
         self.assertEqual([p["标识"] for p in doc["地址池"]], ["bpool", "default"])
         p0 = doc["地址池"][0]
         self.assertEqual(list(p0), ["标识", "CIDR", "保留", "静态"])
@@ -35,7 +37,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(doc["模板"], [])
         self.assertEqual(doc["用户模板"], [])
         # 紧凑分隔符
-        self.assertIn('"版本":3,', out)
+        self.assertIn('"版本":4,', out)
         self.assertNotIn(" ", out.strip())
 
     def test_export_zero_pools(self):
@@ -64,14 +66,15 @@ class ConfigTest(unittest.TestCase):
         }, ensure_ascii=False)
         out = s.load_config(v1)
         doc = json.loads(out)
-        self.assertEqual(doc["版本"], 3)
+        self.assertEqual(doc["版本"], 4)
         self.assertEqual(doc["会话"], {"总数": 3, "每用户": 2, "空闲毫秒": 0, "租期毫秒": 7})
         self.assertEqual(len(doc["地址池"]), 1)
         self.assertEqual(doc["地址池"][0]["标识"], "default")
         self.assertEqual(doc["地址池"][0]["CIDR"], "10.9.0.0/24")
-        # v1 迁移：模板与用户模板为空
+        # v1 迁移：模板与用户模板为空，容量补默认 1024、0
         self.assertEqual(doc["模板"], [])
         self.assertEqual(doc["用户模板"], [])
+        self.assertEqual(doc["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
         # 新租期作用于后续建立
         s._auth.add("alice", "pw")
         r = json.loads(s.do("k1", "建立", "s1", ("alice", "pw"), 0))
@@ -296,8 +299,8 @@ class QosTemplateTest(unittest.TestCase):
         s.load_config(make_v3(s))
         out = s.export_config()
         doc = json.loads(out)
-        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板"])
-        self.assertEqual(doc["版本"], 3)
+        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量"])
+        self.assertEqual(doc["版本"], 4)
         self.assertEqual([t["标识"] for t in doc["模板"]], ["basic", "gold"])
         t0 = doc["模板"][0]
         self.assertEqual(list(t0), ["标识", "限速", "突发", "配额", "超限"])
@@ -315,9 +318,10 @@ class QosTemplateTest(unittest.TestCase):
             "地址池": [],
         }, ensure_ascii=False)
         doc = json.loads(s.load_config(v2))
-        self.assertEqual(doc["版本"], 3)
+        self.assertEqual(doc["版本"], 4)
         self.assertEqual(doc["模板"], [])
         self.assertEqual(doc["用户模板"], [])
+        self.assertEqual(doc["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
 
     def test_load_template_value_errors(self):
         s = make()
