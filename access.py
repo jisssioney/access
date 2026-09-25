@@ -5,7 +5,8 @@
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
-  export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
+  export_config/load_config/rollback_config 与只读升级包 upgrade_config、
+  QoS 模板查询 qos、按模板
   令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats、容量申请
   capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按入队序晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
@@ -324,23 +325,26 @@ def _parse_config_capacity(doc):
     return queue_limit, max_wait
 
 
-def _parse_config(text):
-    """解析配置文本为规范化 spec；text 非 str 抛 TypeError，余错抛 ValueError。
+_UPGRADE_KEYS = ("源版本", "目标版本", "改变", "摘要", "配置")
+_UPGRADE_KEY_SET = frozenset(_UPGRADE_KEYS)
 
-    spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
-    capacity)，capacity 为 (队列上限, 最大等待毫秒)；pools 为按标识升序的
+
+def _parse_config_object(doc):
+    """解析已解析的配置 JSON 对象，返回 (版本, 规范化 spec)。
+
+    供 upgrade_config、load_config 与升级包复核复用（调用方自行 json.loads
+    并以 _unique_object 拒重键）。spec 为 (total, per,
+    idle_ms, lease_ms, pools, templates, user_templates, capacity)，capacity
+    为 (队列上限, 最大等待毫秒)；pools 为按标识升序的
     (标识, cidr, reserved, static) 元组，reserved/static 已规范化排序；
     templates 为按标识升序的 (标识, 限速, 突发, 配额, 超限) 元组，
     user_templates 为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为无
     标识单池对象，迁移为 default 池；v2（版本=2）地址池为池对象列表；v3
     （版本=3）增模板与用户模板；v4（版本=4）增容量背压（队列上限/最大等待
     毫秒）。v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时容量补默认
-    (1024, 0)。JSON 解析错（JSONDecodeError 系 ValueError 子类）、重复/未知/
-    缺失键、结构、值或池规则错均抛 ValueError。
+    (1024, 0)。非对象、重复/未知/缺失键、结构、值、版本或池规则错均抛
+    ValueError。
     """
-    if not isinstance(text, str):
-        raise TypeError(f"text must be a str, got {type(text).__name__}")
-    doc = json.loads(text, object_pairs_hook=_unique_object)
     if not isinstance(doc, dict):
         raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
     version = doc.get("版本")
@@ -420,7 +424,7 @@ def _parse_config(text):
     else:
         # v1-v3 迁移：容量补默认 1024 项队列、不限等待。
         capacity = (_MAX_QUEUE, 0)
-    return (
+    spec = (
         numbers["总数"],
         numbers["每用户"],
         numbers["空闲毫秒"],
@@ -430,6 +434,127 @@ def _parse_config(text):
         user_templates,
         capacity,
     )
+    return version, spec
+
+
+def _v4_config_payload(spec):
+    """按 export_config 的 v4 规范组装配置对象（各层键序、类型、排序一致）。"""
+    (
+        total,
+        per,
+        idle_ms,
+        lease_ms,
+        pool_specs,
+        templates,
+        user_templates,
+        (queue_limit, max_wait_ms),
+    ) = spec
+    pools = [
+        {
+            "标识": pool_id,
+            "CIDR": cidr,
+            "保留": list(reserved),
+            "静态": [[user, ip] for user, ip in static],
+        }
+        for pool_id, cidr, reserved, static in pool_specs
+    ]
+    return {
+        "版本": _CONFIG_VERSION,
+        "会话": {
+            "总数": total,
+            "每用户": per,
+            "空闲毫秒": idle_ms,
+            "租期毫秒": lease_ms,
+        },
+        "地址池": pools,
+        "模板": [
+            {
+                "标识": template_id,
+                "限速": rate,
+                "突发": burst,
+                "配额": quota,
+                "超限": exceed,
+            }
+            for template_id, rate, burst, quota, exceed in templates
+        ],
+        "用户模板": [
+            [user, template_id] for user, template_id in user_templates
+        ],
+        "容量": {
+            "队列上限": queue_limit,
+            "最大等待毫秒": max_wait_ms,
+        },
+    }
+
+
+def _compact_json(value):
+    """基线紧凑 JSON（ensure_ascii、无空白、无尾 LF）。"""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _v4_config_blob(spec):
+    """spec 的 v4 规范配置对象之紧凑 JSON（无 LF）。"""
+    return _compact_json(_v4_config_payload(spec))
+
+
+def _v4_config_digest(spec):
+    """配置对象同法编码（无 LF）后 UTF-8 字节的 sha256 小写十六进制串。"""
+    return hashlib.sha256(_v4_config_blob(spec).encode("utf-8")).hexdigest()
+
+
+def _parse_upgrade_object(doc):
+    """校验升级包对象，返回 (源版本, 目标版本, 改变, v4 规范化 spec)。
+
+    逐字段复核顶层键序（源版本/目标版本/改变/摘要/配置）、字段类型与值：
+    源版本为 1..4 的 int、目标版本仅 4、改变为 bool 且恰为“源版本 != 4”，
+    摘要为 64 位小写十六进制 str；配置须为 v4 规范形态——重新解析并迁移后与
+    包内配置对象逐层（键序、类型、排序）逐字节相符，摘要须等于配置对象紧凑
+    JSON（无 LF）UTF-8 字节的 sha256。任一不符抛 ValueError。
+    """
+    if not isinstance(doc, dict):
+        raise ValueError(f"upgrade package must be a JSON object, got {type(doc).__name__}")
+    if tuple(doc) != _UPGRADE_KEYS:
+        raise ValueError(
+            "upgrade package keys must be exactly and ordered as "
+            "源版本/目标版本/改变/摘要/配置"
+        )
+    source = doc["源版本"]
+    target = doc["目标版本"]
+    changed = doc["改变"]
+    summary = doc["摘要"]
+    config = doc["配置"]
+    if isinstance(source, bool) or not isinstance(source, int):
+        raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
+    if source not in (1, 2, 3, 4):
+        raise ValueError(f"源版本 must be 1, 2, 3 or 4, got {source}")
+    if isinstance(target, bool) or not isinstance(target, int):
+        raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
+    if target != _CONFIG_VERSION:
+        raise ValueError(f"目标版本 must be {_CONFIG_VERSION}, got {target}")
+    if not isinstance(changed, bool):
+        raise ValueError(f"改变 must be a bool, got {type(changed).__name__}")
+    if changed != (source != _CONFIG_VERSION):
+        raise ValueError(
+            f"改变 must equal (源版本 != {_CONFIG_VERSION}), got {changed!r} "
+            f"for 源版本 {source}"
+        )
+    if not isinstance(summary, str) or len(summary) != 64 or any(
+        ch not in "0123456789abcdef" for ch in summary
+    ):
+        raise ValueError("摘要 must be a 64-char lowercase hex string")
+    if not isinstance(config, dict):
+        raise ValueError(f"配置 must be a JSON object, got {type(config).__name__}")
+    # 配置须为 v4 规范形态：重新解析（版本须恰为 4）并迁移为 spec，再由 spec
+    # 规范化重编码与包内对象比较，键序、类型、排序任一不符即非规范。
+    version, spec = _parse_config_object(config)
+    if version != _CONFIG_VERSION:
+        raise ValueError(f"配置.版本 must be {_CONFIG_VERSION}, got {version}")
+    canonical = _compact_json(_v4_config_payload(spec))
+    if _compact_json(config) != canonical:
+        raise ValueError("配置 is not in canonical v4 form")
+    if _v4_config_digest(spec) != summary:
+        raise ValueError("摘要 mismatch: upgrade package is not canonical")
+    return source, target, changed, spec
 
 
 def _digest(user, password):
@@ -604,7 +729,11 @@ class Sessions:
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
     参数错与异参 key 重放不入链。export_config 导出 v4 配置 JSON（顶层键序
     版本/会话/地址池/模板/用户模板/容量；会话与地址池沿用 v2，模板按标识升序、
-    用户模板按用户升序、容量为队列上限/最大等待毫秒）；load_config 全验后
+    用户模板按用户升序、容量为队列上限/最大等待毫秒）；upgrade_config 只读
+    地把 v1-v4 配置文本迁移规范化为 v4 升级包（顶层键序源版本/目标版本/
+    改变/摘要/配置，配置同 export_config v4 规范，摘要为其紧凑编码 UTF-8
+    字节的 sha256 小写值，不改任何实例状态）；load_config 直载 v1-v4 配置
+    文本，亦承载复核通过（键序、字段、规范形态与摘要）的升级包，全验后
     原子替换并保存旧配置为唯一回滚点，引用错（用户模板引用未知用户或未知
     模板标识）抛 ValueError，上限、租约或队长承载不满足抛 ResourceError，
     失败不改配置、回滚点、会话、租约与运行态；rollback_config 经同样校验
@@ -2957,53 +3086,8 @@ class Sessions:
         配额/超限”；用户模板为按用户升序的 [user, 标识] 二元串列表；容量键序
         为“队列上限/最大等待毫秒”，0 分别表示不限队长与不限等待。
         """
-        (
-            total,
-            per,
-            idle_ms,
-            lease_ms,
-            pool_specs,
-            templates,
-            user_templates,
-            (queue_limit, max_wait_ms),
-        ) = self._current_spec()
-        pools = [
-            {
-                "标识": pool_id,
-                "CIDR": cidr,
-                "保留": list(reserved),
-                "静态": [[user, ip] for user, ip in static],
-            }
-            for pool_id, cidr, reserved, static in pool_specs
-        ]
-        payload = {
-            "版本": _CONFIG_VERSION,
-            "会话": {
-                "总数": total,
-                "每用户": per,
-                "空闲毫秒": idle_ms,
-                "租期毫秒": lease_ms,
-            },
-            "地址池": pools,
-            "模板": [
-                {
-                    "标识": template_id,
-                    "限速": rate,
-                    "突发": burst,
-                    "配额": quota,
-                    "超限": exceed,
-                }
-                for template_id, rate, burst, quota, exceed in templates
-            ],
-            "用户模板": [
-                [user, template_id] for user, template_id in user_templates
-            ],
-            "容量": {
-                "队列上限": queue_limit,
-                "最大等待毫秒": max_wait_ms,
-            },
-        }
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        spec = self._current_spec()
+        return _v4_config_blob(spec) + "\n"
 
     def _build_pools(self, spec):
         """校验 spec 对现有会话与等待队列的承载力并构建新池表；失败抛 ResourceError。
@@ -3124,16 +3208,62 @@ class Sessions:
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
 
-    def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v4 JSON。
+    def upgrade_config(self, text, target=4):
+        """只读地把 v1..v4 配置文本规范化为 v4 并返回升级包 JSON（LF 结尾）。
 
-        text 非 str 抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、
-        值、重复项或引用（用户模板引用未注册用户或未知模板标识）错抛
-        ValueError；上限、租约或队长承载不满足抛 ResourceError。全部校验通过
-        后原子提交：失败不改配置、回滚点、会话、租约与运行态；成功不老化，
-        会话与租约不变，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点。
+        text 须为 str，target 须为非 bool 的 int：类型不符抛 TypeError；target
+        仅允许 4、源配置版本须为 1..4，否则抛 ValueError。JSON 解析错（含
+        重复键）、键缺失或未知、结构/值/引用/版本非法均抛 ValueError，迁移沿用
+        load_config 的既有规则：v1 无标识单池改为 default 池，v1/v2 补空模板
+        与空用户模板，v1-v3 补容量 (1024, 0)，v4 仅规范化（排序与排版归一）。
+        本方法为只读操作：不认证、不老化、不改任何实例状态，亦不校验用户是否
+        已注册等承载条件。返回沿基线格式的 LF 尾紧凑 JSON，顶层键序与类型为
+        “源版本:int/目标版本:int/改变:bool/摘要:str/配置:object”，
+        改变 = 源版本 != 4；配置逐层键序、类型与排序同 export_config() 的
+        v4，摘要为配置对象以同法编码、去掉 LF 后的 UTF-8 字节 sha256 小写值。
+        时间 O(n log n)、空间 O(n)，n 为配置规模。
         """
-        spec = _parse_config(text)
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise TypeError(f"target must be an int, got {type(target).__name__}")
+        if target != _CONFIG_VERSION:
+            raise ValueError(f"target must be {_CONFIG_VERSION}, got {target}")
+        doc = json.loads(text, object_pairs_hook=_unique_object)
+        source, spec = _parse_config_object(doc)
+        config = _v4_config_payload(spec)
+        config_blob = _compact_json(config)
+        summary = hashlib.sha256(config_blob.encode("utf-8")).hexdigest()
+        payload = {
+            "源版本": source,
+            "目标版本": target,
+            "改变": source != _CONFIG_VERSION,
+            "摘要": summary,
+            # 与摘要所用 blob 为同一规范对象，嵌套序列化逐字节一致。
+            "配置": config,
+        }
+        return _compact_json(payload) + "\n"
+
+    def load_config(self, text):
+        """校验并原子加载配置文本或升级包，保存旧配置为唯一回滚点，返回 v4 JSON。
+
+        直接承载 v1-v4 配置文本（解析、迁移与异常规则同既有 load_config）；
+        亦承载 upgrade_config 产出的升级包：须复核顶层键序、各字段、配置的
+        v4 规范形态与摘要，任一不符抛 ValueError。text 非 str 抛 TypeError；
+        JSON 解析、重复/未知/缺失键、结构、类型、值、重复项或引用（用户模板
+        引用未注册用户或未知模板标识）错抛 ValueError；上限、租约或队长承载
+        不满足抛 ResourceError。全部校验通过后经既有原子加载与唯一回滚点
+        语义提交：失败不改配置、回滚点、会话、租约与运行态；成功不老化，会话
+        与租约不变，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点。
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        doc = json.loads(text, object_pairs_hook=_unique_object)
+        if isinstance(doc, dict) and _UPGRADE_KEY_SET <= set(doc):
+            # 升级包：键集恰为包键时按包复核，混入配置键等情形由复核拒入。
+            _source, _target, _changed, spec = _parse_upgrade_object(doc)
+        else:
+            spec = _parse_config_object(doc)[1]
         for user, _template_id in spec[6]:
             if user not in self._auth:
                 raise ValueError(
