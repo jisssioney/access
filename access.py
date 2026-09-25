@@ -559,11 +559,13 @@ class Sessions:
     (now_ms) 先验参再老化，输出全局在线/挂起/排队/可用/水位/最早截止
     与按标识升序的用户、池明细。clog(now_ms) 先老化后输出检查点基线
     JSON：全量事件哈希链（事件键序序号/时刻/会话/结果/入队序/前哈希/
-    哈希，取消保留原入队序、事件时刻可回拨）、按会话升序的非下线会话、
-    按入队序的排队项与覆盖前四顶层键的状态哈希。cverify() 校验事件链
-    连续序号与哈希衔接，空链为 True。creplay(text) 仅恢复所列会话、
-    租约、队列与事件账本，验链、验状态哈希与承载力后原子提交，同状态
-    哈希重放为空操作，返回该时刻 capacity_stats。
+    哈希，取消保留原入队序、事件时刻可回拨）、按会话升序的全部会话
+    （在线/挂起/下线，下线项为状态“下线”、期限0、池“”、地址“”、租期0
+    的墓碑，不计容量不持租约）、按入队序的排队项与覆盖前四顶层键的
+    状态哈希。cverify() 校验事件链连续序号与哈希衔接，空链为 True。
+    creplay(text) 校验并恢复含墓碑在内的所列会话、租约、队列与事件
+    账本，墓碑不计容量、不建租约，验链、验状态哈希与承载力后原子
+    提交，同状态哈希重放为空操作并保留墓碑，返回该时刻 capacity_stats。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1692,15 +1694,28 @@ class Sessions:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _checkpoint_sessions(self):
-        """检查点会话快照：仅非下线会话，按会话升序。
+        """检查点会话快照：全部会话（在线/挂起/下线），按会话升序。
 
         项键序为“会话/用户/状态/期限/池/地址/租期”；期限/租期为 int，
         余为 str；无址（挂起及租约到期未挂起）项池址为 ""、租期为 0。
+        下线项为墓碑：状态“下线”，期限/池/地址/租期固定为 0/""/""/0，
+        墓碑不计容量、不持租约。
         """
         rows = []
         for sid in sorted(self._sessions):
             session = self._sessions[sid]
             if session["state"] == _STATE_OFFLINE:
+                rows.append(
+                    {
+                        "会话": sid,
+                        "用户": session["user"],
+                        "状态": _STATE_OFFLINE,
+                        "期限": 0,
+                        "池": "",
+                        "地址": "",
+                        "租期": 0,
+                    }
+                )
                 continue
             if session["ip"] is None:
                 pool_id = ""
@@ -1792,8 +1807,9 @@ class Sessions:
         顶层键序为“时刻/事件/会话/排队/状态哈希”。事件为全量哈希链账本，
         项键序为“序号/时刻/会话/结果/入队序/前哈希/哈希”，首项前哈希为
         64 个 0、余承前项，哈希为前六键基线 JSON（无 LF）的 UTF-8 字节
-        sha256 小写值；取消事件保留原入队序，事件时刻允许回拨。会话仅列
-        非下线项、按会话升序，排队按入队序；状态哈希同法覆盖前四顶层键。
+        sha256 小写值；取消事件保留原入队序，事件时刻允许回拨。会话列
+        在线/挂起/下线全部项、按会话升序，下线项为字段清零的墓碑；排队
+        按入队序；状态哈希同法覆盖前四顶层键。
         """
         _check_int("now_ms", now_ms, 0)
         self._age(now_ms)
@@ -1867,8 +1883,9 @@ class Sessions:
         """解析并全量校验检查点文本，返回 (时刻, 事件七元组, 会话行, 排队行,
         状态哈希)；结构、类型、取值、排序、链或状态哈希错均抛 ValueError。
 
-        会话/排队行为规范化 dict（键序与输出一致）；仅做结构自洽校验，
-        用户注册、上限与池址承载力由 creplay 判定。
+        会话/排队行为规范化 dict（键序与输出一致），会话行含在线/挂起/下线
+        三类，下线行须字段清零；仅做结构自洽校验，用户注册、上限与池址
+        承载力由 creplay 判定。
         """
         try:
             doc = json.loads(text, object_pairs_hook=_unique_object)
@@ -1967,34 +1984,50 @@ class Sessions:
             sid = self._cp_str(item["会话"], "会话.会话")
             user = self._cp_str(item["用户"], "会话.用户")
             state = item["状态"]
-            if state not in (_STATE_ONLINE, _STATE_SUSPENDED):
-                raise ValueError(f"会话.状态 must be 在线 or 挂起: {state!r}")
+            if state not in (_STATE_ONLINE, _STATE_SUSPENDED, _STATE_OFFLINE):
+                raise ValueError(
+                    f"会话.状态 must be 在线, 挂起 or 下线: {state!r}"
+                )
             deadline = self._cp_int(item["期限"], "会话.期限", 0)
             pool_id = item["池"]
             address = item["地址"]
             lease = self._cp_int(item["租期"], "会话.租期", 0)
             if not isinstance(pool_id, str) or not isinstance(address, str):
                 raise ValueError("会话.池 and 会话.地址 must be str")
-            if (pool_id == "") != (address == ""):
-                raise ValueError("会话.池 and 会话.地址 must be both empty or both set")
-            if pool_id == "":
-                if lease != 0:
-                    raise ValueError("会话.租期 must be 0 when 会话.池 is empty")
+            if state == _STATE_OFFLINE:
+                # 墓碑：期限/池/地址/租期固定清零，不计容量、不持租约。
+                if (
+                    deadline != 0
+                    or pool_id != ""
+                    or address != ""
+                    or lease != 0
+                ):
+                    raise ValueError(
+                        "offline session must have 期限/池/地址/租期 zeroed"
+                    )
             else:
-                self._cp_str(pool_id, "会话.池")
-                try:
-                    _check_ip("会话.地址", address)
-                except ValueError as exc:
-                    raise ValueError(str(exc)) from exc
-            if state == _STATE_SUSPENDED and (
-                deadline != 0 or pool_id != "" or address != "" or lease != 0
-            ):
-                raise ValueError("suspended session must have 期限/池/地址/租期 zeroed")
-            if state == _STATE_ONLINE:
-                if deadline < 1:
-                    raise ValueError("online session must have 期限 >= 1")
-                if pool_id != "" and lease < 1:
-                    raise ValueError("online session with address must have 租期 >= 1")
+                if (pool_id == "") != (address == ""):
+                    raise ValueError(
+                        "会话.池 and 会话.地址 must be both empty or both set"
+                    )
+                if pool_id == "":
+                    if lease != 0:
+                        raise ValueError("会话.租期 must be 0 when 会话.池 is empty")
+                else:
+                    self._cp_str(pool_id, "会话.池")
+                    try:
+                        _check_ip("会话.地址", address)
+                    except ValueError as exc:
+                        raise ValueError(str(exc)) from exc
+                if state == _STATE_SUSPENDED and (
+                    deadline != 0 or pool_id != "" or address != "" or lease != 0
+                ):
+                    raise ValueError("suspended session must have 期限/池/地址/租期 zeroed")
+                if state == _STATE_ONLINE:
+                    if deadline < 1:
+                        raise ValueError("online session must have 期限 >= 1")
+                    if pool_id != "" and lease < 1:
+                        raise ValueError("online session with address must have 租期 >= 1")
             if sid in session_sids:
                 raise ValueError(f"duplicate session in checkpoint: {sid!r}")
             if last_sid is not None and sid <= last_sid:
@@ -2092,16 +2125,18 @@ class Sessions:
             heapq.heapify(pool.free)
 
     def creplay(self, text):
-        """按检查点仅恢复所列会话、租约、队列与 capacity 事件账本，返回该时刻
-        capacity_stats 的 LF 结尾 JSON。
+        """按检查点校验并恢复所列会话（含下线墓碑）、租约、队列与 capacity
+        事件账本，返回该时刻 capacity_stats 的 LF 结尾 JSON。
 
-        text 非 str 抛 TypeError；非规范包（JSON/结构/类型/取值/重复项/排序错）、
-        链断或状态哈希不符抛 ValueError。目标当前持有检查点之外的非下线会话、
-        排队项或事件，或同批行列状态不一致，抛 StateError。检查点用户未注册、
-        会话数超全局/单用户上限、池缺失或地址不可用/被保留/静态易主/重复占用，
-        抛 ResourceError。全部校验通过后原子提交；配置、认证器、QoS、计量统计、
-        各域重放缓存、接管与 do 审计链均不受影响。当前状态与检查点同状态哈希时
-        重放为空操作，不追加任何事件。
+        text 非 str 抛 TypeError；非规范包（JSON/结构/类型/取值/重复项/排序错，
+        含墓碑清零字段不符或非法状态）、链断或状态哈希不符抛 ValueError。
+        目标当前持有检查点之外的会话（含墓碑）、排队项或事件，或同标识会话/
+        排队行列状态不一致，抛 StateError。检查点用户未注册、在线/挂起会话数
+        超全局/单用户上限、池缺失或地址不可用/被保留/静态易主/重复占用，
+        抛 ResourceError；墓碑不计容量、不建租约。全部校验通过后原子提交；
+        配置、认证器、QoS、计量统计、各域重放缓存、接管与 do 审计链均不受
+        影响。当前状态与检查点同状态哈希时重放为空操作，不追加任何事件并
+        保留既有墓碑。
         """
         if not isinstance(text, str):
             raise TypeError(f"text must be a str, got {type(text).__name__}")
@@ -2125,7 +2160,8 @@ class Sessions:
         target_queued = {row["会话"]: row for row in queued}
 
         # 非同批状态（StateError 先于承载力判定）：账本只能在同链上延展，
-        # 目标现存非下线会话与排队项必须与检查点同批行逐字段一致。
+        # 目标现存全部会话（含下线墓碑）与排队项必须与检查点同批行逐字段
+        # 一致；包外会话或同标识状态/字段不同均拒绝。
         if len(self._capacity_events) > len(events):
             raise StateError("current ledger has events beyond checkpoint")
         for current, wanted in zip(self._capacity_events, events):
@@ -2134,14 +2170,6 @@ class Sessions:
                     f"event {wanted[0]} diverges from current ledger"
                 )
         for sid, session in self._sessions.items():
-            if session["state"] == _STATE_OFFLINE:
-                # 下线墓碑不得与检查点所列会话或排队项同 sid（非同批轨迹）；
-                # 其余墓碑不在所列状态内，提交时自然不保留。
-                if sid in target_sessions or sid in target_queued:
-                    raise StateError(
-                        f"sid {sid!r} is offline in target but listed in checkpoint"
-                    )
-                continue
             row = target_sessions.get(sid)
             if row is None:
                 raise StateError(f"current session {sid!r} is not in checkpoint")
@@ -2175,6 +2203,7 @@ class Sessions:
                 raise StateError(f"current queued sid {queued_sid!r} diverges")
 
         # 承载力（ResourceError）：用户注册、全局/单用户上限、池与地址。
+        # 墓碑用户仍须已注册，但墓碑不计容量、不持租约。
         for row in sessions:
             if row["用户"] not in self._auth:
                 raise ResourceError(
@@ -2185,12 +2214,15 @@ class Sessions:
                 raise ResourceError(
                     f"checkpoint references unregistered user: {row['用户']!r}"
                 )
-        if len(sessions) > self._total:
+        live_sessions = [
+            row for row in sessions if row["状态"] != _STATE_OFFLINE
+        ]
+        if len(live_sessions) > self._total:
             raise ResourceError(
-                f"total session limit {self._total} below {len(sessions)} sessions"
+                f"total session limit {self._total} below {len(live_sessions)} sessions"
             )
         per_user = {}
-        for row in sessions:
+        for row in live_sessions:
             user = row["用户"]
             per_user[user] = per_user.get(user, 0) + 1
         for user, count in per_user.items():
