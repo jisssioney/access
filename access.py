@@ -8,7 +8,9 @@
   export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
   令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats、容量申请
   capacity：1024 项等待队列的申请/取消/推进，截止超时与按入队序晋升、
-  capacity_events 事件查询与 capacity_stats 容量统计）。
+  capacity_events 事件查询与 capacity_stats 容量统计、容量检查点
+  clog/cverify/creplay：现状快照（事件账本逐条 sha256 链接、状态哈希
+  覆盖前四顶层键）、账本链校验与全验后原子回放恢复）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -470,6 +472,286 @@ _CAP_STATE_FAILED = "状态失败"
 _CAP_UNKNOWN = "未知"
 _MAX_QUEUE = 1024
 
+# 检查点事件结果全集；入队序恒为 0 的结果子集（余者入队序 >= 1）。
+_CAP_RESULTS = (
+    _CAP_ONLINE,
+    _CAP_QUEUED,
+    _CAP_CANCELLED,
+    _CAP_TIMEOUT,
+    _CAP_PROMOTED,
+    _CAP_QUEUE_FULL,
+    _CAP_AUTH_FAILED,
+    _CAP_STATE_FAILED,
+    _CAP_UNKNOWN,
+)
+_CAP_ZERO_ORDER = (
+    _CAP_ONLINE,
+    _CAP_QUEUE_FULL,
+    _CAP_AUTH_FAILED,
+    _CAP_STATE_FAILED,
+    _CAP_UNKNOWN,
+)
+_SESSION_STATES = (_STATE_ONLINE, _STATE_SUSPENDED, _STATE_OFFLINE)
+
+
+def _snapshot_digest(payload):
+    """紧凑 JSON（去 LF）UTF-8 字节的 sha256 小写十六进制串。"""
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _cap_event_hash(seq, now_ms, sid, verdict, order, prev_hash):
+    """由事件前六键（键序固定）的紧凑 JSON（去 LF）算 sha256 小写值。"""
+    head = {
+        "序号": seq,
+        "时刻": now_ms,
+        "会话": sid,
+        "结果": verdict,
+        "入队序": order,
+        "前哈希": prev_hash,
+    }
+    return _snapshot_digest(head)
+
+
+def _checkpoint_int(item, key, minimum):
+    """检查点整数字段：非 bool int 且 >= minimum，否则抛 ValueError。"""
+    value = item[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an int, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(f"{key} must be >= {minimum}, got {value}")
+    return value
+
+
+def _checkpoint_credential(key, value):
+    """检查点凭据字段：str 且满足凭据约束，否则抛 ValueError。"""
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a str, got {type(value).__name__}")
+    try:
+        _check_credential(key, value)
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
+    return value
+
+
+def _parse_checkpoint(text):
+    """解析并全量校验检查点文本，返回规范化 (时刻, events, sessions, queued)。
+
+    events 为 (序号, 时刻, 会话, 结果, 入队序, 前哈希, 哈希) 元组列表；
+    sessions 为 (会话, 用户, 状态, 期限, 池|None, 地址int|None, 租期) 元组
+    列表（按会话升序）；queued 为 (会话, 用户, 申请时刻, 等待, 截止, 入队序)
+    元组列表（按入队序）。JSON 解析错（JSONDecodeError 系 ValueError 子类）、
+    重复/未知/缺失键、结构、类型、取值、次序、不变量、事件链或状态哈希错
+    均抛 ValueError。
+    """
+    doc = json.loads(text, object_pairs_hook=_unique_object)
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"checkpoint must be a JSON object, got {type(doc).__name__}"
+        )
+    if set(doc) != {"时刻", "事件", "会话", "排队", "状态哈希"}:
+        raise ValueError(
+            "checkpoint keys must be exactly 时刻/事件/会话/排队/状态哈希"
+        )
+    now_ms = _checkpoint_int(doc, "时刻", 0)
+    state_hash = doc["状态哈希"]
+    if not isinstance(state_hash, str):
+        raise ValueError(
+            f"状态哈希 must be a str, got {type(state_hash).__name__}"
+        )
+
+    raw_events = doc["事件"]
+    if not isinstance(raw_events, list):
+        raise ValueError(f"事件 must be a list, got {type(raw_events).__name__}")
+    events = []
+    prev_hash = "0" * 64
+    for index, item in enumerate(raw_events, start=1):
+        if not isinstance(item, dict) or set(item) != {
+            "序号",
+            "时刻",
+            "会话",
+            "结果",
+            "入队序",
+            "前哈希",
+            "哈希",
+        }:
+            raise ValueError(
+                "event keys must be exactly 序号/时刻/会话/结果/入队序/前哈希/哈希"
+            )
+        seq = _checkpoint_int(item, "序号", 1)
+        moment = _checkpoint_int(item, "时刻", 0)
+        sid = item["会话"]
+        if not isinstance(sid, str):
+            raise ValueError(f"会话 must be a str, got {type(sid).__name__}")
+        verdict = item["结果"]
+        if not isinstance(verdict, str) or verdict not in _CAP_RESULTS:
+            raise ValueError(
+                "结果 must be one of 在线/排队/取消/超时/晋升/队满/"
+                f"认证失败/状态失败/未知, got {verdict!r}"
+            )
+        order = _checkpoint_int(item, "入队序", 0)
+        if verdict in _CAP_ZERO_ORDER:
+            if order != 0:
+                raise ValueError(f"入队序 must be 0 for {verdict}, got {order}")
+        elif order < 1:
+            raise ValueError(f"入队序 must be >= 1 for {verdict}, got {order}")
+        prev = item["前哈希"]
+        digest = item["哈希"]
+        if not isinstance(prev, str):
+            raise ValueError(f"前哈希 must be a str, got {type(prev).__name__}")
+        if not isinstance(digest, str):
+            raise ValueError(f"哈希 must be a str, got {type(digest).__name__}")
+        if seq != index:
+            raise ValueError(
+                f"事件 序号 must be continuous: expected {index}, got {seq}"
+            )
+        if prev != prev_hash:
+            raise ValueError("事件 前哈希 does not chain to previous 哈希")
+        if digest != _cap_event_hash(seq, moment, sid, verdict, order, prev):
+            raise ValueError("事件 哈希 mismatch")
+        events.append((seq, moment, sid, verdict, order, prev, digest))
+        prev_hash = digest
+
+    raw_sessions = doc["会话"]
+    if not isinstance(raw_sessions, list):
+        raise ValueError(f"会话 must be a list, got {type(raw_sessions).__name__}")
+    sessions = []
+    prev_sid = None
+    for item in raw_sessions:
+        if not isinstance(item, dict) or set(item) != {
+            "会话",
+            "用户",
+            "状态",
+            "期限",
+            "池",
+            "地址",
+            "租期",
+        }:
+            raise ValueError(
+                "session keys must be exactly 会话/用户/状态/期限/池/地址/租期"
+            )
+        sid = _checkpoint_credential("会话", item["会话"])
+        user = _checkpoint_credential("用户", item["用户"])
+        state = item["状态"]
+        if state not in _SESSION_STATES:
+            raise ValueError(f"状态 must be 在线/挂起/下线, got {state!r}")
+        deadline = _checkpoint_int(item, "期限", 0)
+        lease = _checkpoint_int(item, "租期", 0)
+        pool_id = item["池"]
+        address = item["地址"]
+        if not isinstance(pool_id, str):
+            raise ValueError(f"池 must be a str, got {type(pool_id).__name__}")
+        if not isinstance(address, str):
+            raise ValueError(f"地址 must be a str, got {type(address).__name__}")
+        if state == _STATE_ONLINE:
+            # 老化后在线会话期限必大于时刻（>= 1）；持址租期 >= 1，
+            # 租约到期被释址但未空闲到期者无址且租期为 0。
+            if deadline < 1:
+                raise ValueError(f"在线 期限 must be >= 1, got {deadline}")
+            if (pool_id == "") != (address == ""):
+                raise ValueError("在线 池/地址 must be both empty or both set")
+            if pool_id:
+                _checkpoint_credential("池", pool_id)
+                ip_int = _check_ip("地址", address)
+                if lease < 1:
+                    raise ValueError(f"在线持址 租期 must be >= 1, got {lease}")
+            else:
+                ip_int = None
+                if lease != 0:
+                    raise ValueError(f"在线无址 租期 must be 0, got {lease}")
+                pool_id = None
+        else:
+            # 挂起/下线恒无址：期限/租期为 0、池/地址为空串。
+            if deadline != 0 or lease != 0 or pool_id != "" or address != "":
+                raise ValueError(
+                    "挂起/下线 must have 期限/租期 0 and empty 池/地址"
+                )
+            ip_int = None
+            pool_id = None
+        if prev_sid is not None and sid <= prev_sid:
+            raise ValueError("会话 must be sorted by 会话 ascending, no duplicates")
+        prev_sid = sid
+        sessions.append((sid, user, state, deadline, pool_id, ip_int, lease))
+
+    raw_queue = doc["排队"]
+    if not isinstance(raw_queue, list):
+        raise ValueError(f"排队 must be a list, got {type(raw_queue).__name__}")
+    queued = []
+    prev_order = None
+    taken_sids = {item[0] for item in sessions}
+    for item in raw_queue:
+        if not isinstance(item, dict) or set(item) != {
+            "会话",
+            "用户",
+            "申请时刻",
+            "等待",
+            "截止",
+            "入队序",
+        }:
+            raise ValueError(
+                "queue keys must be exactly 会话/用户/申请时刻/等待/截止/入队序"
+            )
+        sid = _checkpoint_credential("会话", item["会话"])
+        user = _checkpoint_credential("用户", item["用户"])
+        applied = _checkpoint_int(item, "申请时刻", 0)
+        wait = _checkpoint_int(item, "等待", 1)
+        deadline = _checkpoint_int(item, "截止", 0)
+        order = _checkpoint_int(item, "入队序", 1)
+        if deadline != applied + wait:
+            raise ValueError("截止 must equal 申请时刻+等待")
+        if prev_order is not None and order <= prev_order:
+            raise ValueError("排队 must be sorted by 入队序 ascending, no duplicates")
+        prev_order = order
+        if sid in taken_sids:
+            raise ValueError(f"duplicate sid across 会话/排队: {sid!r}")
+        taken_sids.add(sid)
+        queued.append((sid, user, applied, wait, deadline, order))
+
+    # 状态哈希覆盖前四顶层键：以规范化值按规范键序重建负载再比对。
+    payload = {
+        "时刻": now_ms,
+        "事件": [
+            {
+                "序号": seq,
+                "时刻": moment,
+                "会话": sid,
+                "结果": verdict,
+                "入队序": order,
+                "前哈希": prev,
+                "哈希": digest,
+            }
+            for seq, moment, sid, verdict, order, prev, digest in events
+        ],
+        "会话": [
+            {
+                "会话": sid,
+                "用户": user,
+                "状态": state,
+                "期限": deadline,
+                "池": pool_id if pool_id is not None else "",
+                "地址": (
+                    str(ipaddress.IPv4Address(ip_int)) if ip_int is not None else ""
+                ),
+                "租期": lease,
+            }
+            for sid, user, state, deadline, pool_id, ip_int, lease in sessions
+        ],
+        "排队": [
+            {
+                "会话": sid,
+                "用户": user,
+                "申请时刻": applied,
+                "等待": wait,
+                "截止": deadline,
+                "入队序": order,
+            }
+            for sid, user, applied, wait, deadline, order in queued
+        ],
+    }
+    if _snapshot_digest(payload) != state_hash:
+        raise ValueError("状态哈希 mismatch")
+    return now_ms, events, sessions, queued
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -540,7 +822,14 @@ class Sessions:
     成功的新 key 记事件，结果限在线/排队/取消/超时/晋升/队满/认证失败/
     状态失败/未知，推进按入队序先超时后晋升，重放不记。capacity_stats
     (now_ms) 先验参再老化，输出全局在线/挂起/排队/可用/水位/最早截止
-    与按标识升序的用户、池明细。
+    与按标识升序的用户、池明细。clog(now_ms) 先老化再生成检查点：
+    顶层时刻/事件/会话/排队/状态哈希，事件账本逐条 sha256 链接（首项
+    前哈希 64 个 0、余承前项，哈希覆盖前六键），状态哈希同法覆盖前四
+    顶层键，时刻可回拨；cverify() 校验账本序号连续与哈希链，空链
+    True；creplay(text) 全验（规范包与链 ValueError、非同批状态
+    StateError、用户/容量/池/地址不承载 ResourceError）后原子恢复所列
+    会话、租约、队列与账本，同状态哈希重放不追加，返回该时刻
+    capacity_stats。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -593,9 +882,12 @@ class Sessions:
         # capacity 的重放缓存，与 do/meter 分域：
         # key -> (op, sid, args, now_ms, outcome)。
         self._capacity_cache = {}
-        # capacity 事件序列（五元组，序号自 1）：
-        # (序号, 时刻, 会话, 结果, 入队序)；仅新 key 验参成功后记，重放不记。
+        # capacity 事件序列（七元组，序号自 1）：
+        # (序号, 时刻, 会话, 结果, 入队序, 前哈希, 哈希)；仅新 key 验参成功后
+        # 记，重放不记。哈希链供检查点与 cverify：首项前哈希为 64 个 0，
+        # 余承前项哈希，_cap_tail 为末项哈希（空链为 64 个 0）。
         self._capacity_events = []
+        self._cap_tail = "0" * 64
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -1499,13 +1791,19 @@ class Sessions:
         return total_count, per_user
 
     def _cap_event(self, now_ms, sid, verdict, order):
-        """追加一条 capacity 事件（序号自 1），O(1) 时空。
+        """追加一条 capacity 事件（序号自 1）并延展哈希链，O(1) 时空。
 
         同一推进产生的超时/晋升按入队序追加（先超时后晋升）；无入队序者
-        （申请立即结果、取消与各类失败）入队序为 0。
+        （申请立即结果与各类失败）入队序为 0，取消保留原入队序。前哈希首项
+        为 64 个 0、余承前项哈希，哈希覆盖前六键。
         """
         seq = len(self._capacity_events) + 1
-        self._capacity_events.append((seq, now_ms, sid, verdict, order))
+        prev_hash = self._cap_tail
+        digest = _cap_event_hash(seq, now_ms, sid, verdict, order, prev_hash)
+        self._capacity_events.append(
+            (seq, now_ms, sid, verdict, order, prev_hash, digest)
+        )
+        self._cap_tail = digest
 
     def capacity_events(self, after=0, limit=100):
         """返回 capacity 事件 JSON；查询不老化，O(limit) 时空。
@@ -1531,7 +1829,7 @@ class Sessions:
                 "结果": verdict,
                 "入队序": order,
             }
-            for seq, now_ms, sid, verdict, order in window
+            for seq, now_ms, sid, verdict, order, _prev_hash, _digest in window
         ]
         # 有项取下一序号为末项序号，无项取 after。
         next_seq = window[-1][0] if window else after
@@ -1644,6 +1942,211 @@ class Sessions:
             "池": pool_rows,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def clog(self, now_ms):
+        """生成容量状态检查点 JSON（LF 结尾）；先验参再老化，时刻可回拨。
+
+        now_ms 为非 bool 非负 int：类型错 TypeError、取值错 ValueError。
+        顶层键序为“时刻/事件/会话/排队/状态哈希”。事件即 capacity 事件
+        账本，项键序为“序号/时刻/会话/结果/入队序/前哈希/哈希”，首项前
+        哈希为 64 个 0、余承前项哈希，哈希为前六键紧凑 JSON（去 LF）的
+        UTF-8 字节之 sha256 小写值。会话按会话升序，项键序为
+        “会话/用户/状态/期限/池/地址/租期”，期限/租期为 int、余为 str，
+        无池无址为 ""。排队按入队序，项键序为
+        “会话/用户/申请时刻/等待/截止/入队序”，前二为 str、余为 int。
+        状态哈希同法覆盖前四顶层键。时间 O(E+S log S+Q)、空间 O(E+S+Q)。
+        """
+        _check_int("now_ms", now_ms, 0)
+        self._age(now_ms)
+
+        events = [
+            {
+                "序号": seq,
+                "时刻": moment,
+                "会话": sid,
+                "结果": verdict,
+                "入队序": order,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for seq, moment, sid, verdict, order, prev_hash, digest in (
+                self._capacity_events
+            )
+        ]
+        sessions = []
+        for sid in sorted(self._sessions):
+            session = self._sessions[sid]
+            ip_int = session["ip"]
+            sessions.append(
+                {
+                    "会话": sid,
+                    "用户": session["user"],
+                    "状态": session["state"],
+                    "期限": session["deadline"],
+                    "池": session["pool"] if session["pool"] is not None else "",
+                    "地址": (
+                        str(ipaddress.IPv4Address(ip_int))
+                        if ip_int is not None
+                        else ""
+                    ),
+                    "租期": session["lease"],
+                }
+            )
+        queued = [
+            {
+                "会话": queued_sid,
+                "用户": entry[0],
+                "申请时刻": entry[1],
+                "等待": entry[2],
+                "截止": entry[3],
+                "入队序": entry[4],
+            }
+            for queued_sid in self._queue_order
+            for entry in (self._capacity_queue[queued_sid],)
+        ]
+        payload = {"时刻": now_ms, "事件": events, "会话": sessions, "排队": queued}
+        # 状态哈希覆盖前四顶层键，算法与事件哈希一致。
+        payload["状态哈希"] = _snapshot_digest(payload)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def cverify(self):
+        """校验 capacity 事件账本序号连续、前哈希衔接、哈希无误；空链 True。
+
+        O(E) 时间、O(1) 空间：逐项重算，不另建序列。
+        """
+        prev_hash = "0" * 64
+        for expect, event in enumerate(self._capacity_events, start=1):
+            seq, now_ms, sid, verdict, order, stored_prev, digest = event
+            if seq != expect or stored_prev != prev_hash:
+                return False
+            if (
+                _cap_event_hash(seq, now_ms, sid, verdict, order, stored_prev)
+                != digest
+            ):
+                return False
+            prev_hash = digest
+        return True
+
+    def creplay(self, text):
+        """回放检查点：仅恢复所列会话、租约、队列与事件账本，返回该时刻
+        capacity_stats。
+
+        text 非 str 抛 TypeError；非规范包（结构、类型、取值、次序、不变量
+        或状态哈希不符）或事件链错抛 ValueError；本实例已有事件账本非包内
+        账本前缀（非同批状态）抛 StateError；用户未注册、容量上限不承载、
+        池缺失或地址不可用/被保留/静态易主/重复租用抛 ResourceError。全部
+        校验通过后原子提交：会话、各池租约、等待队列与账本整体替换为包内
+        所列；账本按前缀衔接，仅追加缺失后缀，同状态哈希重放不追加。配置、
+        缓存、计量统计与其余审计不受影响。
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        now_ms, events, sessions, queued = _parse_checkpoint(text)
+
+        # 同批检查：现有账本须为包内账本前缀；同状态哈希重放时二者相等，
+        # 下方整体替换不追加任何事件。
+        current = self._capacity_events
+        if len(current) > len(events) or any(
+            current[index] != events[index] for index in range(len(current))
+        ):
+            raise StateError(
+                "existing capacity event ledger is not a prefix of the checkpoint"
+            )
+
+        # 承载检查：用户已注册、全局与单用户上限、池存在且地址可承载。
+        users = {item[1] for item in sessions}
+        users |= {item[1] for item in queued}
+        for user in users:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"checkpoint user not in authenticator: {user!r}"
+                )
+        total_active = 0
+        per_user = {}
+        for _sid, user, state, *_rest in sessions:
+            if state != _STATE_OFFLINE:
+                total_active += 1
+                per_user[user] = per_user.get(user, 0) + 1
+        if total_active > self._total:
+            raise ResourceError(
+                f"total session limit {self._total} below {total_active} "
+                "checkpoint sessions"
+            )
+        for user, count in per_user.items():
+            if count > self._per:
+                raise ResourceError(
+                    f"per-user session limit {self._per} below {count} "
+                    f"checkpoint sessions for {user!r}"
+                )
+        leased = {}
+        for sid, user, _state, _deadline, pool_id, ip_int, _lease in sessions:
+            if ip_int is None:
+                continue
+            pool = self._pools.get(pool_id)
+            address = str(ipaddress.IPv4Address(ip_int))
+            if pool is None:
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {sid!r}: "
+                    f"no pool {pool_id!r}"
+                )
+            if ip_int in pool.reserved or (
+                ip_int not in pool.static_ips
+                and ip_int not in pool.free
+                and ip_int not in pool.leases
+            ):
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {sid!r}: "
+                    f"address {address} not usable in pool {pool_id!r}"
+                )
+            if ip_int in pool.static_ips and pool.static.get(user) != ip_int:
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {sid!r}: "
+                    f"address {address} is static for another user "
+                    f"in pool {pool_id!r}"
+                )
+            pool_leased = leased.setdefault(pool_id, {})
+            if ip_int in pool_leased:
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {sid!r}: "
+                    f"address {address} leased twice in pool {pool_id!r}"
+                )
+            pool_leased[ip_int] = sid
+
+        # 全部校验通过：原子替换会话、各池租约、等待队列与事件账本。
+        self._sessions = {
+            sid: {
+                "user": user,
+                "state": state,
+                "deadline": deadline,
+                "ip": ip_int,
+                "lease": lease,
+                "pool": pool_id,
+                "meter": None,
+            }
+            for sid, user, state, deadline, pool_id, ip_int, lease in sessions
+        }
+        for pool_id, pool in self._pools.items():
+            # 动态地址全集 = 现空闲 + 现租用动态址；重建后剔除新租用者。
+            dynamic = set(pool.free)
+            for ip_int in pool.leases:
+                if ip_int not in pool.static_ips:
+                    dynamic.add(ip_int)
+            pool_leased = leased.get(pool_id, {})
+            pool.leases = dict(pool_leased)
+            pool.free = [ip_int for ip_int in dynamic if ip_int not in pool_leased]
+            heapq.heapify(pool.free)
+        self._capacity_queue = {
+            sid: [user, applied, wait, deadline, order]
+            for sid, user, applied, wait, deadline, order in queued
+        }
+        self._queue_order = [item[0] for item in queued]
+        # 入队序单调不回拨：保留本实例已发序号，至少覆盖包内最大入队序。
+        self._queue_seq = max(
+            self._queue_seq, queued[-1][5] if queued else 0
+        )
+        self._capacity_events = list(events)
+        self._cap_tail = events[-1][6] if events else "0" * 64
+        return self.capacity_stats(now_ms)
 
     @staticmethod
     def _render_capacity(sid, result, now_ms, deadline):
