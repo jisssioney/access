@@ -2,8 +2,8 @@
 
 当前提供：
 - Authenticator：带失败计数与锁定的用户认证器。
-- Sessions：基于 Authenticator 的会话管理（建立/续租/下线/跨池迁移、空闲老化、
-  构造期 default 池与 add_pool 多地址池、租约、按 key 重放缓存、pool_stats）。
+- Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
+  零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -221,6 +221,7 @@ _OP_ESTABLISH = "建立"
 _OP_RENEW = "续租"
 _OP_OFFLINE = "下线"
 _OP_MIGRATE = "迁移"
+_OP_TAKEOVER = "接管"
 
 _DEFAULT_POOL_ID = "default"
 
@@ -249,11 +250,13 @@ class _Pool:
 class Sessions:
     """会话管理：建立需先认证再查限额，续租限持址在线会话，下线按 sid。
 
-    构造期传入地址池时建为 default 池，add_pool 可追加命名池；未传池则处于
-    零池模式（add_pool 不可用）。各池地址空间相互独立、允许重叠，占用按池隔离。
-    建立为静态用户取其专属地址，否则取最小未租用动态地址；租期到期、挂起或
-    下线均释放地址，静态地址不回动态池。迁移在两池间原子换址。按 key 永久缓存
-    重放。
+    构造期传入地址池时建为 default 池；未传池则从零池起步，add_pool 可随时
+    追加命名池（含 default），重名 ValueError。建立须经 default 池分配地址，
+    缺 default 抛 StateError；无池时 pool_stats 抛 StateError。各池地址空间
+    相互独立、允许重叠，占用按池隔离。建立为静态用户取其专属地址，否则取最小
+    未租用动态地址；租期到期、挂起或下线均释放地址，静态地址不回动态池。迁移
+    在两池间原子换址。接管将旧会话原子下线，新会话接管其池与地址或自 default
+    池新分配地址。按 key 永久缓存重放。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -264,10 +267,9 @@ class Sessions:
         self._per = _check_int("per", per, 1)
         self._idle_ms = _check_int("idle_ms", idle_ms, 0)
 
-        self._pool_enabled = pool is not None
         # 池 id -> _Pool，插入顺序即 add_pool 顺序；统计另按 id 升序输出。
         self._pools = {}
-        if self._pool_enabled:
+        if pool is not None:
             self._pools[_DEFAULT_POOL_ID] = _Pool(_check_pool(pool))
         self._lease_ms = _check_int("lease_ms", lease_ms, 1)
 
@@ -279,23 +281,20 @@ class Sessions:
         self._cache = {}
 
     def add_pool(self, pool_id, pool):
-        """构造为 default 池的多池模式下追加命名池；零池模式抛 StateError。
+        """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
 
         重名抛 ValueError，pool_id/pool 类型或取值不合法抛 TypeError/ValueError。
         新池地址空间独立，可与既有池重叠。
         """
         _check_credential("pool id", pool_id)
-        # 先完成全部入参校验（与 do() 一致：参数类异常先于状态类异常），
-        # 再判定零池模式与重名。
+        # 先完成全部入参校验（与 do() 一致：参数类异常先于状态类异常），再查重名。
         parsed = _check_pool(pool)
-        if not self._pool_enabled:
-            raise StateError("no default pool: sessions constructed without a pool")
         if pool_id in self._pools:
             raise ValueError(f"duplicate pool id: {pool_id!r}")
         self._pools[pool_id] = _Pool(parsed)
 
     def do(self, key, op, sid, args, now_ms):
-        """执行一次建立/续租/下线/迁移操作，返回 LF 结尾的 JSON 字符串。"""
+        """执行一次建立/续租/下线/迁移/接管操作，返回 LF 结尾的 JSON 字符串。"""
         _check_credential("key", key)
 
         cached = self._cache.get(key)
@@ -333,6 +332,8 @@ class Sessions:
                 result = self._renew(sid, now_ms)
             elif op == _OP_MIGRATE:
                 result = self._migrate(sid, args[0], args[1], now_ms)
+            elif op == _OP_TAKEOVER:
+                result = self._takeover(sid, args[0], args[1], now_ms)
             else:
                 result = self._offline(sid, now_ms)
         except (AuthError, ResourceError, StateError, KeyError) as exc:
@@ -348,18 +349,19 @@ class Sessions:
         return result
 
     def _validate_params(self, op, sid, args, now_ms):
-        """校验 key 之外的四个参数；迁移始终受理（零池于老化后抛 StateError），
-        续租仅在地址池启用时受理。"""
+        """校验 key 之外的四个参数；迁移与接管始终受理（无池于老化后抛
+        StateError 或 KeyError），续租仅在已有地址池时受理。"""
         if isinstance(op, bool) or not isinstance(op, str):
             raise TypeError(f"op must be a str, got {type(op).__name__}")
-        # 迁移在零池模式下亦通过验参，StateError 延后到老化之后（见 _migrate）。
-        valid_ops = (_OP_ESTABLISH, _OP_OFFLINE, _OP_MIGRATE)
-        if self._pool_enabled:
+        # 迁移与接管在零池模式下亦通过验参，状态类异常延后到老化之后。
+        valid_ops = (_OP_ESTABLISH, _OP_OFFLINE, _OP_MIGRATE, _OP_TAKEOVER)
+        if self._pools:
             valid_ops = (
                 _OP_ESTABLISH,
                 _OP_RENEW,
                 _OP_OFFLINE,
                 _OP_MIGRATE,
+                _OP_TAKEOVER,
             )
         if op not in valid_ops:
             raise ValueError(f"op must be one of {valid_ops}, got {op!r}")
@@ -382,6 +384,16 @@ class Sessions:
                     f"got {len(args)} items"
                 )
             _check_credential("target", args[0])
+            _check_credential("password", args[1])
+        elif op == _OP_TAKEOVER:
+            if not isinstance(args, tuple):
+                raise TypeError(f"args must be a tuple, got {type(args).__name__}")
+            if len(args) != 2:
+                raise ValueError(
+                    "args must be a 2-tuple (old, password), "
+                    f"got {len(args)} items"
+                )
+            _check_credential("old", args[0])
             _check_credential("password", args[1])
         elif args is not None:
             raise ValueError(f"args must be None for {op}, got {args!r}")
@@ -434,29 +446,27 @@ class Sessions:
         if sid in self._sessions:
             raise StateError(f"duplicate sid: {sid!r}")
 
-        ip_int = None
-        lease = 0
-        pool_id = None
-        if self._pool_enabled:
-            pool_id = _DEFAULT_POOL_ID
-            pool = self._pools[pool_id]
-            ip_int = pool.static.get(user)
-            if ip_int is None:
-                # 非静态用户：取最小未租用的非保留非静态地址。
-                if not pool.free:
-                    raise ResourceError("address pool exhausted")
-                ip_int = heapq.heappop(pool.free)
-            elif ip_int in pool.leases:
-                # 静态地址专属该用户，但同一时刻只能租给一个会话。
-                raise ResourceError(
-                    f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
-                    "already in use"
-                )
-            lease = now_ms + self._lease_ms
+        # 建立须经 default 池分配地址；缺 default 池为 StateError。
+        pool = self._pools.get(_DEFAULT_POOL_ID)
+        if pool is None:
+            raise StateError("no default pool: cannot establish session")
+        pool_id = _DEFAULT_POOL_ID
+        ip_int = pool.static.get(user)
+        if ip_int is None:
+            # 非静态用户：取最小未租用的非保留非静态地址。
+            if not pool.free:
+                raise ResourceError("address pool exhausted")
+            ip_int = heapq.heappop(pool.free)
+        elif ip_int in pool.leases:
+            # 静态地址专属该用户，但同一时刻只能租给一个会话。
+            raise ResourceError(
+                f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
+                "already in use"
+            )
+        lease = now_ms + self._lease_ms
 
         # 全部校验通过后再落库，杜绝失败残留。
-        if self._pool_enabled:
-            pool.leases[ip_int] = sid
+        pool.leases[ip_int] = sid
         deadline = now_ms + self._idle_ms
         self._sessions[sid] = {
             "user": user,
@@ -466,7 +476,7 @@ class Sessions:
             "lease": lease,
             "pool": pool_id,
         }
-        address = str(ipaddress.IPv4Address(ip_int)) if self._pool_enabled else None
+        address = str(ipaddress.IPv4Address(ip_int))
         return self._render(sid, _STATE_ONLINE, now_ms, deadline, address, lease)
 
     def _renew(self, sid, now_ms):
@@ -496,8 +506,8 @@ class Sessions:
         依次：零池 StateError、未知 sid/target KeyError、非持址在线或同池
         StateError、认证非 ok AuthError、目标池耗尽或静态占用 ResourceError。
         """
-        if not self._pool_enabled:
-            raise StateError("no pool: sessions constructed without a pool")
+        if not self._pools:
+            raise StateError("no pool: no address pool configured")
         session = self._sessions.get(sid)
         if session is None:
             raise KeyError(f"unknown sid: {sid!r}")
@@ -557,6 +567,88 @@ class Sessions:
             session["lease"],
         )
 
+    def _takeover(self, sid, old, password, now_ms):
+        """同用户接管：旧会话原子下线，新会话接管其地址或自 default 池分配。
+
+        依次：未知 old KeyError、sid 已存在或旧会话已下线 StateError、认证非 ok
+        AuthError；旧会话持址则转移池/地址/租约，否则自 default 池取静态址或
+        最小动态址，缺 default StateError、无可分配址 ResourceError。失败不建
+        sid，保持老化后状态与池水位。时/空 O(S+logA)/O(1)。
+        """
+        old_session = self._sessions.get(old)
+        if old_session is None:
+            raise KeyError(f"unknown old sid: {old!r}")
+        if sid in self._sessions:
+            raise StateError(f"duplicate sid: {sid!r}")
+        if old_session["state"] == _STATE_OFFLINE:
+            raise StateError(f"cannot take over offline sid {old!r}")
+
+        user = old_session["user"]
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        # 旧值取接管前，供输出且不受后续清场影响。
+        old_ip = old_session["ip"]
+        old_deadline = old_session["deadline"]
+        old_lease = old_session["lease"]
+
+        if old_ip is not None:
+            # 转移：池、地址与租约记录由旧会话让渡给新会话，池水位不变。
+            pool_id = old_session["pool"]
+            ip_int = old_ip
+        else:
+            # 分配：default 池静态址或最小动态址。
+            pool = self._pools.get(_DEFAULT_POOL_ID)
+            if pool is None:
+                raise StateError("no default pool: cannot assign address")
+            ip_int = pool.static.get(user)
+            if ip_int is None:
+                if not pool.free:
+                    raise ResourceError("address pool exhausted")
+                ip_int = heapq.heappop(pool.free)
+            elif ip_int in pool.leases:
+                # 静态地址专属该用户，但同一时刻只能租给一个会话。
+                raise ResourceError(
+                    f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
+                    "already in use"
+                )
+            pool_id = _DEFAULT_POOL_ID
+
+        # 全部校验通过：原子下线旧会话（清期限/地址/租期），新会话在线接管。
+        pool = self._pools[pool_id]
+        pool.leases[ip_int] = sid
+        old_session["state"] = _STATE_OFFLINE
+        old_session["deadline"] = 0
+        old_session["ip"] = None
+        old_session["lease"] = 0
+        old_session["pool"] = None
+        deadline = now_ms + self._idle_ms
+        lease = now_ms + self._lease_ms
+        self._sessions[sid] = {
+            "user": user,
+            "state": _STATE_ONLINE,
+            "deadline": deadline,
+            "ip": ip_int,
+            "lease": lease,
+            "pool": pool_id,
+        }
+        old_address = (
+            str(ipaddress.IPv4Address(old_ip)) if old_ip is not None else ""
+        )
+        return self._render_takeover(
+            old,
+            old_address,
+            old_deadline,
+            old_lease,
+            sid,
+            now_ms,
+            deadline,
+            pool_id,
+            str(ipaddress.IPv4Address(ip_int)),
+            lease,
+        )
+
     def _offline(self, sid, now_ms):
         """在线/挂起/下线→下线、期限与租约清零、释址。"""
         session = self._sessions.get(sid)
@@ -567,14 +659,14 @@ class Sessions:
         session["state"] = _STATE_OFFLINE
         session["deadline"] = 0
         self._release(session)
-        address = "" if self._pool_enabled else None
+        address = "" if self._pools else None
         return self._render(sid, _STATE_OFFLINE, now_ms, 0, address, 0)
 
     def pool_stats(self, now_ms):
-        """返回各池占用统计 JSON；零池抛 StateError，否则先老化再统计。"""
+        """返回各池占用统计 JSON；无池抛 StateError，否则先老化再统计。"""
         _check_int("now_ms", now_ms, 0)
-        if not self._pool_enabled:
-            raise StateError("no pool: sessions constructed without a pool")
+        if not self._pools:
+            raise StateError("no pool: no address pool configured")
         self._age(now_ms)
         pools = []
         for pool_id in sorted(self._pools):
@@ -618,6 +710,35 @@ class Sessions:
             "原地址": old_address,
             "目标池": target,
             "目标地址": new_address,
+            "租期": lease,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    @staticmethod
+    def _render_takeover(
+        old,
+        old_address,
+        old_deadline,
+        old_lease,
+        sid,
+        now_ms,
+        deadline,
+        pool_id,
+        address,
+        lease,
+    ):
+        # 旧值取接管前，旧会话无地址时旧地址为 ""；新会话状态恒为在线。
+        payload = {
+            "旧会话": old,
+            "旧地址": old_address,
+            "旧期限": old_deadline,
+            "旧租期": old_lease,
+            "新会话": sid,
+            "状态": _STATE_ONLINE,
+            "时刻": now_ms,
+            "期限": deadline,
+            "池": pool_id,
+            "地址": address,
             "租期": lease,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
