@@ -7,7 +7,8 @@
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
   export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
   令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats、容量申请
-  capacity：1024 项等待队列的申请/取消/推进，截止超时与按入队序晋升）。
+  capacity：1024 项等待队列的申请/取消/推进，截止超时与按入队序晋升，
+  capacity_stats 容量全景与 capacity_events 事件查询）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -454,7 +455,7 @@ _OP_TAKEOVER = "接管"
 
 _DEFAULT_POOL_ID = "default"
 
-# capacity 操作与其结果；结果仅限在线/排队/取消/超时。
+# capacity 操作与其结果；推进结果仅计在线（挂起仍占全局/用户上限）。
 _OP_APPLY = "申请"
 _OP_CANCEL = "取消"
 _OP_ADVANCE = "推进"
@@ -462,6 +463,11 @@ _CAP_ONLINE = "在线"
 _CAP_QUEUED = "排队"
 _CAP_CANCELLED = "取消"
 _CAP_TIMEOUT = "超时"
+_CAP_PROMOTED = "晋升"
+_CAP_QUEUE_FULL = "队满"
+_CAP_AUTH_FAILED = "认证失败"
+_CAP_STATE_FAILED = "状态失败"
+_CAP_UNKNOWN = "未知"
 _MAX_QUEUE = 1024
 
 
@@ -527,8 +533,14 @@ class Sessions:
     认证、老化、上限与 default 池取址规则之上提供 1024 项等待队列：
     申请可立即服务则原子建立、否则入队（队满 ResourceError），取消仅
     撤销排队项，推进先老化再清超时（截止=申请时刻+等待，含同刻）并依
-    入队序晋升容量允许且可取址者至全局满；按 key 重放缓存与 do/meter
-    分域；既有 do 建立仍立即拒绝、绝不入队。
+    入队序晋升容量允许且可取址者至全局满；推进输出“在线”老化后仅计
+    在线会话（挂起仍占全局与用户上限）；按 key 重放缓存与 do/meter
+    分域；既有 do 建立仍立即拒绝、绝不入队。验参成功的新 key 首次结果
+    记入 capacity_events：结果仅在线/排队/取消/超时/晋升/队满/认证失败/
+    状态失败/未知，推进按入队序先超时后晋升，重放不记；
+    capacity_events(after, limit) 游标与异常沿用 audit、查询不老化。
+    capacity_stats(now_ms) 先验参再老化，输出时刻/在线/挂起/排队/可用/
+    水位/最早截止/用户/池的容量全景。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -581,6 +593,10 @@ class Sessions:
         # capacity 的重放缓存，与 do/meter 分域：
         # key -> (op, sid, args, now_ms, outcome)。
         self._capacity_cache = {}
+        # capacity 事件审计：六元组（序号自 1）序列。仅验参成功的新 key 首次
+        # 调用记账（异常或成功），同参重放与异参 key 复用不记；推进一次调用
+        # 按入队序先超时后晋升落多条，其余操作每 key 恰一条。
+        self._capacity_events = []
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -1306,11 +1322,13 @@ class Sessions:
             self._age(now_ms)
         try:
             if op == _OP_APPLY:
-                result = self._cap_apply(sid, args[0], args[1], args[2], now_ms)
+                result, label, queue_seq = self._cap_apply(
+                    sid, args[0], args[1], args[2], now_ms
+                )
             elif op == _OP_CANCEL:
-                result = self._cap_cancel(sid, now_ms)
+                result, label, queue_seq = self._cap_cancel(sid, now_ms)
             else:
-                result = self._cap_advance(now_ms)
+                result, rows = self._cap_advance(now_ms)
         except (AuthError, ResourceError, StateError, KeyError) as exc:
             self._capacity_cache[key] = (
                 op,
@@ -1319,8 +1337,24 @@ class Sessions:
                 now_ms,
                 ("err", (type(exc), exc.args)),
             )
+            # 仅验参成功的新 key 首次结果入账；异常按结果类映射标签。
+            if isinstance(exc, AuthError):
+                label = _CAP_AUTH_FAILED
+            elif isinstance(exc, StateError):
+                label = _CAP_STATE_FAILED
+            elif isinstance(exc, ResourceError):
+                label = _CAP_QUEUE_FULL
+            else:
+                label = _CAP_UNKNOWN
+            self._capacity_event_append(now_ms, sid, label, 0)
             raise
         self._capacity_cache[key] = (op, sid, args, now_ms, ("ok", result))
+        if op == _OP_ADVANCE:
+            # 推进一次调用按入队序先超时后晋升落多条，时刻同为本次推进时刻。
+            for row_sid, row_label, row_seq in rows:
+                self._capacity_event_append(now_ms, row_sid, row_label, row_seq)
+        else:
+            self._capacity_event_append(now_ms, sid, label, queue_seq)
         return result
 
     def _validate_capacity_params(self, op, sid, args, now_ms):
@@ -1354,7 +1388,10 @@ class Sessions:
         _check_int("now_ms", now_ms, 0)
 
     def _cap_apply(self, sid, user, password, wait, now_ms):
-        """认证后能立即服务则原子建立，否则入队；失败不留半分配。"""
+        """认证后能立即服务则原子建立，否则入队；失败不留半分配。
+
+        返回 (json, 结果标签, 入队序)：在线无队序为 0，排队带新入队序。
+        """
         _, status, _ = self._auth.authenticate(user, password, now_ms)
         if status != "ok":
             raise AuthError(f"authentication not ok for user {user!r}: {status}")
@@ -1373,41 +1410,65 @@ class Sessions:
         )
         if servable:
             self._commit_session(sid, user, pool_id, ip_int, now_ms)
-            return self._render_capacity(sid, _CAP_ONLINE, now_ms, deadline)
+            return (
+                self._render_capacity(sid, _CAP_ONLINE, now_ms, deadline),
+                _CAP_ONLINE,
+                0,
+            )
 
         # 上限满或缺址：入队等待，队列本身满则 ResourceError。
         if len(self._capacity_queue) >= _MAX_QUEUE:
             raise ResourceError(f"capacity queue limit {_MAX_QUEUE} reached")
         self._queue_seq += 1
-        self._capacity_queue[sid] = [user, now_ms, wait, deadline, self._queue_seq]
+        queue_seq = self._queue_seq
+        self._capacity_queue[sid] = [user, now_ms, wait, deadline, queue_seq]
         self._queue_order.append(sid)
-        return self._render_capacity(sid, _CAP_QUEUED, now_ms, deadline)
+        return (
+            self._render_capacity(sid, _CAP_QUEUED, now_ms, deadline),
+            _CAP_QUEUED,
+            queue_seq,
+        )
 
     def _cap_cancel(self, sid, now_ms):
-        """撤销排队项：未知 sid KeyError，非排队项（在线/挂起/下线）StateError。"""
+        """撤销排队项：未知 sid KeyError，非排队项（在线/挂起/下线）StateError。
+
+        返回 (json, 结果标签, 入队序)：取消必带被撤排队项的入队序。
+        """
         entry = self._capacity_queue.pop(sid, None)
         if entry is None:
             if sid in self._sessions:
                 raise StateError(f"sid {sid!r} is not a queued item")
             raise KeyError(f"unknown sid: {sid!r}")
         self._queue_order.remove(sid)
-        return self._render_capacity(sid, _CAP_CANCELLED, now_ms, entry[3])
+        return (
+            self._render_capacity(sid, _CAP_CANCELLED, now_ms, entry[3]),
+            _CAP_CANCELLED,
+            entry[4],
+        )
 
     def _cap_advance(self, now_ms):
-        """先清超时项再依入队序晋升，返回时刻/在线/排队/变更 JSON。"""
+        """先清超时项再依入队序晋升，返回时刻/在线/排队/变更 JSON。
+
+        返回 (json, rows)；rows 为本次推进的 (sid, 标签, 入队序)，按入队序
+        先超时后晋升。门控按非下线（在线+挂起）计数；输出“在线”仅计老化后
+        在线会话（挂起仍占全局与用户上限）。
+        """
         # 超时（含同刻）：按入队序摘除截止 <= now_ms 者，记录入队序。
         timed_out = []
+        rows = []
         survivors = []
         for queued_sid in self._queue_order:
             entry = self._capacity_queue[queued_sid]
             if entry[3] <= now_ms:
                 timed_out.append(entry[4])
+                rows.append((queued_sid, _CAP_TIMEOUT, entry[4]))
                 del self._capacity_queue[queued_sid]
             else:
                 survivors.append(queued_sid)
 
         # 晋升：计数只扫一次会话表，晋升时增量维护；取址落库每弹一堆 O(log A)。
-        total_count, per_user = self._active_counts()
+        # total/per_user 计非下线（在线+挂起）；online 仅计在线。
+        active_count, per_user, online = self._active_counts()
         promoted = []
         remaining = []
         for queued_sid in survivors:
@@ -1415,35 +1476,42 @@ class Sessions:
             user = entry[0]
             pool_id, ip_int = self._default_candidate(user)
             if (
-                total_count < self._total
+                active_count < self._total
                 and per_user.get(user, 0) < self._per
                 and pool_id is not None
                 and ip_int is not None
             ):
                 self._commit_session(queued_sid, user, pool_id, ip_int, now_ms)
                 promoted.append(entry[4])
+                rows.append((queued_sid, _CAP_PROMOTED, entry[4]))
                 del self._capacity_queue[queued_sid]
-                total_count += 1
+                active_count += 1
+                online += 1
                 per_user[user] = per_user.get(user, 0) + 1
             else:
                 remaining.append(queued_sid)
         self._queue_order = remaining
 
-        # 在线计老化后非下线会话数（total_count 已含全部新晋升）；排队为余留项。
+        # 在线为老化后在线会话数（含全部新晋升，不含挂起）；排队为余留项。
         return self._render_capacity_advance(
-            now_ms, total_count, len(remaining), timed_out + promoted
-        )
+            now_ms, online, len(remaining), timed_out + promoted
+        ), rows
 
     def _active_counts(self):
-        """非下线会话总数与按用户计数（排队项不计），单次 O(S)。"""
-        total_count = 0
+        """单次扫描：非下线总数（在线+挂起，门控用）、按用户计数、在线数。"""
+        active_count = 0
+        online = 0
         per_user = {}
         for session in self._sessions.values():
-            if session["state"] != _STATE_OFFLINE:
-                total_count += 1
-                user = session["user"]
-                per_user[user] = per_user.get(user, 0) + 1
-        return total_count, per_user
+            state = session["state"]
+            if state == _STATE_OFFLINE:
+                continue
+            active_count += 1
+            user = session["user"]
+            per_user[user] = per_user.get(user, 0) + 1
+            if state == _STATE_ONLINE:
+                online += 1
+        return active_count, per_user, online
 
     @staticmethod
     def _render_capacity(sid, result, now_ms, deadline):
@@ -1465,6 +1533,143 @@ class Sessions:
             "排队": queued,
             "变更": changed,
         }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _capacity_event_append(self, now_ms, sid, result, queue_seq):
+        """追加一条 capacity 事件，O(1) 时空。
+
+        五元组 (序号, 时刻, 会话, 结果, 入队序)，序号自 1 递增；非排队项
+        （在线/各类失败）无队序，入队序为 0。
+        """
+        seq = len(self._capacity_events) + 1
+        self._capacity_events.append((seq, now_ms, sid, result, queue_seq))
+
+    def capacity_stats(self, now_ms):
+        """返回容量全景统计 JSON；先验参再老化，O(S+Q+P log P+U log U)/O(P+U)。
+
+        now_ms 为非 bool 非负 int，类型错 TypeError、取值错 ValueError。顶层键序
+        为“时刻/在线/挂起/排队/可用/水位/最早截止/用户/池”，前七项为 int：
+        在线/挂起为老化后状态计数，排队为队列项数，全局可用 =
+        max(0, total-在线-挂起)（挂起仍占全局与用户上限），水位即排队，最早
+        截止取队列项最小截止、空队为 0。用户列含拥有非下线会话或排队涉及的
+        用户、按标识升序，项键序为“标识/在线/挂起/排队/可用/最早截止”，可用
+        按 per 计 max(0, per-在线-挂起)，最早截止取其排队项、无则 0。池按
+        标识升序，项键序为“标识/在线/排队/可用”：在线为持租在线数，排队仅
+        default 池计队项（余池 0），可用为动态空闲加未租静态数。
+        """
+        _check_int("now_ms", now_ms, 0)
+        self._age(now_ms)
+
+        total_online = 0
+        total_suspended = 0
+        # user -> [在线, 挂起, 排队, 最早截止]；仅非下线会话与排队涉及者建项。
+        users = {}
+        # pool id -> 持租在线会话数。
+        pool_online = {}
+        for session in self._sessions.values():
+            state = session["state"]
+            if state == _STATE_OFFLINE:
+                continue
+            user = session["user"]
+            entry = users.get(user)
+            if entry is None:
+                entry = users[user] = [0, 0, 0, 0]
+            if state == _STATE_ONLINE:
+                total_online += 1
+                entry[0] += 1
+                if session["ip"] is not None:
+                    pool_id = session["pool"]
+                    pool_online[pool_id] = pool_online.get(pool_id, 0) + 1
+            else:
+                total_suspended += 1
+                entry[1] += 1
+
+        queued = len(self._capacity_queue)
+        earliest = 0
+        for queued_sid in self._queue_order:
+            user, _apply_t, _wait, deadline, _qseq = self._capacity_queue[queued_sid]
+            entry = users.get(user)
+            if entry is None:
+                entry = users[user] = [0, 0, 0, 0]
+            entry[2] += 1
+            if entry[3] == 0 or deadline < entry[3]:
+                entry[3] = deadline
+            if earliest == 0 or deadline < earliest:
+                earliest = deadline
+
+        user_rows = []
+        for user in sorted(users):
+            online, suspended, user_queued, user_earliest = users[user]
+            user_rows.append(
+                {
+                    "标识": user,
+                    "在线": online,
+                    "挂起": suspended,
+                    "排队": user_queued,
+                    "可用": max(0, self._per - online - suspended),
+                    "最早截止": user_earliest,
+                }
+            )
+
+        pool_rows = []
+        for pool_id in sorted(self._pools):
+            pool = self._pools[pool_id]
+            leased_static = sum(
+                1 for ip_int in pool.static_ips if ip_int in pool.leases
+            )
+            pool_rows.append(
+                {
+                    "标识": pool_id,
+                    "在线": pool_online.get(pool_id, 0),
+                    "排队": queued if pool_id == _DEFAULT_POOL_ID else 0,
+                    "可用": len(pool.free) + len(pool.static_ips) - leased_static,
+                }
+            )
+
+        payload = {
+            "时刻": now_ms,
+            "在线": total_online,
+            "挂起": total_suspended,
+            "排队": queued,
+            "可用": max(0, self._total - total_online - total_suspended),
+            "水位": queued,
+            "最早截止": earliest,
+            "用户": user_rows,
+            "池": pool_rows,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def capacity_events(self, after=0, limit=100):
+        """返回 capacity 事件 JSON；查询不老化，O(limit) 时空。
+
+        参数、异常与游标沿用 audit：取序号 > after 的前 limit 项，after/limit
+        须为非 bool 的 int，类型不符 TypeError，after<0 或 limit ∉ [1,1000]
+        抛 ValueError；游标为末项序号、无项为 after。仅 capacity 验参成功的
+        新 key 首次调用记账，重放不记。结果仅在线/排队/取消/超时/晋升/队满/
+        认证失败/状态失败/未知；推进一次调用按入队序先超时后晋升落多条。
+        顶层键序为“下个序号/事件”，事件键序为“序号/时刻/会话/结果/入队序”，
+        序号/时刻/入队序为 int、会话/结果为 str，无队序者入队序为 0。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        # 序号即位置+1，序号 > after 的事件自下标 after 起，直接切片。
+        window = self._capacity_events[after : after + limit]
+        events = [
+            {
+                "序号": seq,
+                "时刻": now_ms,
+                "会话": sid,
+                "结果": result,
+                "入队序": queue_seq,
+            }
+            for seq, now_ms, sid, result, queue_seq in window
+        ]
+        # 有项取下一序号为末项序号，无项取 after。
+        next_seq = window[-1][0] if window else after
+        payload = {"下个序号": next_seq, "事件": events}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _current_spec(self):

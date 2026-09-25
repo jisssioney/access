@@ -260,10 +260,14 @@ class AdvanceTest(unittest.TestCase):
         s.capacity("a1", "申请", "s1", ("alice", "pw", 1000), 0)
         s.capacity("a2", "申请", "s2", ("bob", "pw", 1000), 0)
         s.capacity("a3", "申请", "q1", ("carol", "pw", 1000), 1)  # 因池耗尽排队
-        # 同刻到期 s1/s2 挂起释址；挂起会话仍计上限但 total 有余，q1 晋升。
+        # 同刻到期 s1/s2 挂起释址；挂起仍计上限但 total 有余，q1 晋升。
+        # “在线”老化后仅计在线：s1/s2 挂起不计，仅 q1 在线。
         doc = json.loads(s.capacity("v1", "推进", "", None, 100))
-        self.assertEqual(doc, {"时刻": 100, "在线": 3,
+        self.assertEqual(doc, {"时刻": 100, "在线": 1,
                                "排队": 0, "变更": [1]})
+        # 挂起仍占全局与用户上限：统计中在线 1、挂起 2、可用 7。
+        stats = json.loads(s.capacity_stats(100))
+        self.assertEqual((stats["在线"], stats["挂起"], stats["可用"]), (1, 2, 7))
 
     def test_lease_expiry_frees_address(self):
         _auth, s = make(total=10, per=10, lease_ms=10)
