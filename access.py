@@ -13,6 +13,8 @@
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
+  user_stats 按用户给出只读统计快照（会话四态、租约占用与按类累计的
+  用户失败次数），查询不认证、不老化、不改态。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -651,6 +653,12 @@ class Sessions:
     后端检查抛 BackendError 时计数（now_ms<retry_at 归退避，否则归
     故障），注入/恢复/配置变更不清零；查询不认证、不老化、不改退避、
     不审计、不记事件、不动缓存，O(U) 时间、O(1) 辅助空间。
+    user_stats(user, now_ms) 返回按用户的只读统计快照：按 now_ms 取
+    视图（不老化），在线期限已到计挂起、租期或期限已到不计占用、队项
+    截止已到不计排队、墓碑计下线；失败为认证/资源/状态/后端四项累计，
+    仅 do/meter/capacity 新 key 首次且已定位用户的对应异常各计一次。
+    查询不认证、不老化、不改租约、退避、审计、事件、缓存与计数，
+    O(S+Q) 时间、O(1) 辅助空间。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -721,6 +729,11 @@ class Sessions:
         # 后端失败累计 [故障, 退避]：仅新 key 首次后端检查抛 BackendError
         # 时按类归计；注入/恢复/配置变更不清零。
         self._fault_fail = [0, 0]
+        # 按用户失败累计：user -> [认证, 资源, 状态, 后端]；仅 do/meter/
+        # capacity 新 key 首次且已定位用户的 AuthError/ResourceError/
+        # StateError/BackendError 各计一次，参数错、KeyError、fault、
+        # 重放与异参 key 不计。
+        self._user_fail = {}
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -832,7 +845,19 @@ class Sessions:
                     now_ms,
                     ("err", (type(exc), exc.args)),
                 )
+                self._record_user_failure(backend_user, exc)
                 raise
+
+        # 失败统计归因用户：建立取 args 用户，迁移/续租/下线取 sid 会话用户，
+        # 接管取 old 会话用户（迁移/接管未知 sid/old 已在上方 KeyError）；
+        # 定位不到为 None，对应路径只可能抛 KeyError，本就不计。
+        if op == _OP_ESTABLISH:
+            fail_user = args[0]
+        elif op == _OP_TAKEOVER:
+            fail_user = backend_user
+        else:
+            owner = self._sessions.get(sid)
+            fail_user = owner["user"] if owner is not None else None
 
         # 非重放：先将到期在线会话挂起、到期租约释放。
         self._age(now_ms)
@@ -856,6 +881,9 @@ class Sessions:
                 now_ms,
                 ("err", (type(exc), exc.args)),
             )
+            # 用户失败统计：KeyError 不计，余三类在已定位用户时各计一次。
+            if not isinstance(exc, KeyError) and fail_user is not None:
+                self._record_user_failure(fail_user, exc)
             # 仅接管的认证/资源失败入账（老化结果已保留）；
             # StateError、KeyError 不记。
             if is_takeover and isinstance(exc, (AuthError, ResourceError)):
@@ -975,6 +1003,25 @@ class Sessions:
             # 退避未到期：n 不变。
             self._fault_fail[1] += 1
         raise BackendError(retry_at)
+
+    def _record_user_failure(self, user, exc):
+        """按异常类归计一次用户失败（认证/资源/状态/后端），O(1) 时空。
+
+        仅由 do/meter/capacity 的新 key 首次路径在已定位用户后调用；
+        参数错、KeyError、fault、重放与异参 key 均不到达此处。
+        """
+        if isinstance(exc, AuthError):
+            index = 0
+        elif isinstance(exc, ResourceError):
+            index = 1
+        elif isinstance(exc, StateError):
+            index = 2
+        else:  # BackendError
+            index = 3
+        entry = self._user_fail.get(user)
+        if entry is None:
+            entry = self._user_fail[user] = [0, 0, 0, 0]
+        entry[index] += 1
 
     def _capacity_counts(self, user=None):
         """非下线会话计数（排队项不计数）：返回 (总数, 该用户数)。"""
@@ -1351,6 +1398,10 @@ class Sessions:
                 now_ms,
                 ("err", (type(exc), exc.args)),
             )
+            # 用户失败统计：StateError 时会话必存在（否则为 KeyError），
+            # 按其用户计一次状态失败；KeyError 不计。
+            if isinstance(exc, StateError):
+                self._record_user_failure(self._sessions[sid]["user"], exc)
             raise
         self._meter_cache[key] = (sid, size, now_ms, ("ok", result))
         return result
@@ -1572,6 +1623,82 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def user_stats(self, user, now_ms):
+        """返回指定用户的只读统计快照 JSON；查询不认证、不老化、不改租约、
+        退避、审计、事件、各域缓存与任何计数。
+
+        user 沿用凭据约束、now_ms 为非 bool 非负 int：类型错 TypeError、
+        取值错 ValueError；未注册用户抛 KeyError。按 now_ms 取视图（不老化）：
+        在线会话期限 <= now_ms 计挂起；租期或期限 <= now_ms 的持址不计占用；
+        队项截止 <= now_ms 不计排队；下线墓碑计下线。顶层键序为
+        “时刻/用户/会话/租约/失败”：会话键序为“在线/挂起/下线/排队”，
+        租约键序为“占用/最早到期”（无占用时最早到期为 0），失败恒按
+        认证/资源/状态/后端排列，项键序为“类型/次数”，次数为 do/meter/
+        capacity 新 key 首次且已定位用户的 AuthError/ResourceError/
+        StateError/BackendError 累计（参数错、KeyError、fault、重放与
+        异参 key 不计）。LF 结尾紧凑 JSON；同状态同时刻查询逐字节相同。
+        查询 O(S+Q) 时间、O(1) 辅助空间。
+        """
+        _check_credential("user", user)
+        _check_int("now_ms", now_ms, 0)
+        if user not in self._auth:
+            raise KeyError(f"unknown user: {user!r}")
+
+        online = 0
+        suspended = 0
+        offline = 0
+        occupied = 0
+        earliest = 0
+        for session in self._sessions.values():
+            if session["user"] != user:
+                continue
+            state = session["state"]
+            if state == _STATE_OFFLINE:
+                # 下线墓碑计下线。
+                offline += 1
+            elif state == _STATE_SUSPENDED or session["deadline"] <= now_ms:
+                # 已挂起，或在线但期限已到（含同刻）视如挂起。
+                suspended += 1
+            else:
+                online += 1
+            # 占用：持址在线且租期、期限均未到（含同刻不计）。
+            if (
+                state == _STATE_ONLINE
+                and session["ip"] is not None
+                and session["lease"] > now_ms
+                and session["deadline"] > now_ms
+            ):
+                occupied += 1
+                lease = session["lease"]
+                if earliest == 0 or lease < earliest:
+                    earliest = lease
+
+        queued = 0
+        for entry in self._capacity_queue.values():
+            # 截止已到（含同刻）的队项不计排队。
+            if entry[0] == user and entry[3] > now_ms:
+                queued += 1
+
+        failures = self._user_fail.get(user, (0, 0, 0, 0))
+        payload = {
+            "时刻": now_ms,
+            "用户": user,
+            "会话": {
+                "在线": online,
+                "挂起": suspended,
+                "下线": offline,
+                "排队": queued,
+            },
+            "租约": {"占用": occupied, "最早到期": earliest},
+            "失败": [
+                {"类型": "认证", "次数": failures[0]},
+                {"类型": "资源", "次数": failures[1]},
+                {"类型": "状态", "次数": failures[2]},
+                {"类型": "后端", "次数": failures[3]},
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def capacity(self, key, op, sid, args, now_ms):
         """容量申请：可配置背压等待队列的申请/取消/推进，返回 LF 结尾 JSON。
 
@@ -1641,6 +1768,7 @@ class Sessions:
                     now_ms,
                     ("err", (type(exc), exc.args)),
                 )
+                self._record_user_failure(args[0], exc)
                 raise
 
         # 申请与推进先老化（取消不老化）；取消结果不受老化影响。
@@ -1671,6 +1799,18 @@ class Sessions:
                 now_ms,
                 ("err", (type(exc), exc.args)),
             )
+            # 用户失败统计：KeyError 不计；申请取 args 用户，取消取 sid
+            # 会话用户（StateError 时 sid 必为既有会话），推进无归因用户。
+            if not isinstance(exc, KeyError):
+                if op == _OP_APPLY:
+                    fail_user = args[0]
+                elif op == _OP_CANCEL:
+                    owner = self._sessions.get(sid)
+                    fail_user = owner["user"] if owner is not None else None
+                else:
+                    fail_user = None
+                if fail_user is not None:
+                    self._record_user_failure(fail_user, exc)
             raise
         self._capacity_cache[key] = (op, sid, args, now_ms, ("ok", result))
         return result
