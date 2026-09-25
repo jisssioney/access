@@ -3,7 +3,8 @@
 当前提供：
 - Authenticator：带失败计数与锁定的用户认证器。
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
-  零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats）。
+  零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
+  takeover_audit）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -223,6 +224,12 @@ _OP_OFFLINE = "下线"
 _OP_MIGRATE = "迁移"
 _OP_TAKEOVER = "接管"
 
+# 接管审计结果取值。
+_AUDIT_OK = "成功"
+_AUDIT_AUTH_FAIL = "认证失败"
+_AUDIT_RES_FAIL = "资源失败"
+_AUDIT_REPLAY = "重放"
+
 _DEFAULT_POOL_ID = "default"
 
 
@@ -255,8 +262,9 @@ class Sessions:
     缺 default 抛 StateError；无池时 pool_stats 抛 StateError。各池地址空间
     相互独立、允许重叠，占用按池隔离。建立为静态用户取其专属地址，否则取最小
     未租用动态地址；租期到期、挂起或下线均释放地址，静态地址不回动态池。迁移
-    在两池间原子换址。接管将旧会话原子下线，新会话接管其池与地址或自 default
-    池新分配地址。按 key 永久缓存重放。
+    在两池间原子换址。接管将旧会话原子下线，新会话接管其池与地址并继承旧租期，
+    或自 default 池新分配地址（租期 now_ms+lease_ms）。按 key 永久缓存重放；
+    仅首次成功/AuthError/ResourceError 接管及同参 key 重放计入接管审计。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -279,6 +287,10 @@ class Sessions:
         # key -> (op, sid, args, now_ms, outcome)
         # outcome 为 ("ok", json_str) 或 ("err", (exc_class, exc_args))
         self._cache = {}
+        # 接管审计事件（dict，见 takeover_audit 键序），序号自 1 递增、即表长+1；
+        # key -> 首次事件序号，用于同参重放定位原序号。
+        self._takeover_events = []
+        self._takeover_keys = {}
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -299,12 +311,18 @@ class Sessions:
 
         cached = self._cache.get(key)
         if cached is not None:
-            # 重放：不老化、不认证、不改租约，仅按缓存返回或重抛。
+            # 重放：不老化、不认证、不改租约，仅按缓存返回或重抛；
+            # 接管的首次成功/AuthError/ResourceError 重放计审计事件。
             c_op, c_sid, c_args, c_now_ms, outcome = cached
             if not _strict_equal(
                 (op, sid, args, now_ms), (c_op, c_sid, c_args, c_now_ms)
             ):
                 raise ValueError(f"key {key!r} reused with different parameters")
+            if c_op == _OP_TAKEOVER and key in self._takeover_keys:
+                self._audit_takeover(
+                    key, c_args[0], c_sid, now_ms, _AUDIT_REPLAY,
+                    self._takeover_keys[key],
+                )
             if outcome[0] == "ok":
                 return outcome[1]
             exc_class, exc_args = outcome[1]
@@ -344,8 +362,18 @@ class Sessions:
                 now_ms,
                 ("err", (type(exc), exc.args)),
             )
+            # 接管仅成功、认证失败、资源失败计审计；StateError/KeyError 不计。
+            if op == _OP_TAKEOVER and isinstance(exc, (AuthError, ResourceError)):
+                verdict = (
+                    _AUDIT_AUTH_FAIL
+                    if isinstance(exc, AuthError)
+                    else _AUDIT_RES_FAIL
+                )
+                self._audit_takeover(key, args[0], sid, now_ms, verdict, 0)
             raise
         self._cache[key] = (op, sid, args, now_ms, ("ok", result))
+        if op == _OP_TAKEOVER:
+            self._audit_takeover(key, args[0], sid, now_ms, _AUDIT_OK, 0)
         return result
 
     def _validate_params(self, op, sid, args, now_ms):
@@ -571,9 +599,10 @@ class Sessions:
         """同用户接管：旧会话原子下线，新会话接管其地址或自 default 池分配。
 
         依次：未知 old KeyError、sid 已存在或旧会话已下线 StateError、认证非 ok
-        AuthError；旧会话持址则转移池/地址/租约，否则自 default 池取静态址或
-        最小动态址，缺 default StateError、无可分配址 ResourceError。失败不建
-        sid，保持老化后状态与池水位。时/空 O(S+logA)/O(1)。
+        AuthError；旧会话持址则转移池/地址并继承旧租期，否则自 default 池取静态
+        址或最小动态址（租期 now_ms+lease_ms），缺 default StateError、无可分配
+        址 ResourceError。AuthError/ResourceError 仅保留先行老化的结果，不建 sid、
+        不动旧会话与池水位；其余接管契约不变。时/空 O(S+logA)/O(1)。
         """
         old_session = self._sessions.get(old)
         if old_session is None:
@@ -594,11 +623,13 @@ class Sessions:
         old_lease = old_session["lease"]
 
         if old_ip is not None:
-            # 转移：池、地址与租约记录由旧会话让渡给新会话，池水位不变。
+            # 转移：池、地址与租约记录由旧会话让渡给新会话，池水位不变，
+            # 租期继承旧会话剩余租期（不重置）。
             pool_id = old_session["pool"]
             ip_int = old_ip
+            lease = old_lease
         else:
-            # 分配：default 池静态址或最小动态址。
+            # 分配：default 池静态址或最小动态址，新租期 now_ms+lease_ms。
             pool = self._pools.get(_DEFAULT_POOL_ID)
             if pool is None:
                 raise StateError("no default pool: cannot assign address")
@@ -614,6 +645,7 @@ class Sessions:
                     "already in use"
                 )
             pool_id = _DEFAULT_POOL_ID
+            lease = now_ms + self._lease_ms
 
         # 全部校验通过：原子下线旧会话（清期限/地址/租期），新会话在线接管。
         pool = self._pools[pool_id]
@@ -624,7 +656,6 @@ class Sessions:
         old_session["lease"] = 0
         old_session["pool"] = None
         deadline = now_ms + self._idle_ms
-        lease = now_ms + self._lease_ms
         self._sessions[sid] = {
             "user": user,
             "state": _STATE_ONLINE,
@@ -684,6 +715,63 @@ class Sessions:
             )
         payload = {"时刻": now_ms, "池": pools}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _audit_takeover(self, key, old, sid, now_ms, verdict, origin):
+        """追加一条接管审计事件，O(1) 时空。
+
+        序号自 1 递增（表长 + 1）；首次事件原序号 0，并登记 key->序号，
+        重放事件原序号指向首次序号。时刻取本次调用的 now_ms。
+        """
+        seq = len(self._takeover_events) + 1
+        event = {
+            "序号": seq,
+            "时刻": now_ms,
+            "键": key,
+            "旧会话": old,
+            "新会话": sid,
+            "结果": verdict,
+            "原序号": origin,
+        }
+        self._takeover_events.append(event)
+        if origin == 0:
+            self._takeover_keys[key] = seq
+
+    def takeover_audit(self, after=0, limit=100):
+        """返回接管审计 JSON；查询不老化。取序号 > after 的前 limit 项。
+
+        after/limit 须为非 bool 的 int，否则 TypeError；after < 0 或
+        limit ∉ [1,1000] 抛 ValueError。顶层键序 下个序号/事件：有项时下个
+        序号为末项序号，无项时取 after。事件按固定键序输出。查询 O(limit)。
+        """
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise TypeError(f"after must be an int, got {type(after).__name__}")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+        if after < 0:
+            raise ValueError(f"after must be >= 0, got {after}")
+        if not (1 <= limit <= 1000):
+            raise ValueError(f"limit must be in 1..1000, got {limit}")
+
+        events = self._takeover_events
+        # 序号自 1 连续递增，故序号 > after 的首项下标恰为 after（after 超界
+        # 时截到表尾），随后顺序取至多 limit 项，整体 O(limit)。
+        start = min(after, len(events))
+        selected = events[start : start + limit]
+        items = [
+            {
+                "序号": event["序号"],
+                "时刻": event["时刻"],
+                "键": event["键"],
+                "旧会话": event["旧会话"],
+                "新会话": event["新会话"],
+                "结果": event["结果"],
+                "原序号": event["原序号"],
+            }
+            for event in selected
+        ]
+        next_seq = selected[-1]["序号"] if items else after
+        payload = {"下个序号": next_seq, "事件": items}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def _render(sid, state, now_ms, deadline, address=None, lease=0):
