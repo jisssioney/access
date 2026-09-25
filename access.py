@@ -10,6 +10,8 @@
   capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按入队序晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
   creplay 提供 capacity 状态检查点、事件哈希链校验与原子重放恢复。
+  fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
+  老化前查后端，故障期按用户指数退避抛 BackendError。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -19,7 +21,14 @@ import hmac
 import ipaddress
 import json
 
-__all__ = ["Authenticator", "AuthError", "ResourceError", "StateError", "Sessions"]
+__all__ = [
+    "Authenticator",
+    "AuthError",
+    "ResourceError",
+    "StateError",
+    "BackendError",
+    "Sessions",
+]
 
 _MAX_USERS = 10000
 _MIN_CRED_BYTES = 1
@@ -37,6 +46,10 @@ class ResourceError(Exception):
 
 class StateError(Exception):
     """会话状态不允许当前操作。"""
+
+
+class BackendError(Exception):
+    """后端故障未恢复或退避未到期；值为可重试时刻 retry_at。"""
 
 
 def _check_int(name, value, minimum):
@@ -531,6 +544,12 @@ _MAX_QUEUE = 1024
 _MAX_QUEUE_LIMIT = 10000
 _CONFIG_VERSION = 4
 
+# fault 操作与后端状态。
+_OP_INJECT = "注入"
+_OP_RECOVER = "恢复"
+_BACKEND_FAULT = "故障"
+_BACKEND_NORMAL = "正常"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -612,7 +631,21 @@ class Sessions:
     连续序号与哈希衔接，空链为 True。creplay(text) 校验并恢复所列
     会话（含下线墓碑，墓碑不计容量、不建租约）、租约、队列与事件账本，
     验链、验状态哈希与承载力后原子提交，同状态哈希重放为空操作并保留
-    墓碑，返回检查点时刻 capacity_stats。
+    墓碑，返回检查点时刻 capacity_stats。fault(key, op, ms, now_ms)
+    注入（op=注入，ms 为非 bool 正 int）或恢复（op=恢复，ms=None）后端
+    故障：注入置故障截至为 now_ms+ms，恢复清零，二者均清空全部用户退避；
+    返回键序“状态/时刻/截至”的基线 LF 尾 JSON（注入为 故障/now_ms/
+    now_ms+ms，恢复为 正常/now_ms/0），key 首果（含验参异常）永久缓存、
+    同参重放、异参 ValueError，缓存与 do/meter/capacity 分域。do 建立/
+    迁移/接管与 capacity 申请验参后、老化前查后端：建立/申请取 args
+    用户，迁移/接管由 sid/old 只读定位（未知 KeyError 且不退避，仍缓存
+    并入链），定位后 BackendError 先于状态、目标池与新 sid 错误，健康
+    才老化并循旧序。故障中每用户 now_ms>=retry_at 则 n 加一并令
+    retry_at=now_ms+min(100*2**(n-1), 1600)，抛 BackendError(retry_at)，
+    否则 n 不变抛 BackendError(retry_at)；截至与 retry_at 均到才认证并
+    清该用户退避。BackendError 按 key 入各自缓存；失败仅改退避与缓存，
+    认证器、会话、租约与队列不变；BackendError 与 fault 均不审计。检查
+    额外时空 O(1)。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -674,6 +707,13 @@ class Sessions:
         self._capacity_events = []
         self._capacity_tail = "0" * 64
 
+        # 后端故障：截至时刻（0 表示无故障）与按用户退避 (n, retry_at)；
+        # fault 的重放缓存与 do/meter/capacity 分域：
+        # key -> (op, ms, now_ms, outcome)。
+        self._fault_until = 0
+        self._backoff = {}
+        self._fault_cache = {}
+
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
 
@@ -688,7 +728,11 @@ class Sessions:
         self._pools[pool_id] = _Pool(parsed)
 
     def do(self, key, op, sid, args, now_ms):
-        """执行一次建立/续租/下线/迁移/接管操作，返回 LF 结尾的 JSON 字符串。"""
+        """执行一次建立/续租/下线/迁移/接管操作，返回 LF 结尾的 JSON 字符串。
+
+        建立/迁移/接管在验参后、老化前查后端：故障期按用户指数退避抛
+        BackendError（只入缓存，不老化、不认证、不审计），健康才老化。
+        """
         _check_credential("key", key)
 
         cached = self._cache.get(key)
@@ -732,6 +776,55 @@ class Sessions:
                 ("err", (type(exc), exc.args)),
             )
             raise
+
+        # 建立/迁移/接管：验参后、老化前查后端。迁移/接管由 sid/old 只读
+        # 定位，未知 KeyError（不退避，仍缓存并入链）；定位后 BackendError
+        # 先于状态、目标池与新 sid 错误；健康才老化并循旧序。
+        if op == _OP_ESTABLISH:
+            backend_user = args[0]
+        elif op == _OP_MIGRATE:
+            session = self._sessions.get(sid)
+            if session is None:
+                exc = KeyError(f"unknown sid: {sid!r}")
+                self._cache[key] = (
+                    op,
+                    sid,
+                    args,
+                    now_ms,
+                    ("err", (type(exc), exc.args)),
+                )
+                self._chain_append(key, op, sid, type(exc).__name__, now_ms)
+                raise exc
+            backend_user = session["user"]
+        elif op == _OP_TAKEOVER:
+            old_session = self._sessions.get(args[0])
+            if old_session is None:
+                exc = KeyError(f"unknown old sid: {args[0]!r}")
+                self._cache[key] = (
+                    op,
+                    sid,
+                    args,
+                    now_ms,
+                    ("err", (type(exc), exc.args)),
+                )
+                self._chain_append(key, op, sid, type(exc).__name__, now_ms)
+                raise exc
+            backend_user = old_session["user"]
+        else:
+            backend_user = None
+        if backend_user is not None:
+            try:
+                self._backend_check(backend_user, now_ms)
+            except BackendError as exc:
+                # 失败只改退避与缓存：不老化、不认证、不审计。
+                self._cache[key] = (
+                    op,
+                    sid,
+                    args,
+                    now_ms,
+                    ("err", (type(exc), exc.args)),
+                )
+                raise
 
         # 非重放：先将到期在线会话挂起、到期租约释放。
         self._age(now_ms)
@@ -849,6 +942,26 @@ class Sessions:
         session["ip"] = None
         session["lease"] = 0
         session["pool"] = None
+
+    def _backend_check(self, user, now_ms):
+        """老化前的后端健康检查，O(1) 时空。
+
+        截至与 retry_at 均到（含无故障）则清该用户退避并返回；故障中且
+        retry_at 已到则 n 加一、retry_at = now_ms+min(100*2**(n-1), 1600)
+        并抛 BackendError(retry_at)；retry_at 未到则 n 不变，抛
+        BackendError(retry_at)。
+        """
+        n, retry_at = self._backoff.get(user, (0, 0))
+        if now_ms >= self._fault_until and now_ms >= retry_at:
+            # 健康：清该用户退避（无则空操作）。
+            self._backoff.pop(user, None)
+            return
+        if now_ms >= retry_at:
+            # 故障中且退避到期：n 加一，指数退避重算 retry_at（封顶 1600）。
+            n += 1
+            retry_at = now_ms + min(100 * 2 ** (n - 1), 1600)
+            self._backoff[user] = (n, retry_at)
+        raise BackendError(retry_at)
 
     def _capacity_counts(self, user=None):
         """非下线会话计数（排队项不计数）：返回 (总数, 该用户数)。"""
@@ -1350,6 +1463,72 @@ class Sessions:
         payload = {"时刻": now_ms, "分组": group, "汇总": summary}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def fault(self, key, op, ms, now_ms):
+        """注入或恢复后端故障，返回 LF 结尾的 JSON 字符串。
+
+        key 沿用凭据约束；op 仅“注入/恢复”：注入 ms 为非 bool 正 int，
+        恢复 ms 须为 None；now_ms 为非 bool 非负 int，类型错 TypeError、
+        取值错 ValueError。注入置故障截至为 now_ms+ms，恢复清零；二者
+        均清空全部用户退避。返回基线 LF 尾 JSON，键序“状态/时刻/截至”，
+        注入为 故障/now_ms/now_ms+ms，恢复为 正常/now_ms/0。key 首果
+        （含验参异常）永久缓存，同参重放直接返回或重抛，异参抛
+        ValueError；缓存与 do/meter/capacity 分域。fault 不审计。
+        """
+        _check_credential("key", key)
+
+        cached = self._fault_cache.get(key)
+        if cached is not None:
+            # 重放：不改故障态与退避，仅按缓存返回或重抛。
+            c_op, c_ms, c_now_ms, outcome = cached
+            if not _strict_equal((op, ms, now_ms), (c_op, c_ms, c_now_ms)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存。
+        try:
+            self._validate_fault_params(op, ms, now_ms)
+        except (TypeError, ValueError) as exc:
+            self._fault_cache[key] = (
+                op,
+                ms,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 注入与恢复均清空全部用户退避。
+        self._backoff.clear()
+        if op == _OP_INJECT:
+            self._fault_until = now_ms + ms
+            result = self._render_fault(_BACKEND_FAULT, now_ms, self._fault_until)
+        else:
+            self._fault_until = 0
+            result = self._render_fault(_BACKEND_NORMAL, now_ms, 0)
+        self._fault_cache[key] = (op, ms, now_ms, ("ok", result))
+        return result
+
+    @staticmethod
+    def _validate_fault_params(op, ms, now_ms):
+        """校验 fault 三参数：op 限注入/恢复，注入 ms 为正 int、恢复 ms=None。"""
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if op not in (_OP_INJECT, _OP_RECOVER):
+            raise ValueError(f"op must be one of 注入/恢复, got {op!r}")
+        if op == _OP_INJECT:
+            _check_int("ms", ms, 1)
+        elif ms is not None:
+            raise ValueError(f"ms must be None for 恢复, got {ms!r}")
+        _check_int("now_ms", now_ms, 0)
+
+    @staticmethod
+    def _render_fault(state, now_ms, until):
+        # 键序：状态、时刻、截至；状态为 str，余为 int。
+        payload = {"状态": state, "时刻": now_ms, "截至": until}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def capacity(self, key, op, sid, args, now_ms):
         """容量申请：可配置背压等待队列的申请/取消/推进，返回 LF 结尾 JSON。
 
@@ -1360,7 +1539,9 @@ class Sessions:
 
         申请等待超过配置的非零最大等待毫秒（0 表示不限）时在老化、认证之前
         即抛 ValueError：不老化、不认证、不入队、不记事件，随验参异常入
-        重放缓存。通过该上界后申请先老化再认证：认证非 ok 抛 AuthError，
+        重放缓存。验参通过后申请在老化前查后端：故障期按用户指数退避抛
+        BackendError（只入缓存，不老化、不认证、不入队、不记事件），健康
+        才老化。通过该上界后申请先老化再认证：认证非 ok 抛 AuthError，
         sid 已存在（在线/挂起/下线会话或排队项）抛 StateError。非下线会话数
         达全局/单用户上限或缺 default 池、无可取址则入队等待，需排队且队长
         已达配置队列上限（0 表示不限，默认 1024）抛 ResourceError 并记既有
@@ -1403,6 +1584,21 @@ class Sessions:
                 ("err", (type(exc), exc.args)),
             )
             raise
+
+        # 申请：验参后、老化前查后端（用户取自 args）；BackendError 只入
+        # 缓存，不老化、不认证、不入队、不记事件。
+        if op == _OP_APPLY:
+            try:
+                self._backend_check(args[0], now_ms)
+            except BackendError as exc:
+                self._capacity_cache[key] = (
+                    op,
+                    sid,
+                    args,
+                    now_ms,
+                    ("err", (type(exc), exc.args)),
+                )
+                raise
 
         # 申请与推进先老化（取消不老化）；取消结果不受老化影响。
         if op != _OP_CANCEL:
