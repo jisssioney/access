@@ -2,8 +2,8 @@
 
 当前提供：
 - Authenticator：带失败计数与锁定的用户认证器。
-- Sessions：基于 Authenticator 的会话管理（建立/续租/下线、空闲老化、可选
-  IPv4 地址池与租约、按 key 重放缓存）。
+- Sessions：基于 Authenticator 的会话管理（建立/续租/下线/跨池迁移、空闲老化、
+  构造期 default 池与 add_pool 多地址池、租约、按 key 重放缓存、pool_stats）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -220,13 +220,40 @@ _STATE_OFFLINE = "下线"
 _OP_ESTABLISH = "建立"
 _OP_RENEW = "续租"
 _OP_OFFLINE = "下线"
+_OP_MIGRATE = "迁移"
+
+_DEFAULT_POOL_ID = "default"
+
+
+class _Pool:
+    """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
+
+    租用地址表按池隔离，故不同池的地址（int）允许重叠。
+    """
+
+    __slots__ = ("capacity", "reserved", "static", "static_ips", "free", "leases")
+
+    def __init__(self, parsed):
+        _network, usable, reserved, static, static_ips = parsed
+        self.capacity = len(usable)
+        self.reserved = reserved
+        self.static = static
+        self.static_ips = static_ips
+        # 动态地址最小堆：含全部未租用的非保留非静态地址（heapify 为 O(A)）。
+        self.free = list(usable - reserved - static_ips)
+        heapq.heapify(self.free)
+        # 本池已租用地址 int -> sid（含静态与动态）。
+        self.leases = {}
 
 
 class Sessions:
     """会话管理：建立需先认证再查限额，续租限持址在线会话，下线按 sid。
 
-    启用地址池时，建立为静态用户取其专属地址，否则取最小未租用动态地址；
-    租期到期、挂起或下线均释放地址，静态地址不回动态池。按 key 永久缓存重放。
+    构造期传入地址池时建为 default 池，add_pool 可追加命名池；未传池则处于
+    零池模式（add_pool 不可用）。各池地址空间相互独立、允许重叠，占用按池隔离。
+    建立为静态用户取其专属地址，否则取最小未租用动态地址；租期到期、挂起或
+    下线均释放地址，静态地址不回动态池。迁移在两池间原子换址。按 key 永久缓存
+    重放。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -238,35 +265,37 @@ class Sessions:
         self._idle_ms = _check_int("idle_ms", idle_ms, 0)
 
         self._pool_enabled = pool is not None
+        # 池 id -> _Pool，插入顺序即 add_pool 顺序；统计另按 id 升序输出。
+        self._pools = {}
         if self._pool_enabled:
-            (
-                _network,
-                usable,
-                self._reserved,
-                self._static,
-                self._static_ips,
-            ) = _check_pool(pool)
-            # 动态地址最小堆：含全部未租用的非保留非静态地址（heapify 为 O(A)）。
-            self._free = list(usable - self._reserved - self._static_ips)
-            heapq.heapify(self._free)
-        else:
-            self._reserved = frozenset()
-            self._static = {}
-            self._static_ips = frozenset()
-            self._free = []
+            self._pools[_DEFAULT_POOL_ID] = _Pool(_check_pool(pool))
         self._lease_ms = _check_int("lease_ms", lease_ms, 1)
 
         # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
-        #         "lease": int}
+        #         "lease": int, "pool": str|None}
         self._sessions = {}
-        # 已租用地址 int -> sid（含静态与动态）。
-        self._leases = {}
         # key -> (op, sid, args, now_ms, outcome)
         # outcome 为 ("ok", json_str) 或 ("err", (exc_class, exc_args))
         self._cache = {}
 
+    def add_pool(self, pool_id, pool):
+        """构造为 default 池的多池模式下追加命名池；零池模式抛 StateError。
+
+        重名抛 ValueError，pool_id/pool 类型或取值不合法抛 TypeError/ValueError。
+        新池地址空间独立，可与既有池重叠。
+        """
+        _check_credential("pool id", pool_id)
+        # 先完成全部入参校验（与 do() 一致：参数类异常先于状态类异常），
+        # 再判定零池模式与重名。
+        parsed = _check_pool(pool)
+        if not self._pool_enabled:
+            raise StateError("no default pool: sessions constructed without a pool")
+        if pool_id in self._pools:
+            raise ValueError(f"duplicate pool id: {pool_id!r}")
+        self._pools[pool_id] = _Pool(parsed)
+
     def do(self, key, op, sid, args, now_ms):
-        """执行一次建立/续租/下线操作，返回 LF 结尾的 JSON 字符串。"""
+        """执行一次建立/续租/下线/迁移操作，返回 LF 结尾的 JSON 字符串。"""
         _check_credential("key", key)
 
         cached = self._cache.get(key)
@@ -302,6 +331,8 @@ class Sessions:
                 result = self._establish(sid, args[0], args[1], now_ms)
             elif op == _OP_RENEW:
                 result = self._renew(sid, now_ms)
+            elif op == _OP_MIGRATE:
+                result = self._migrate(sid, args[0], args[1], now_ms)
             else:
                 result = self._offline(sid, now_ms)
         except (AuthError, ResourceError, StateError, KeyError) as exc:
@@ -317,12 +348,19 @@ class Sessions:
         return result
 
     def _validate_params(self, op, sid, args, now_ms):
-        """校验 key 之外的四个参数；地址池未启用时不接受续租。"""
+        """校验 key 之外的四个参数；迁移始终受理（零池于老化后抛 StateError），
+        续租仅在地址池启用时受理。"""
         if isinstance(op, bool) or not isinstance(op, str):
             raise TypeError(f"op must be a str, got {type(op).__name__}")
-        valid_ops = (_OP_ESTABLISH, _OP_OFFLINE)
+        # 迁移在零池模式下亦通过验参，StateError 延后到老化之后（见 _migrate）。
+        valid_ops = (_OP_ESTABLISH, _OP_OFFLINE, _OP_MIGRATE)
         if self._pool_enabled:
-            valid_ops = (_OP_ESTABLISH, _OP_RENEW, _OP_OFFLINE)
+            valid_ops = (
+                _OP_ESTABLISH,
+                _OP_RENEW,
+                _OP_OFFLINE,
+                _OP_MIGRATE,
+            )
         if op not in valid_ops:
             raise ValueError(f"op must be one of {valid_ops}, got {op!r}")
         _check_credential("sid", sid)
@@ -334,6 +372,16 @@ class Sessions:
                     f"args must be a 2-tuple (user, password), got {len(args)} items"
                 )
             _check_credential("user", args[0])
+            _check_credential("password", args[1])
+        elif op == _OP_MIGRATE:
+            if not isinstance(args, tuple):
+                raise TypeError(f"args must be a tuple, got {type(args).__name__}")
+            if len(args) != 2:
+                raise ValueError(
+                    "args must be a 2-tuple (target, password), "
+                    f"got {len(args)} items"
+                )
+            _check_credential("target", args[0])
             _check_credential("password", args[1])
         elif args is not None:
             raise ValueError(f"args must be None for {op}, got {args!r}")
@@ -352,16 +400,18 @@ class Sessions:
                 session["deadline"] = 0
 
     def _release(self, session):
-        """释放会话持址：动态地址回堆，静态地址仅退租，仍专属其用户。"""
+        """释放会话持址：动态地址回本池堆，静态地址仅退租，仍专属其用户。"""
         ip_int = session["ip"]
         if ip_int is None:
             return
-        del self._leases[ip_int]
+        pool = self._pools[session["pool"]]
+        del pool.leases[ip_int]
         # 租用地址非动态即静态（保留地址从不租用），静态地址不入动态堆。
-        if ip_int not in self._static_ips:
-            heapq.heappush(self._free, ip_int)
+        if ip_int not in pool.static_ips:
+            heapq.heappush(pool.free, ip_int)
         session["ip"] = None
         session["lease"] = 0
+        session["pool"] = None
 
     def _establish(self, sid, user, password, now_ms):
         """初始→认证中→在线；任一失败不留会话与租约残留。"""
@@ -386,14 +436,17 @@ class Sessions:
 
         ip_int = None
         lease = 0
+        pool_id = None
         if self._pool_enabled:
-            ip_int = self._static.get(user)
+            pool_id = _DEFAULT_POOL_ID
+            pool = self._pools[pool_id]
+            ip_int = pool.static.get(user)
             if ip_int is None:
                 # 非静态用户：取最小未租用的非保留非静态地址。
-                if not self._free:
+                if not pool.free:
                     raise ResourceError("address pool exhausted")
-                ip_int = heapq.heappop(self._free)
-            elif ip_int in self._leases:
+                ip_int = heapq.heappop(pool.free)
+            elif ip_int in pool.leases:
                 # 静态地址专属该用户，但同一时刻只能租给一个会话。
                 raise ResourceError(
                     f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
@@ -403,7 +456,7 @@ class Sessions:
 
         # 全部校验通过后再落库，杜绝失败残留。
         if self._pool_enabled:
-            self._leases[ip_int] = sid
+            pool.leases[ip_int] = sid
         deadline = now_ms + self._idle_ms
         self._sessions[sid] = {
             "user": user,
@@ -411,6 +464,7 @@ class Sessions:
             "deadline": deadline,
             "ip": ip_int,
             "lease": lease,
+            "pool": pool_id,
         }
         address = str(ipaddress.IPv4Address(ip_int)) if self._pool_enabled else None
         return self._render(sid, _STATE_ONLINE, now_ms, deadline, address, lease)
@@ -436,6 +490,73 @@ class Sessions:
             session["lease"],
         )
 
+    def _migrate(self, sid, target, password, now_ms):
+        """持址在线会话从原池原子迁至目标池；失败不换址，老化不回滚。
+
+        依次：零池 StateError、未知 sid/target KeyError、非持址在线或同池
+        StateError、认证非 ok AuthError、目标池耗尽或静态占用 ResourceError。
+        """
+        if not self._pool_enabled:
+            raise StateError("no pool: sessions constructed without a pool")
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        target_pool = self._pools.get(target)
+        if target_pool is None:
+            raise KeyError(f"unknown target pool: {target!r}")
+        if session["state"] != _STATE_ONLINE or session["ip"] is None:
+            raise StateError(
+                f"cannot migrate sid {sid!r} in state {session['state']!r} "
+                "without address"
+            )
+        source_id = session["pool"]
+        if source_id == target:
+            raise StateError(f"sid {sid!r} already in target pool {target!r}")
+
+        user = session["user"]
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        source_pool = self._pools[source_id]
+        old_ip = session["ip"]
+        new_ip = target_pool.static.get(user)
+        if new_ip is None:
+            # 非静态用户：取目标池最小动态空闲址。
+            if not target_pool.free:
+                raise ResourceError(f"target pool {target!r} exhausted")
+            new_ip = heapq.heappop(target_pool.free)
+        elif new_ip in target_pool.leases:
+            # 目标静态址已被同用户的另一会话占用。
+            raise ResourceError(
+                f"static address {ipaddress.IPv4Address(new_ip)} for {user!r} "
+                "already in use"
+            )
+
+        # 全部校验通过：原子释旧址、换池址。动态旧址回本池堆。
+        del source_pool.leases[old_ip]
+        if old_ip not in source_pool.static_ips:
+            heapq.heappush(source_pool.free, old_ip)
+        target_pool.leases[new_ip] = sid
+
+        old_address = str(ipaddress.IPv4Address(old_ip))
+        new_address = str(ipaddress.IPv4Address(new_ip))
+        session["ip"] = new_ip
+        session["pool"] = target
+        # 迁移重置租期，空闲期限（期限）保持不变。
+        session["lease"] = now_ms + self._lease_ms
+        return self._render_migration(
+            sid,
+            _STATE_ONLINE,
+            now_ms,
+            session["deadline"],
+            source_id,
+            old_address,
+            target,
+            new_address,
+            session["lease"],
+        )
+
     def _offline(self, sid, now_ms):
         """在线/挂起/下线→下线、期限与租约清零、释址。"""
         session = self._sessions.get(sid)
@@ -449,6 +570,29 @@ class Sessions:
         address = "" if self._pool_enabled else None
         return self._render(sid, _STATE_OFFLINE, now_ms, 0, address, 0)
 
+    def pool_stats(self, now_ms):
+        """返回各池占用统计 JSON；零池抛 StateError，否则先老化再统计。"""
+        _check_int("now_ms", now_ms, 0)
+        if not self._pool_enabled:
+            raise StateError("no pool: sessions constructed without a pool")
+        self._age(now_ms)
+        pools = []
+        for pool_id in sorted(self._pools):
+            pool = self._pools[pool_id]
+            # 项序：标识、容量（可用数）、保留、静态、租用、动态空闲。
+            pools.append(
+                [
+                    pool_id,
+                    pool.capacity,
+                    len(pool.reserved),
+                    len(pool.static_ips),
+                    len(pool.leases),
+                    len(pool.free),
+                ]
+            )
+        payload = {"时刻": now_ms, "池": pools}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     @staticmethod
     def _render(sid, state, now_ms, deadline, address=None, lease=0):
         # address=None 表示未启用地址池，JSON 与基线逐字节一致；
@@ -460,3 +604,20 @@ class Sessions:
         return (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+
+    @staticmethod
+    def _render_migration(
+        sid, state, now_ms, deadline, source, old_address, target, new_address, lease
+    ):
+        payload = {
+            "会话": sid,
+            "状态": state,
+            "时刻": now_ms,
+            "期限": deadline,
+            "原池": source,
+            "原地址": old_address,
+            "目标池": target,
+            "目标地址": new_address,
+            "租期": lease,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
