@@ -226,6 +226,16 @@ _OP_TAKEOVER = "接管"
 
 _DEFAULT_POOL_ID = "default"
 
+# 防篡改审计入账的异常类型 -> 结果串；验参错误（TypeError/ValueError）不在内。
+_TAMPER_RESULTS = {
+    AuthError: "AuthError",
+    ResourceError: "ResourceError",
+    StateError: "StateError",
+    KeyError: "KeyError",
+}
+_TAMPER_RESULT_OK = "成功"
+_TAMPER_GENESIS_HASH = "0" * 64
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -259,7 +269,9 @@ class Sessions:
     在两池间原子换址。接管先老化：旧会话持址则新会话继承其池/地址/租约，
     无址则自 default 池新分配，租期 = now_ms+lease_ms；认证或资源失败仅保留
     老化结果。按 key 永久缓存重放。takeover_audit 记录首次成功/认证失败/资源
-    失败及同参重放，查询不老化。
+    失败及同参重放，查询不老化。audit/verify_audit 另提供覆盖全部操作的防篡改
+    哈希链：验参后首次结果（成功/AuthError/ResourceError/StateError/KeyError）
+    及同参重放均记，参数错误与异参 key 不记，链不老化。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -285,6 +297,10 @@ class Sessions:
         # 接管审计事件追加序列（序号自 1）；key -> 首次事件序号，供重放指认。
         self._audit_events = []
         self._audit_index = {}
+        # 防篡改审计链（序号自 1）：九元组含前哈希与本事件哈希；
+        # key -> 首次事件序号，供重放指认。
+        self._tamper_events = []
+        self._tamper_index = {}
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -315,6 +331,14 @@ class Sessions:
             if c_op == _OP_TAKEOVER and key in self._audit_index:
                 self._audit_append(
                     key, c_args[0], c_sid, "重放", now_ms, self._audit_index[key]
+                )
+            # 防篡改链：首次已入账的键（操作成功/AuthError/ResourceError/
+            # StateError/KeyError）重放均记，结果沿用首次记录，原序号指认首次。
+            if key in self._tamper_index:
+                origin = self._tamper_index[key]
+                self._tamper_append(
+                    now_ms, key, c_op, c_sid,
+                    self._tamper_events[origin - 1][5], origin,
                 )
             if outcome[0] == "ok":
                 return outcome[1]
@@ -361,10 +385,16 @@ class Sessions:
             if is_takeover and isinstance(exc, (AuthError, ResourceError)):
                 verdict = "认证失败" if isinstance(exc, AuthError) else "资源失败"
                 self._audit_append(key, args[0], sid, verdict, now_ms)
+            # 防篡改链：成功之外只记 AuthError/ResourceError/StateError/KeyError
+            # 四类，验参错误（TypeError/ValueError）不记。
+            self._tamper_append(
+                now_ms, key, op, sid, _TAMPER_RESULTS[type(exc)]
+            )
             raise
         self._cache[key] = (op, sid, args, now_ms, ("ok", result))
         if is_takeover:
             self._audit_append(key, args[0], sid, "成功", now_ms)
+        self._tamper_append(now_ms, key, op, sid, "成功")
         return result
 
     def _validate_params(self, op, sid, args, now_ms):
@@ -748,6 +778,89 @@ class Sessions:
         next_seq = window[-1][0] if window else after
         payload = {"下个序号": next_seq, "事件": events}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _tamper_append(self, now_ms, key, op, sid, result, origin=0):
+        """向防篡改哈希链尾追加一条事件，O(1) 时空。
+
+        元组字段序：序号、时刻、键、操作、会话、结果、原序号、前哈希、哈希。
+        首次事件登记 key -> 序号且原序号为 0；重放沿用首次结果，原序号填首次
+        序号。前哈希首项取 64 个 0，余取前项哈希。哈希 = sha256(前八字段紧凑
+        JSON 的 UTF-8 字节).hexdigest()。
+        """
+        seq = len(self._tamper_events) + 1
+        prev_hash = (
+            _TAMPER_GENESIS_HASH
+            if seq == 1
+            else self._tamper_events[-1][8]
+        )
+        fields = (seq, now_ms, key, op, sid, result, origin, prev_hash)
+        digest = hashlib.sha256(
+            json.dumps(
+                list(fields), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        self._tamper_events.append(fields + (digest,))
+        if origin == 0:
+            self._tamper_index[key] = seq
+
+    def audit(self, after=0, limit=100):
+        """返回防篡改审计链窗口 JSON，不老化，O(limit) 时空。
+
+        取序号 > after 的前 limit 项；游标（下个序号）有项为末项序号，无项为
+        after。after/limit 须为非 bool 的 int：类型不符 TypeError，after<0 或
+        limit ∉ [1,1000] 抛 ValueError。顶层键序“下个序号/事件”；事件键序
+        “序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希”，序号/时刻/原序号
+        为 int，余为 str，LF 结尾。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        # 序号即位置+1，序号 > after 的事件自下标 after 起，直接切片。
+        window = self._tamper_events[after : after + limit]
+        events = [
+            {
+                "序号": seq,
+                "时刻": now_ms,
+                "键": key,
+                "操作": op,
+                "会话": sid,
+                "结果": result,
+                "原序号": origin,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for seq, now_ms, key, op, sid, result, origin, prev_hash, digest
+            in window
+        ]
+        next_seq = window[-1][0] if window else after
+        payload = {"下个序号": next_seq, "事件": events}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def verify_audit(self):
+        """校验整条防篡改链：序号连续、前哈希衔接、哈希重算一致，O(N)/O(1)。
+
+        空链返回 True；任一项被篡改即返回 False。
+        """
+        prev_hash = _TAMPER_GENESIS_HASH
+        for index, event in enumerate(self._tamper_events):
+            seq, now_ms, key, op, sid, result, origin, stored_prev, stored_hash = (
+                event
+            )
+            if seq != index + 1 or stored_prev != prev_hash:
+                return False
+            digest = hashlib.sha256(
+                json.dumps(
+                    [seq, now_ms, key, op, sid, result, origin, stored_prev],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if not hmac.compare_digest(digest, stored_hash):
+                return False
+            prev_hash = stored_hash
+        return True
 
     @staticmethod
     def _render(sid, state, now_ms, deadline, address=None, lease=0):
