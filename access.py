@@ -7,7 +7,7 @@
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
   export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
   令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats、容量申请
-  capacity：1024 项等待队列的申请/取消/推进，截止超时与按入队序晋升、
+  capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按入队序晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
   creplay 提供 capacity 状态检查点、事件哈希链校验与原子重放恢复。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
@@ -277,17 +277,46 @@ def _parse_config_templates(doc):
     return tuple(templates), tuple(user_templates)
 
 
+def _parse_config_capacity(doc):
+    """校验 v4 的容量节，返回 (队列上限, 最大等待毫秒)。
+
+    容量须恰含“队列上限/最大等待毫秒”，二者为非 bool int：队列上限
+    0..10000（0 表示不限），最大等待毫秒 >= 0（0 表示不限）。结构、类型或
+    值错均抛 ValueError。
+    """
+    raw = doc["容量"]
+    if not isinstance(raw, dict) or set(raw) != {"队列上限", "最大等待毫秒"}:
+        raise ValueError("容量 keys must be exactly 队列上限/最大等待毫秒")
+    queue_limit = raw["队列上限"]
+    max_wait = raw["最大等待毫秒"]
+    if isinstance(queue_limit, bool) or not isinstance(queue_limit, int):
+        raise ValueError(
+            f"队列上限 must be an int, got {type(queue_limit).__name__}"
+        )
+    if not (0 <= queue_limit <= _MAX_QUEUE_LIMIT):
+        raise ValueError(
+            f"队列上限 must be 0..{_MAX_QUEUE_LIMIT}, got {queue_limit}"
+        )
+    if isinstance(max_wait, bool) or not isinstance(max_wait, int):
+        raise ValueError(f"最大等待毫秒 must be an int, got {type(max_wait).__name__}")
+    if max_wait < 0:
+        raise ValueError(f"最大等待毫秒 must be >= 0, got {max_wait}")
+    return queue_limit, max_wait
+
+
 def _parse_config(text):
     """解析配置文本为规范化 spec；text 非 str 抛 TypeError，余错抛 ValueError。
 
-    spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates)，
-    pools 为按标识升序的 (标识, cidr, reserved, static) 元组，reserved/static
-    已规范化排序；templates 为按标识升序的 (标识, 限速, 突发, 配额, 超限) 元组，
+    spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
+    capacity)，capacity 为 (队列上限, 最大等待毫秒)；pools 为按标识升序的
+    (标识, cidr, reserved, static) 元组，reserved/static 已规范化排序；
+    templates 为按标识升序的 (标识, 限速, 突发, 配额, 超限) 元组，
     user_templates 为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为无
     标识单池对象，迁移为 default 池；v2（版本=2）地址池为池对象列表；v3
-    （版本=3）增模板与用户模板，v1/v2 迁移时二者为空。JSON 解析错
-    （JSONDecodeError 系 ValueError 子类）、重复/未知/缺失键、结构、值或
-    池规则错均抛 ValueError。
+    （版本=3）增模板与用户模板；v4（版本=4）增容量背压（队列上限/最大等待
+    毫秒）。v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时容量补默认
+    (1024, 0)。JSON 解析错（JSONDecodeError 系 ValueError 子类）、重复/未知/
+    缺失键、结构、值或池规则错均抛 ValueError。
     """
     if not isinstance(text, str):
         raise TypeError(f"text must be a str, got {type(text).__name__}")
@@ -297,9 +326,16 @@ def _parse_config(text):
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3):
-        raise ValueError(f"版本 must be 1, 2 or 3, got {version}")
-    if version == 3:
+    if version not in (1, 2, 3, 4):
+        raise ValueError(f"版本 must be 1, 2, 3 or 4, got {version}")
+    if version == 4:
+        if set(doc) != {
+            "版本", "会话", "地址池", "模板", "用户模板", "容量"
+        }:
+            raise ValueError(
+                "config keys must be exactly 版本/会话/地址池/模板/用户模板/容量"
+            )
+    elif version == 3:
         if set(doc) != {"版本", "会话", "地址池", "模板", "用户模板"}:
             raise ValueError(
                 "config keys must be exactly 版本/会话/地址池/模板/用户模板"
@@ -354,11 +390,16 @@ def _parse_config(text):
         cidr, reserved, static = _parse_config_pool(obj)
         pool_specs.append((pool_id, cidr, reserved, static))
     pool_specs.sort(key=lambda item: item[0])
-    if version == 3:
+    if version >= 3:
         templates, user_templates = _parse_config_templates(doc)
     else:
         # v1/v2 迁移：模板与用户模板均为空。
         templates, user_templates = (), ()
+    if version == 4:
+        capacity = _parse_config_capacity(doc)
+    else:
+        # v1-v3 迁移：容量补默认 1024 项队列、不限等待。
+        capacity = (_MAX_QUEUE, 0)
     return (
         numbers["总数"],
         numbers["每用户"],
@@ -367,6 +408,7 @@ def _parse_config(text):
         tuple(pool_specs),
         templates,
         user_templates,
+        capacity,
     )
 
 
@@ -486,6 +528,8 @@ _CAP_VERDICTS_WITH_ORDER = frozenset(
     (_CAP_QUEUED, _CAP_CANCELLED, _CAP_TIMEOUT, _CAP_PROMOTED)
 )
 _MAX_QUEUE = 1024
+_MAX_QUEUE_LIMIT = 10000
+_CONFIG_VERSION = 4
 
 
 class _Pool:
@@ -532,14 +576,15 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v3 配置 JSON（顶层键序
-    版本/会话/地址池/模板/用户模板；会话与地址池沿用 v2，模板按标识升序、
-    用户模板按用户升序）；load_config 全验后原子替换并保存旧配置为回滚点，
-    引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限或租约
-    承载不满足抛 ResourceError，失败不改配置、回滚点、会话与租约；
-    rollback_config 经同样校验恢复旧配置并清除回滚点，无回滚点抛
-    StateError。三者成功均返回 v3 配置 JSON，会话状态、期限、地址、租期
-    不受配置替换影响，新配置仅作用于后续操作与查询。qos(sid) 以 O(1) 返回
+    参数错与异参 key 重放不入链。export_config 导出 v4 配置 JSON（顶层键序
+    版本/会话/地址池/模板/用户模板/容量；会话与地址池沿用 v2，模板按标识升序、
+    用户模板按用户升序、容量为队列上限/最大等待毫秒）；load_config 全验后
+    原子替换并保存旧配置为唯一回滚点，引用错（用户模板引用未知用户或未知
+    模板标识）抛 ValueError，上限、租约或队长承载不满足抛 ResourceError，
+    失败不改配置、回滚点、会话、租约与运行态；rollback_config 经同样校验
+    恢复旧配置并清除回滚点，无回滚点抛 StateError。三者成功均返回 v4 配置
+    JSON，会话状态、期限、地址、租期与旧队项的等待/截止/入队序不受配置替换
+    影响，新配置仅作用于后续操作与查询。qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
     会话所绑模板做令牌桶加配额计量：通过则提交累计，超限取模板动作
     （拒绝不提交，下线原子清场），重放缓存与 do 分域。meter 新 key 首次
@@ -547,8 +592,10 @@ class Sessions:
     （通过另计字节），配置热加载或回滚不迁移历史计数；meter_stats
     (now_ms, group) 老化后按用户或查询时生效绑定（未绑定归空串）汇总
     历史计数与当前在线数。capacity(key, op, sid, args, now_ms) 在既有
-    认证、老化、上限与 default 池取址规则之上提供 1024 项等待队列：
-    申请可立即服务则原子建立、否则入队（队满 ResourceError），取消仅
+    认证、老化、上限与 default 池取址规则之上提供容量背压等待队列（队列
+    上限与最大等待由配置给定，默认 1024 项、不限等待）：申请等待超过非零
+    最大等待在认证/老化之前即抛 ValueError（不入队、不记事件），可立即
+    服务则原子建立、否则入队（队长达上限 ResourceError），取消仅
     撤销排队项，推进先老化再清超时（截止=申请时刻+等待，含同刻）并依
     入队序晋升容量允许且可取址者至全局满；老化挂起即释址，挂起会话不
     持址、不计在线但仍占全局与单用户上限；按 key 重放缓存与 do/meter
@@ -585,6 +632,9 @@ class Sessions:
         # QoS 模板：标识 -> (限速, 突发, 配额, 超限)；用户模板：user -> 标识。
         self._templates = {}
         self._user_templates = {}
+        # 容量背压：队列上限（0 表示不限）、最大等待毫秒（0 表示不限）。
+        self._queue_limit = _MAX_QUEUE
+        self._max_wait_ms = 0
 
         # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
         #         "lease": int, "pool": str|None,
@@ -1301,18 +1351,21 @@ class Sessions:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def capacity(self, key, op, sid, args, now_ms):
-        """容量申请：1024 项等待队列的申请/取消/推进，返回 LF 结尾的 JSON 字符串。
+        """容量申请：可配置背压等待队列的申请/取消/推进，返回 LF 结尾 JSON。
 
         key/sid 沿用凭据约束（推进 sid 恒为空串）；now_ms 为非 bool 非负 int，
         类型错 TypeError、取值错 ValueError。op 仅“申请/取消/推进”：申请 args 为
         (user, password, 等待)，等待为非 bool 正 int；取消 args 须为 None；
         推进 sid 须为 ""、args 须为 None。
 
-        申请先老化再认证：认证非 ok 抛 AuthError，sid 已存在（在线/挂起/下线
-        会话或排队项）抛 StateError。非下线会话数达全局/单用户上限或缺
-        default 池、无可取址则入队等待，队满（1024 项）抛 ResourceError；
-        否则原子建立在线会话，失败不留半分配。老化挂起即释址，挂起会话不
-        持址、不计在线，但仍占全局与单用户上限。
+        申请等待超过配置的非零最大等待毫秒（0 表示不限）时在老化、认证之前
+        即抛 ValueError：不老化、不认证、不入队、不记事件，随验参异常入
+        重放缓存。通过该上界后申请先老化再认证：认证非 ok 抛 AuthError，
+        sid 已存在（在线/挂起/下线会话或排队项）抛 StateError。非下线会话数
+        达全局/单用户上限或缺 default 池、无可取址则入队等待，需排队且队长
+        已达配置队列上限（0 表示不限，默认 1024）抛 ResourceError 并记既有
+        “队满”事件；否则原子建立在线会话，失败不留半分配。老化挂起即释址，
+        挂起会话不持址、不计在线，但仍占全局与单用户上限。
         取消未知 sid 抛 KeyError，sid 为非排队项抛 StateError。推进先老化，
         再清除截止（=申请时刻+等待）≤ now_ms 的排队项，随后依入队序晋升上限
         允许且可取址者，直至全局上限满；变更仅含本次推进超时与晋升项的入队序，
@@ -1409,6 +1462,12 @@ class Sessions:
             _check_credential("user", args[0])
             _check_credential("password", args[1])
             _check_int("等待", args[2], 1)
+            # 容量背压：非零最大等待为硬上界，超限在老化/认证之前即拒（不老化、
+            # 不认证、不入队、不记事件），随验参异常入重放缓存；0 表示不限。
+            if self._max_wait_ms != 0 and args[2] > self._max_wait_ms:
+                raise ValueError(
+                    f"等待 must be <= {self._max_wait_ms}, got {args[2]}"
+                )
         elif args is not None:
             raise ValueError(f"args must be None for {op}, got {args!r}")
         _check_int("now_ms", now_ms, 0)
@@ -1439,9 +1498,12 @@ class Sessions:
             self._cap_event(now_ms, sid, _CAP_ONLINE, 0)
             return self._render_capacity(sid, _CAP_ONLINE, now_ms, deadline)
 
-        # 在线满（含挂起占位）或缺址：入队等待，队列本身满则 ResourceError。
-        if len(self._capacity_queue) >= _MAX_QUEUE:
-            raise ResourceError(f"capacity queue limit {_MAX_QUEUE} reached")
+        # 在线满（含挂起占位）或缺址：入队等待，队列本身达上限则 ResourceError；
+        # 队列上限为 0 表示不限。
+        if self._queue_limit != 0 and len(self._capacity_queue) >= self._queue_limit:
+            raise ResourceError(
+                f"capacity queue limit {self._queue_limit} reached"
+            )
         self._queue_seq += 1
         order = self._queue_seq
         self._capacity_queue[sid] = [user, now_ms, wait, deadline, order]
@@ -2349,7 +2411,7 @@ class Sessions:
 
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
-        模板按标识、用户模板按用户升序。"""
+        模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒)。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -2377,16 +2439,18 @@ class Sessions:
             tuple(pool_specs),
             templates,
             user_templates,
+            (self._queue_limit, self._max_wait_ms),
         )
 
     def export_config(self):
-        """导出当前配置为 v3 JSON（LF 结尾），O(n log n + S)/O(n)。
+        """导出当前配置为 v4 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
 
-        顶层键序为“版本/会话/地址池/模板/用户模板”；会话键序为“总数/每用户/
-        空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为“标识/CIDR/
-        保留/静态”，保留为按 IPv4 整数升序的串列表，静态为按用户再 IP 升序的
-        二元串列表；模板为按标识升序的列表，项键序为“标识/限速/突发/配额/
-        超限”；用户模板为按用户升序的 [user, 标识] 二元串列表。
+        顶层键序为“版本/会话/地址池/模板/用户模板/容量”；会话键序为“总数/
+        每用户/空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为“标识/
+        CIDR/保留/静态”，保留为按 IPv4 整数升序的串列表，静态为按用户再 IP
+        升序的二元串列表；模板为按标识升序的列表，项键序为“标识/限速/突发/
+        配额/超限”；用户模板为按用户升序的 [user, 标识] 二元串列表；容量键序
+        为“队列上限/最大等待毫秒”，0 分别表示不限队长与不限等待。
         """
         (
             total,
@@ -2396,6 +2460,7 @@ class Sessions:
             pool_specs,
             templates,
             user_templates,
+            (queue_limit, max_wait_ms),
         ) = self._current_spec()
         pools = [
             {
@@ -2407,7 +2472,7 @@ class Sessions:
             for pool_id, cidr, reserved, static in pool_specs
         ]
         payload = {
-            "版本": 3,
+            "版本": _CONFIG_VERSION,
             "会话": {
                 "总数": total,
                 "每用户": per,
@@ -2428,17 +2493,31 @@ class Sessions:
             "用户模板": [
                 [user, template_id] for user, template_id in user_templates
             ],
+            "容量": {
+                "队列上限": queue_limit,
+                "最大等待毫秒": max_wait_ms,
+            },
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _build_pools(self, spec):
-        """校验 spec 对现有会话的承载力并构建新池表；失败抛 ResourceError。
+        """校验 spec 对现有会话与等待队列的承载力并构建新池表；失败抛 ResourceError。
 
         任一上限低于对应非下线会话数，或新池无法按原池、地址、用户承载
-        在租租约（池缺失、地址不可用/被保留、静态址易主），均抛
-        ResourceError；本方法不改任何状态。
+        在租租约（池缺失、地址不可用/被保留、静态址易主），或当前队长大于
+        目标队列上限（0 表示不限），均抛 ResourceError；本方法不改任何状态，
+        旧队项的等待、截止与入队序均不触碰。
         """
-        total, per, _idle_ms, _lease_ms, pool_specs, _templates, _user_templates = spec
+        (
+            total,
+            per,
+            _idle_ms,
+            _lease_ms,
+            pool_specs,
+            _templates,
+            _user_templates,
+            (queue_limit, _max_wait_ms),
+        ) = spec
         total_count = 0
         per_user = {}
         for session in self._sessions.values():
@@ -2456,6 +2535,12 @@ class Sessions:
                     f"per-user session limit {per} below {count} active "
                     f"sessions for {user!r}"
                 )
+        # 队长承载：当前队长 > 目标上限即不可承载（上限 0 表示不限）。
+        if queue_limit != 0 and len(self._capacity_queue) > queue_limit:
+            raise ResourceError(
+                f"capacity queue limit {queue_limit} below current queue length "
+                f"{len(self._capacity_queue)}"
+            )
 
         parsed = {}
         for pool_id, cidr, reserved, static in pool_specs:
@@ -2509,8 +2594,18 @@ class Sessions:
         return new_pools
 
     def _install_spec(self, spec, new_pools):
-        """原子替换配置数值、池表与 QoS 模板；会话状态、期限、地址、租期不变。"""
-        (total, per, idle_ms, lease_ms, _pool_specs, templates, user_templates) = spec
+        """原子替换配置数值、池表、QoS 模板与容量背压；会话状态、期限、地址、
+        租期及旧队项的等待、截止、入队序均不变。"""
+        (
+            total,
+            per,
+            idle_ms,
+            lease_ms,
+            _pool_specs,
+            templates,
+            user_templates,
+            (queue_limit, max_wait_ms),
+        ) = spec
         self._total = total
         self._per = per
         self._idle_ms = idle_ms
@@ -2521,15 +2616,17 @@ class Sessions:
             for template_id, rate, burst, quota, exceed in templates
         }
         self._user_templates = dict(user_templates)
+        self._queue_limit = queue_limit
+        self._max_wait_ms = max_wait_ms
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为回滚点，返回新配置 v3 JSON。
+        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v4 JSON。
 
         text 非 str 抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、
         值、重复项或引用（用户模板引用未注册用户或未知模板标识）错抛
-        ValueError；上限或租约承载不满足抛 ResourceError。全部校验通过后
-        原子提交：失败不改配置、回滚点、会话与租约；成功不改会话与租约，
-        新值仅作用于后续操作与查询。
+        ValueError；上限、租约或队长承载不满足抛 ResourceError。全部校验通过
+        后原子提交：失败不改配置、回滚点、会话、租约与运行态；成功不老化，
+        会话与租约不变，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点。
         """
         spec = _parse_config(text)
         for user, _template_id in spec[6]:
@@ -2543,10 +2640,10 @@ class Sessions:
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复回滚点配置并清除回滚点，返回恢复后的 v3 JSON。
+        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v4 JSON。
 
-        无回滚点抛 StateError；校验失败（ResourceError）不改状态，
-        回滚点保留。
+        无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点或
+        运行态，回滚点保留；成功清除回滚点，不老化。
         """
         spec = self._rollback
         if spec is None:
