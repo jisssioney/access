@@ -4,7 +4,8 @@
 - Authenticator：带失败计数与锁定的用户认证器。
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
-  takeover_audit、防篡改审计链 audit/verify_audit）。
+  takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
+  export_config/load_config/rollback_config）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -144,6 +145,136 @@ def _check_pool(pool):
     return network, usable, reserved_ips, static_map, static_ips
 
 
+def _unique_object(pairs):
+    """json object_pairs_hook：重复键抛 ValueError。"""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate key: {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _parse_config_pool(obj):
+    """校验单个池对象（CIDR/保留/静态），返回规范化 (cidr, reserved, static)。
+
+    reserved 为按 IPv4 整数升序的地址串元组，static 为按用户升序的
+    (user, IP) 串对元组；结构、值或池规则错均抛 ValueError。
+    """
+    cidr = obj["CIDR"]
+    reserved = obj["保留"]
+    static = obj["静态"]
+    if not isinstance(cidr, str):
+        raise ValueError(f"CIDR must be a str, got {type(cidr).__name__}")
+    if not isinstance(reserved, list) or not all(
+        isinstance(item, str) for item in reserved
+    ):
+        raise ValueError("保留 must be a list of IPv4 address strings")
+    if not isinstance(static, list):
+        raise ValueError(f"静态 must be a list, got {type(static).__name__}")
+    pairs = []
+    for entry in static:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not isinstance(entry[1], str)
+        ):
+            raise ValueError("静态 entries must be [user, IP] string pairs")
+        pairs.append((entry[0], entry[1]))
+    try:
+        parsed = _check_pool((cidr, tuple(reserved), tuple(pairs)))
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
+    network, _usable, reserved_ips, static_map, _static_ips = parsed
+    canonical_reserved = tuple(
+        str(ipaddress.IPv4Address(ip_int)) for ip_int in sorted(reserved_ips)
+    )
+    canonical_static = tuple(
+        (user, str(ipaddress.IPv4Address(static_map[user])))
+        for user in sorted(static_map)
+    )
+    return (str(network), canonical_reserved, canonical_static)
+
+
+def _parse_config(text):
+    """解析配置文本为规范化 spec；text 非 str 抛 TypeError，余错抛 ValueError。
+
+    spec 为 (total, per, idle_ms, lease_ms, pools)，pools 为按标识升序的
+    (标识, cidr, reserved, static) 元组，reserved/static 已规范化排序。
+    v1（版本=1）地址池为无标识单池对象，迁移为 default 池；v2（版本=2）
+    地址池为池对象列表。JSON 解析错（JSONDecodeError 系 ValueError 子类）、
+    重复/未知/缺失键、结构、值或池规则错均抛 ValueError。
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"text must be a str, got {type(text).__name__}")
+    doc = json.loads(text, object_pairs_hook=_unique_object)
+    if not isinstance(doc, dict):
+        raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
+    if set(doc) != {"版本", "会话", "地址池"}:
+        raise ValueError("config keys must be exactly 版本/会话/地址池")
+    version = doc["版本"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+    if version not in (1, 2):
+        raise ValueError(f"版本 must be 1 or 2, got {version}")
+
+    session = doc["会话"]
+    if not isinstance(session, dict) or set(session) != {
+        "总数",
+        "每用户",
+        "空闲毫秒",
+        "租期毫秒",
+    }:
+        raise ValueError("会话 keys must be exactly 总数/每用户/空闲毫秒/租期毫秒")
+    numbers = {}
+    for name, minimum in (("总数", 1), ("每用户", 1), ("空闲毫秒", 0), ("租期毫秒", 1)):
+        value = session[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an int, got {type(value).__name__}")
+        if value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}, got {value}")
+        numbers[name] = value
+
+    raw_pools = doc["地址池"]
+    if version == 1:
+        if not isinstance(raw_pools, dict):
+            raise ValueError("v1 地址池 must be a single pool object")
+        if set(raw_pools) != {"CIDR", "保留", "静态"}:
+            raise ValueError("v1 地址池 keys must be exactly CIDR/保留/静态")
+        entries = [(_DEFAULT_POOL_ID, raw_pools)]
+    else:
+        if not isinstance(raw_pools, list):
+            raise ValueError("v2 地址池 must be a list of pool objects")
+        entries = []
+        seen_ids = set()
+        for item in raw_pools:
+            if not isinstance(item, dict) or set(item) != {"标识", "CIDR", "保留", "静态"}:
+                raise ValueError("pool entry keys must be exactly 标识/CIDR/保留/静态")
+            pool_id = item["标识"]
+            try:
+                _check_credential("pool id", pool_id)
+            except TypeError as exc:
+                raise ValueError(str(exc)) from exc
+            if pool_id in seen_ids:
+                raise ValueError(f"duplicate pool id: {pool_id!r}")
+            seen_ids.add(pool_id)
+            entries.append((pool_id, item))
+
+    pool_specs = []
+    for pool_id, obj in entries:
+        cidr, reserved, static = _parse_config_pool(obj)
+        pool_specs.append((pool_id, cidr, reserved, static))
+    pool_specs.sort(key=lambda item: item[0])
+    return (
+        numbers["总数"],
+        numbers["每用户"],
+        numbers["空闲毫秒"],
+        numbers["租期毫秒"],
+        tuple(pool_specs),
+    )
+
+
 def _digest(user, password):
     return hashlib.sha256((user + "\0" + password).encode("utf-8")).digest()
 
@@ -233,11 +364,20 @@ class _Pool:
     租用地址表按池隔离，故不同池的地址（int）允许重叠。
     """
 
-    __slots__ = ("capacity", "reserved", "static", "static_ips", "free", "leases")
+    __slots__ = (
+        "capacity",
+        "cidr",
+        "reserved",
+        "static",
+        "static_ips",
+        "free",
+        "leases",
+    )
 
     def __init__(self, parsed):
-        _network, usable, reserved, static, static_ips = parsed
+        network, usable, reserved, static, static_ips = parsed
         self.capacity = len(usable)
+        self.cidr = str(network)
         self.reserved = reserved
         self.static = static
         self.static_ips = static_ips
@@ -262,7 +402,11 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。
+    参数错与异参 key 重放不入链。export_config 导出 v2 配置 JSON；
+    load_config 校验后原子替换并保存旧配置为回滚点，上限或租约承载不满足
+    抛 ResourceError，失败不改状态；rollback_config 经同样校验恢复旧配置
+    并清除回滚点，无回滚点抛 StateError。三者成功均返回 v2 配置 JSON，
+    会话状态、期限、地址、租期不受配置替换影响。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -293,6 +437,8 @@ class Sessions:
         self._chain_events = []
         self._chain_index = {}
         self._chain_tail = "0" * 64
+        # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None。
+        self._rollback = None
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -728,6 +874,169 @@ class Sessions:
             )
         payload = {"时刻": now_ms, "池": pools}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _current_spec(self):
+        """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序。"""
+        pool_specs = []
+        for pool_id in sorted(self._pools):
+            pool = self._pools[pool_id]
+            reserved = tuple(
+                str(ipaddress.IPv4Address(ip_int)) for ip_int in sorted(pool.reserved)
+            )
+            static = tuple(
+                (user, str(ipaddress.IPv4Address(pool.static[user])))
+                for user in sorted(pool.static)
+            )
+            pool_specs.append((pool_id, pool.cidr, reserved, static))
+        return (
+            self._total,
+            self._per,
+            self._idle_ms,
+            self._lease_ms,
+            tuple(pool_specs),
+        )
+
+    def export_config(self):
+        """导出当前配置为 v2 JSON（LF 结尾），O((P+A)log(P+A)+S)/O(P+A)。
+
+        顶层键序为“版本/会话/地址池”；会话键序为“总数/每用户/空闲毫秒/
+        租期毫秒”；地址池为按标识升序的列表，项键序为“标识/CIDR/保留/静态”，
+        保留为按 IPv4 整数升序的串列表，静态为按用户再 IP 升序的二元串列表。
+        """
+        total, per, idle_ms, lease_ms, pool_specs = self._current_spec()
+        pools = [
+            {
+                "标识": pool_id,
+                "CIDR": cidr,
+                "保留": list(reserved),
+                "静态": [[user, ip] for user, ip in static],
+            }
+            for pool_id, cidr, reserved, static in pool_specs
+        ]
+        payload = {
+            "版本": 2,
+            "会话": {
+                "总数": total,
+                "每用户": per,
+                "空闲毫秒": idle_ms,
+                "租期毫秒": lease_ms,
+            },
+            "地址池": pools,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _build_pools(self, spec):
+        """校验 spec 对现有会话的承载力并构建新池表；失败抛 ResourceError。
+
+        任一上限低于对应非下线会话数，或新池无法按原池、地址、用户承载
+        在租租约（池缺失、地址不可用/被保留、静态址易主），均抛
+        ResourceError；本方法不改任何状态。
+        """
+        total, per, _idle_ms, _lease_ms, pool_specs = spec
+        total_count = 0
+        per_user = {}
+        for session in self._sessions.values():
+            if session["state"] != _STATE_OFFLINE:
+                total_count += 1
+                user = session["user"]
+                per_user[user] = per_user.get(user, 0) + 1
+        if total_count > total:
+            raise ResourceError(
+                f"total session limit {total} below {total_count} active sessions"
+            )
+        for user, count in per_user.items():
+            if count > per:
+                raise ResourceError(
+                    f"per-user session limit {per} below {count} active "
+                    f"sessions for {user!r}"
+                )
+
+        parsed = {}
+        for pool_id, cidr, reserved, static in pool_specs:
+            parsed[pool_id] = _check_pool((cidr, reserved, static))
+        static_owners = {
+            pool_id: {ip_int: user for user, ip_int in data[3].items()}
+            for pool_id, data in parsed.items()
+        }
+        for sid, session in self._sessions.items():
+            ip_int = session["ip"]
+            if ip_int is None:
+                continue
+            pool_id = session["pool"]
+            data = parsed.get(pool_id)
+            address = str(ipaddress.IPv4Address(ip_int))
+            if data is None:
+                raise ResourceError(
+                    f"new config cannot carry lease of sid {sid!r}: "
+                    f"no pool {pool_id!r}"
+                )
+            _network, usable, reserved_ips, _static_map, static_ips = data
+            if ip_int not in usable or ip_int in reserved_ips:
+                raise ResourceError(
+                    f"new config cannot carry lease of sid {sid!r}: "
+                    f"address {address} not usable in pool {pool_id!r}"
+                )
+            if (
+                ip_int in static_ips
+                and static_owners[pool_id][ip_int] != session["user"]
+            ):
+                raise ResourceError(
+                    f"new config cannot carry lease of sid {sid!r}: "
+                    f"address {address} is static for another user "
+                    f"in pool {pool_id!r}"
+                )
+
+        # 全部校验通过：构建新池表并回挂在租租约，空闲堆剔除租用动态址。
+        leased = {}
+        for sid, session in self._sessions.items():
+            if session["ip"] is not None:
+                leased.setdefault(session["pool"], {})[session["ip"]] = sid
+        new_pools = {}
+        for pool_id, data in parsed.items():
+            pool = _Pool(data)
+            pool_leases = leased.get(pool_id)
+            if pool_leases:
+                pool.leases.update(pool_leases)
+                pool.free = [x for x in pool.free if x not in pool_leases]
+                heapq.heapify(pool.free)
+            new_pools[pool_id] = pool
+        return new_pools
+
+    def _install_spec(self, spec, new_pools):
+        """原子替换配置数值与池表；会话状态、期限、地址、租期不变。"""
+        total, per, idle_ms, lease_ms, _pool_specs = spec
+        self._total = total
+        self._per = per
+        self._idle_ms = idle_ms
+        self._lease_ms = lease_ms
+        self._pools = new_pools
+
+    def load_config(self, text):
+        """校验并原子加载配置文本，保存旧配置为回滚点，返回新配置 v2 JSON。
+
+        text 非 str 抛 TypeError；JSON 解析、重复/未知/缺失键、结构、值或
+        池规则错抛 ValueError；上限或租约承载不满足抛 ResourceError。
+        失败不改状态；成功后新值作用于后续操作，会话与租约不变。
+        """
+        spec = _parse_config(text)
+        new_pools = self._build_pools(spec)
+        self._rollback = self._current_spec()
+        self._install_spec(spec, new_pools)
+        return self.export_config()
+
+    def rollback_config(self):
+        """经同样校验恢复回滚点配置并清除回滚点，返回恢复后的 v2 JSON。
+
+        无回滚点抛 StateError；校验失败（ResourceError）不改状态，
+        回滚点保留。
+        """
+        spec = self._rollback
+        if spec is None:
+            raise StateError("no config rollback point")
+        new_pools = self._build_pools(spec)
+        self._rollback = None
+        self._install_spec(spec, new_pools)
+        return self.export_config()
 
     def _audit_append(self, key, old, sid, result, now_ms, origin=0):
         """追加一条接管审计事件，O(1) 时空。
