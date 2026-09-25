@@ -17,6 +17,11 @@
   注入期该池视为无可分配地址，建立、迁入、无址接管在既有认证与老化后抛
   ResourceError，capacity 申请排队、推进跳过，到刻自动正常；首果独立域
   永久缓存，首次成功与重放写防篡改审计链（池注入/池恢复）。
+  timeout_fault 注入/恢复超时演练触发：注入设置或覆盖待触发时刻，恢复
+  取消；待触发时首个到刻（含同刻）的 capacity 推进在普通老化与晋升前
+  原子挂起全部在线会话（清期限、释租约）、按入队序将全部队项记超时后
+  删除，再清除触发，本批不晋升；首果独立域永久缓存，首次成功与重放写
+  防篡改审计链（超时注入/超时恢复、会话空串）。
   user_stats 按用户只读快照：按 now_ms 取视图（在线期限到计挂起、租期或
   期限到不计占用、队项截止到不计排队、墓碑计下线），并给出该用户
   do/meter/capacity 新 key 首次且已定位用户的认证/资源/状态/后端失败
@@ -707,6 +712,13 @@ _POOL_NORMAL = "正常"
 _POOL_OP_INJECT = "池注入"
 _POOL_OP_RECOVER = "池恢复"
 
+# timeout_fault 触发演练状态：仅等待/正常。
+_TIMEOUT_WAITING = "等待"
+_TIMEOUT_NORMAL = "正常"
+# timeout_fault 入防篡改审计链的操作名。
+_TIMEOUT_OP_INJECT = "超时注入"
+_TIMEOUT_OP_RECOVER = "超时恢复"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -831,6 +843,21 @@ class Sessions:
     恢复、会话记 pool，结果成功/重放、原序号沿用，异常不记。配置加载/
     回滚成功后保留同名池故障、清除已删池，失败不改故障。故障判定及
     变更 O(1) 时空。
+    timeout_fault(key, op, at_ms, now_ms) 注入或恢复超时演练触发：
+    key 沿用凭据约束，op 仅注入/恢复，now_ms 为非 bool 非负 int；
+    注入 at_ms 为非 bool int 且 >= now_ms，设置或覆盖待触发时刻，
+    恢复 at_ms 须为 None 并取消待触发；类型、值错依次抛 TypeError、
+    ValueError，校验失败不改触发状态。成功 JSON 沿基线，键序
+    “状态/时刻/触发”，注入为 等待/now_ms/at_ms，恢复为
+    正常/now_ms/0。验 key 后以独立域永久缓存余参与首次成败（含
+    验参异常），同参重放不改状态、异参 ValueError；首次成功及成功
+    重放写现有防篡改审计链，操作超时注入/超时恢复、会话记空串，
+    结果成功/重放、原序号沿用，异常不记。待触发时首个满足
+    now_ms >= 触发值的 capacity 推进在普通老化与晋升前原子挂起全部
+    在线会话（清期限、释租约）、按入队序将全部队项记超时后删除，
+    再清除触发；本批不晋升、不半释放。配置加载/回滚成功保留待触发
+    值，失败不改。控制 O(1) 时空，触发 O(S log A + Q) 时间、O(Q)
+    空间。
     user_stats(user, now_ms) 返回按用户只读快照 JSON：按 now_ms 取视图
     （不老化），在线期限 <= now_ms 计挂起，租期或期限 <= now_ms 不计
     占用，队项截止 <= now_ms 不计排队，墓碑计下线；失败为该用户
@@ -928,6 +955,15 @@ class Sessions:
         # pool_fault 写现有防篡改链，但原序号索引与 do 分域，避免同名字符串
         # key 跨域互相指认首次事件。
         self._pool_fault_chain_index = {}
+        # 超时演练：待触发时刻（None 表示无待触发）；首个满足
+        # now_ms >= 触发值的推进在普通老化与晋升前原子挂起全部在线会话、
+        # 将全部队项记超时后删除，再清除触发。timeout_fault 的重放缓存
+        # 与 do/meter/capacity/fault/pool_fault 分域：
+        # key -> (op, at_ms, now_ms, outcome)。
+        self._timeout_trigger = None
+        self._timeout_fault_cache = {}
+        # timeout_fault 写现有防篡改链，原序号索引同样与 do 分域。
+        self._timeout_fault_chain_index = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -1942,6 +1978,114 @@ class Sessions:
         payload = {"池": pool, "状态": state, "时刻": now_ms, "截至": until}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def timeout_fault(self, key, op, at_ms, now_ms):
+        """注入或恢复超时演练触发，返回 LF 结尾 JSON。
+
+        key 沿用凭据约束；op 仅“注入/恢复”：注入 at_ms 为非 bool int 且
+        >= now_ms，设置或覆盖待触发时刻；恢复 at_ms 须为 None，取消待
+        触发。now_ms 为非 bool 非负 int；类型错 TypeError、取值错
+        ValueError，校验失败不改触发状态。成功 JSON 沿基线，键序
+        “状态/时刻/触发”，注入为 等待/now_ms/at_ms，恢复为
+        正常/now_ms/0。验 key 后以独立域（与 do/meter/capacity/fault/
+        pool_fault 分域）永久缓存余参与首次成败（含验参异常）：同参
+        重放不改状态、直接返回或重抛，异参抛 ValueError。首次成功及
+        成功的同参重放写现有防篡改审计链：操作“超时注入/超时恢复”、
+        会话记空串，结果“成功/重放”，重放原序号沿用首次；异常不记。
+        配置加载/回滚成功保留待触发值，失败不改。判定与变更均 O(1)
+        时空；触发本身见 capacity 推进。
+        """
+        _check_credential("key", key)
+
+        cached = self._timeout_fault_cache.get(key)
+        if cached is not None:
+            # 重放：不改触发状态，仅按缓存返回或重抛。
+            c_op, c_at_ms, c_now_ms, outcome = cached
+            if not _strict_equal((op, at_ms, now_ms), (c_op, c_at_ms, c_now_ms)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 仅首次成功的同参重放入链记“重放”，原序号沿用首次；
+            # 首次异常不在本域链索引中，自然跳过。
+            origin = self._timeout_fault_chain_index.get(key)
+            if origin is not None:
+                chain_op = (
+                    _TIMEOUT_OP_INJECT if c_op == _OP_INJECT else _TIMEOUT_OP_RECOVER
+                )
+                self._chain_append(
+                    key,
+                    chain_op,
+                    "",
+                    "重放",
+                    now_ms,
+                    origin,
+                    self._timeout_fault_chain_index,
+                )
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存；校验失败不改触发状态。
+        try:
+            self._validate_timeout_fault_params(op, at_ms, now_ms)
+        except (TypeError, ValueError) as exc:
+            self._timeout_fault_cache[key] = (
+                op,
+                at_ms,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        if op == _OP_INJECT:
+            self._timeout_trigger = at_ms
+            result = self._render_timeout_fault(_TIMEOUT_WAITING, now_ms, at_ms)
+            chain_op = _TIMEOUT_OP_INJECT
+        else:
+            self._timeout_trigger = None
+            result = self._render_timeout_fault(_TIMEOUT_NORMAL, now_ms, 0)
+            chain_op = _TIMEOUT_OP_RECOVER
+        self._timeout_fault_cache[key] = (op, at_ms, now_ms, ("ok", result))
+        self._chain_append(
+            key,
+            chain_op,
+            "",
+            "成功",
+            now_ms,
+            index=self._timeout_fault_chain_index,
+        )
+        return result
+
+    @staticmethod
+    def _validate_timeout_fault_params(op, at_ms, now_ms):
+        """校验 timeout_fault 三参数：类型错先于值错。
+
+        op 限注入/恢复，注入 at_ms 为非 bool int 且 >= now_ms，恢复
+        at_ms 须为 None（任何非 None 皆值错），now_ms 为非 bool 非负 int。
+        """
+        # 类型阶段：任一类型错先于任何值错抛出。
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if op == _OP_INJECT and (isinstance(at_ms, bool) or not isinstance(at_ms, int)):
+            raise TypeError(f"at_ms must be an int, got {type(at_ms).__name__}")
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值阶段。
+        if op not in (_OP_INJECT, _OP_RECOVER):
+            raise ValueError(f"op must be one of 注入/恢复, got {op!r}")
+        if op == _OP_INJECT:
+            if at_ms < now_ms:
+                raise ValueError(f"at_ms must be >= now_ms, got {at_ms} < {now_ms}")
+        elif at_ms is not None:
+            raise ValueError(f"at_ms must be None for 恢复, got {at_ms!r}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+
+    @staticmethod
+    def _render_timeout_fault(state, now_ms, trigger):
+        # 键序：状态、时刻、触发；状态为 str，余为 int。
+        payload = {"状态": state, "时刻": now_ms, "触发": trigger}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def fault_stats(self, now_ms):
         """返回后端故障统计 JSON；查询不认证、不老化、不改退避、不审计、
         不记事件、不动各域缓存。
@@ -2187,7 +2331,10 @@ class Sessions:
         取消未知 sid 抛 KeyError，sid 为非排队项抛 StateError。推进先老化，
         再清除截止（=申请时刻+等待）≤ now_ms 的排队项，随后依入队序晋升上限
         允许且可取址者，直至全局上限满；变更仅含本次推进超时与晋升项的入队序，
-        先超时后晋升；输出“在线”仅计在线会话。新 key 首次结果（成功或
+        先超时后晋升；输出“在线”仅计在线会话。超时演练待触发且本推进到刻
+        （含同刻）时，改为在普通老化与晋升前原子挂起全部在线会话（清期限、
+        释租约）、按入队序将全部队项记超时后删除并清除触发，本批不老化、
+        不晋升、不半释放。新 key 首次结果（成功或
         AuthError/ResourceError/StateError/KeyError，含验参异常）永久缓存，
         同参重放无副作用、直接返回或重抛，异参抛 ValueError；缓存与
         do/meter 分域。仅首个验参成功的新 key 记 capacity 事件，重放不记。
@@ -2237,6 +2384,19 @@ class Sessions:
                     ("err", (type(exc), exc.args)),
                 )
                 raise
+
+        # 超时演练：待触发且本推进到刻（含同刻）时，在普通老化与晋升前
+        # 原子挂起全部在线会话（清期限、释租约），按入队序将全部队项记
+        # 超时后删除，再清除触发；本批不老化、不晋升、不半释放。
+        if (
+            op == _OP_ADVANCE
+            and self._timeout_trigger is not None
+            and now_ms >= self._timeout_trigger
+        ):
+            changed = self._fire_timeout_fault(now_ms)
+            result = self._render_capacity_advance(now_ms, 0, 0, changed)
+            self._capacity_cache[key] = (op, sid, args, now_ms, ("ok", result))
+            return result
 
         # 申请与推进先老化（取消不老化）；取消结果不受老化影响。
         if op != _OP_CANCEL:
@@ -2420,6 +2580,29 @@ class Sessions:
         changed = [order for _sid, order in timed_out]
         changed += [order for _sid, order in promoted]
         return self._render_capacity_advance(now_ms, online, len(remaining), changed)
+
+    def _fire_timeout_fault(self, now_ms):
+        """超时演练触发：原子挂起全部在线会话（释租约、清期限），按入队序
+        将全部队项记超时后删除，再清除触发；返回超时项的入队序列表。
+
+        本批不晋升、不半释放；挂起会话不持址、不计在线，但仍占全局与
+        单用户上限。时间 O(S log A + Q)、辅助空间 O(Q)。
+        """
+        for session in self._sessions.values():
+            if session["state"] != _STATE_ONLINE:
+                continue
+            self._release(session)
+            session["state"] = _STATE_SUSPENDED
+            session["deadline"] = 0
+        changed = []
+        for queued_sid in self._queue_order:
+            entry = self._capacity_queue[queued_sid]
+            self._cap_event(now_ms, queued_sid, _CAP_TIMEOUT, entry[4])
+            changed.append(entry[4])
+        self._capacity_queue.clear()
+        self._queue_order = []
+        self._timeout_trigger = None
+        return changed
 
     def _active_counts(self):
         """非下线会话总数与按用户计数（含在线与挂起，排队项不计），单次 O(S)。"""
@@ -3452,7 +3635,8 @@ class Sessions:
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
         # 配置加载/回滚成功后保留同名池的耗尽演练、清除已删池（截至不改）；
-        # 加载失败不经过本方法，故障态不变。
+        # 加载失败不经过本方法，故障态不变。超时演练待触发值与池无关，
+        # 成功保留、失败不改，此处均不动。
         self._pool_fault = {
             pool_id: until
             for pool_id, until in self._pool_fault.items()
