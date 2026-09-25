@@ -11,7 +11,8 @@
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
   creplay 提供 capacity 状态检查点、事件哈希链校验与原子重放恢复。
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
-  老化前查后端，故障期按用户指数退避抛 BackendError。
+  老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
+  后端故障统计（含按类累计的失败次数），查询不老化、不改态。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -645,7 +646,11 @@ class Sessions:
     否则 n 不变抛 BackendError(retry_at)；截至与 retry_at 均到才认证并
     清该用户退避。BackendError 按 key 入各自缓存；失败仅改退避与缓存，
     认证器、会话、租约与队列不变；BackendError 与 fault 均不审计。检查
-    额外时空 O(1)。
+    额外时空 O(1)。fault_stats(now_ms) 返回后端故障统计 JSON（时刻/
+    故障/截至/退避用户/失败）：失败为故障、退避两项累计，仅新 key 首次
+    后端检查抛 BackendError 时计数（now_ms<retry_at 归退避，否则归
+    故障），注入/恢复/配置变更不清零；查询不认证、不老化、不改退避、
+    不审计、不记事件、不动缓存，O(U) 时间、O(1) 辅助空间。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -713,6 +718,9 @@ class Sessions:
         self._fault_until = 0
         self._backoff = {}
         self._fault_cache = {}
+        # 后端失败累计 [故障, 退避]：仅新 key 首次后端检查抛 BackendError
+        # 时按类归计；注入/恢复/配置变更不清零。
+        self._fault_fail = [0, 0]
 
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
@@ -948,8 +956,9 @@ class Sessions:
 
         截至与 retry_at 均到（含无故障）则清该用户退避并返回；故障中且
         retry_at 已到则 n 加一、retry_at = now_ms+min(100*2**(n-1), 1600)
-        并抛 BackendError(retry_at)；retry_at 未到则 n 不变，抛
-        BackendError(retry_at)。
+        并抛 BackendError(retry_at)，计一次“故障”失败；retry_at 未到则
+        n 不变，抛 BackendError(retry_at)，计一次“退避”失败。本方法仅由
+        新 key 首次路径调用，重放不到达，故每次抛错恰计一次。
         """
         n, retry_at = self._backoff.get(user, (0, 0))
         if now_ms >= self._fault_until and now_ms >= retry_at:
@@ -961,6 +970,10 @@ class Sessions:
             n += 1
             retry_at = now_ms + min(100 * 2 ** (n - 1), 1600)
             self._backoff[user] = (n, retry_at)
+            self._fault_fail[0] += 1
+        else:
+            # 退避未到期：n 不变。
+            self._fault_fail[1] += 1
         raise BackendError(retry_at)
 
     def _capacity_counts(self, user=None):
@@ -1527,6 +1540,36 @@ class Sessions:
     def _render_fault(state, now_ms, until):
         # 键序：状态、时刻、截至；状态为 str，余为 int。
         payload = {"状态": state, "时刻": now_ms, "截至": until}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def fault_stats(self, now_ms):
+        """返回后端故障统计 JSON；查询不认证、不老化、不改退避、不审计、
+        不记事件、不动各域缓存。
+
+        now_ms 为非 bool 非负 int：类型错 TypeError、取值错 ValueError。
+        顶层键序为“时刻/故障/截至/退避用户/失败”：故障当且仅当
+        now_ms < 故障截至，截至为当前存值；退避用户为 retry_at > now_ms
+        的不同用户数；失败恒为故障、退避两项，项键序为“类型/次数”，
+        次数为 do 建立/迁移/接管与 capacity 申请在新 key 首次后端检查
+        抛 BackendError 的累计（now_ms<retry_at 归退避，否则归故障），
+        注入/恢复/配置变更不清零。LF 结尾紧凑 JSON；同状态同时刻查询
+        逐字节相同。查询 O(U) 时间、O(1) 辅助空间，U 为退避记录数。
+        """
+        _check_int("now_ms", now_ms, 0)
+        backoff_users = 0
+        for _n, retry_at in self._backoff.values():
+            if retry_at > now_ms:
+                backoff_users += 1
+        payload = {
+            "时刻": now_ms,
+            "故障": now_ms < self._fault_until,
+            "截至": self._fault_until,
+            "退避用户": backoff_users,
+            "失败": [
+                {"类型": "故障", "次数": self._fault_fail[0]},
+                {"类型": "退避", "次数": self._fault_fail[1]},
+            ],
+        }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def capacity(self, key, op, sid, args, now_ms):
