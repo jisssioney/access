@@ -5,7 +5,8 @@
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/加载/回滚
-  export_config/load_config/rollback_config、QoS 模板查询 qos）。
+  export_config/load_config/rollback_config、QoS 模板查询 qos、按模板
+  令牌桶加配额计量 meter）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -505,7 +506,9 @@ class Sessions:
     rollback_config 经同样校验恢复旧配置并清除回滚点，无回滚点抛
     StateError。三者成功均返回 v3 配置 JSON，会话状态、期限、地址、租期
     不受配置替换影响，新配置仅作用于后续操作与查询。qos(sid) 以 O(1) 返回
-    在线会话用户所绑 QoS 模板的生效值。
+    在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
+    会话所绑模板做令牌桶加配额计量：通过则提交累计，超限取模板动作
+    （拒绝不提交，下线原子清场），重放缓存与 do 分域。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -527,11 +530,14 @@ class Sessions:
         self._user_templates = {}
 
         # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
-        #         "lease": int, "pool": str|None}
+        #         "lease": int, "pool": str|None,
+        #         "meter": [累计, 上次通过时刻, 千分字节令牌] | None}
         self._sessions = {}
         # key -> (op, sid, args, now_ms, outcome)
         # outcome 为 ("ok", json_str) 或 ("err", (exc_class, exc_args))
         self._cache = {}
+        # meter 的重放缓存，与 do 分域：key -> (sid, size, now_ms, outcome)
+        self._meter_cache = {}
         # 接管审计事件追加序列（序号自 1）；key -> 首次事件序号，供重放指认。
         self._audit_events = []
         self._audit_index = {}
@@ -765,6 +771,7 @@ class Sessions:
             "ip": ip_int,
             "lease": lease,
             "pool": pool_id,
+            "meter": None,
         }
         address = str(ipaddress.IPv4Address(ip_int))
         return self._render(sid, _STATE_ONLINE, now_ms, deadline, address, lease)
@@ -925,6 +932,7 @@ class Sessions:
             "ip": ip_int,
             "lease": lease,
             "pool": pool_id,
+            "meter": None,
         }
         old_address = (
             str(ipaddress.IPv4Address(old_ip)) if old_ip is not None else ""
@@ -1008,6 +1016,109 @@ class Sessions:
             "超限": exceed,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def meter(self, key, sid, size, now_ms):
+        """按会话所绑 QoS 模板计量一次流量，返回 LF 结尾的 JSON 字符串。
+
+        key/sid 沿用凭据约束；size/now_ms 为非 bool 的正/非负 int，类型错
+        TypeError、范围错 ValueError。重放缓存与 do 分域：首个结果（成功或
+        异常）永久缓存，同型同参重放不老化、直接返回或重抛，异参抛
+        ValueError。首次调用先老化；未知 sid 抛 KeyError，会话非在线、用户
+        未绑模板或 now_ms 早于上次通过时刻抛 StateError；异常仅保留老化
+        结果。单次 O(S) 时间、O(1) 辅助空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._meter_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不计量，仅按缓存返回或重抛。
+            c_sid, c_size, c_now_ms, outcome = cached
+            if not _strict_equal((sid, size, now_ms), (c_sid, c_size, c_now_ms)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存。
+        try:
+            _check_credential("sid", sid)
+            _check_int("size", size, 1)
+            _check_int("now_ms", now_ms, 0)
+        except (TypeError, ValueError) as exc:
+            self._meter_cache[key] = (
+                sid,
+                size,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 非重放：先将到期在线会话挂起、到期租约释放。
+        self._age(now_ms)
+        try:
+            result = self._meter(sid, size, now_ms)
+        except (StateError, KeyError) as exc:
+            self._meter_cache[key] = (
+                sid,
+                size,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+        self._meter_cache[key] = (sid, size, now_ms, ("ok", result))
+        return result
+
+    def _meter(self, sid, size, now_ms):
+        """令牌桶加配额计量：通过则提交，拒绝不提交，下线原子清场。
+
+        每会话计量态 (u, t, c) 为累计字节、上次通过时刻、千分字节令牌，
+        初始 (0, now_ms, C)，C=(限速+突发)*1000；之后 c 按限速补足并以 C
+        截顶（配置变更后亦按新模板限速与桶容截顶，u/t 续存）。
+        size*1000 <= c 且 u+size <= 配额则通过并提交 (u+size, now_ms,
+        c-size*1000)；否则取超限动作：拒绝不提交任何计量态，下线不累计并
+        原子下线、清期限、释址退租。
+        """
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        if session["state"] != _STATE_ONLINE:
+            raise StateError(
+                f"cannot meter sid {sid!r} in state {session['state']!r}"
+            )
+        user = session["user"]
+        template_id = self._user_templates.get(user)
+        if template_id is None:
+            raise StateError(f"no qos template bound for user {user!r}")
+        rate, burst, quota, exceed = self._templates[template_id]
+        capacity = (rate + burst) * 1000
+
+        meter = session["meter"]
+        if meter is None:
+            # 首次计量：满桶起步，时刻即此刻。
+            meter = [0, now_ms, capacity]
+        used, last, tokens = meter
+        if now_ms < last:
+            raise StateError(
+                f"now_ms {now_ms} before last meter time {last} for sid {sid!r}"
+            )
+        tokens = min(capacity, tokens + rate * (now_ms - last))
+
+        if size * 1000 <= tokens and used + size <= quota:
+            # 通过：提交累计、时刻与扣减后的令牌。
+            used += size
+            tokens -= size * 1000
+            session["meter"] = [used, now_ms, tokens]
+            result = "通过"
+        else:
+            result = exceed
+            if exceed == "下线":
+                # 不累计：原子下线、清期限、释址退租，计量态不提交。
+                session["state"] = _STATE_OFFLINE
+                session["deadline"] = 0
+                self._release(session)
+            # 拒绝：不提交任何计量态。
+        return self._render_meter(sid, now_ms, size, result, used)
 
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
@@ -1348,6 +1459,18 @@ class Sessions:
                 return False
             prev_hash = digest
         return True
+
+    @staticmethod
+    def _render_meter(sid, now_ms, size, result, used):
+        # 键序：会话、时刻、字节、结果、累计；会话/结果为 str，余为 int。
+        payload = {
+            "会话": sid,
+            "时刻": now_ms,
+            "字节": size,
+            "结果": result,
+            "累计": used,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
     def _render(sid, state, now_ms, deadline, address=None, lease=0):
