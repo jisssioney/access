@@ -706,6 +706,8 @@ _OP_RENEW = "续租"
 _OP_OFFLINE = "下线"
 _OP_MIGRATE = "迁移"
 _OP_TAKEOVER = "接管"
+_OP_SUSPEND = "挂起"
+_OP_RESUME = "恢复"
 
 _DEFAULT_POOL_ID = "default"
 
@@ -1026,6 +1028,18 @@ class Sessions:
     原序号指认首次、结果“重放”。停用态不随配置加载/回滚或
     creplay/runtime_restore 改变。首次
     O(S+Q) 时间、O(1) 辅助空间，重放 O(1)。
+    do 另受理挂起/恢复：挂起 args 须为 None 否则 ValueError，先老化，
+    未知 sid 抛 KeyError、非在线抛 StateError，置挂起、期限 0 并释址
+    退租；恢复 args 为 (pool, password) 二元 tuple（非 tuple 抛
+    TypeError、长度错抛 ValueError、两字段沿用凭据约束），先由 sid
+    只读定位（未知 KeyError），再查停用（AuthError）与后端
+    （BackendError），老化后查池（未知 KeyError）与状态（非挂起
+    StateError）、认证（非 ok AuthError）、取址（池故障演练、静态址
+    占用或动态址耗尽均 ResourceError）：取用户静态址，否则取池内最小
+    动态址，置在线，期限 = now_ms+idle_ms、租期 = now_ms+lease_ms；
+    失败仅保留老化、认证计数与退避，不半分配。二者返回键序
+    会话/状态/时刻/期限/池/地址/租期的 LF 尾 JSON（会话/状态/池/地址
+    为 str，余为 int；挂起时池/地址空串、租期 0），缓存与审计沿用 do。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1180,9 +1194,9 @@ class Sessions:
         self._pools[pool_id] = _Pool(parsed)
 
     def do(self, key, op, sid, args, now_ms):
-        """执行一次建立/续租/下线/迁移/接管操作，返回 LF 结尾的 JSON 字符串。
+        """执行一次建立/续租/下线/迁移/接管/挂起/恢复操作，返回 LF 结尾的 JSON 字符串。
 
-        建立/迁移/接管在验参后、老化前查后端：故障期按用户指数退避抛
+        建立/迁移/接管/恢复在验参后、老化前查后端：故障期按用户指数退避抛
         BackendError（只入缓存，不老化、不认证、不审计），健康才老化。
         """
         _check_credential("key", key)
@@ -1236,9 +1250,9 @@ class Sessions:
         if count_establish:
             self._establish_total += 1
 
-        # 建立/迁移/接管：验参后、老化前查后端。迁移/接管由 sid/old 只读
-        # 定位，未知 KeyError（不退避，仍缓存并入链）；定位后 BackendError
-        # 先于状态、目标池与新 sid 错误；健康才老化并循旧序。
+        # 建立/迁移/接管/恢复：验参后、老化前查后端。迁移/接管/恢复由
+        # sid/old 只读定位，未知 KeyError（不退避，仍缓存并入链）；定位后
+        # BackendError 先于状态、目标池与新 sid 错误；健康才老化并循旧序。
         if op == _OP_ESTABLISH:
             backend_user = args[0]
         elif op == _OP_MIGRATE:
@@ -1269,9 +1283,23 @@ class Sessions:
                 self._chain_append(key, op, sid, type(exc).__name__, now_ms)
                 raise exc
             backend_user = old_session["user"]
+        elif op == _OP_RESUME:
+            session = self._sessions.get(sid)
+            if session is None:
+                exc = KeyError(f"unknown sid: {sid!r}")
+                self._cache[key] = (
+                    op,
+                    sid,
+                    args,
+                    now_ms,
+                    ("err", (type(exc), exc.args)),
+                )
+                self._chain_append(key, op, sid, type(exc).__name__, now_ms)
+                raise exc
+            backend_user = session["user"]
         else:
             backend_user = None
-        # 停用态用户：建立/迁移/接管先于后端检查与认证拒绝，只入缓存；
+        # 停用态用户：建立/迁移/接管/恢复先于后端检查与认证拒绝，只入缓存；
         # 不老化、不退避、不认证、不计失败、不入审计链（重放自然不重记入链）。
         if backend_user is not None and backend_user in self._disabled_users:
             exc = AuthError(f"user {backend_user!r} is disabled")
@@ -1312,6 +1340,10 @@ class Sessions:
                 result = self._migrate(sid, args[0], args[1], now_ms)
             elif is_takeover:
                 result = self._takeover(sid, args[0], args[1], now_ms)
+            elif op == _OP_SUSPEND:
+                result = self._suspend(sid, now_ms)
+            elif op == _OP_RESUME:
+                result = self._resume(sid, args[0], args[1], now_ms)
             else:
                 result = self._offline(sid, now_ms)
         except (AuthError, ResourceError, StateError, KeyError) as exc:
@@ -1351,12 +1383,20 @@ class Sessions:
         return result
 
     def _validate_params(self, op, sid, args, now_ms):
-        """校验 key 之外的四个参数；迁移与接管始终受理（无池于老化后抛
-        StateError 或 KeyError），续租仅在已有地址池时受理。"""
+        """校验 key 之外的四个参数；迁移、接管、挂起与恢复始终受理（无池于
+        老化后抛 StateError 或 KeyError），续租仅在已有地址池时受理。"""
         if isinstance(op, bool) or not isinstance(op, str):
             raise TypeError(f"op must be a str, got {type(op).__name__}")
-        # 迁移与接管在零池模式下亦通过验参，状态类异常延后到老化之后。
-        valid_ops = (_OP_ESTABLISH, _OP_OFFLINE, _OP_MIGRATE, _OP_TAKEOVER)
+        # 迁移、接管、挂起与恢复在零池模式下亦通过验参，状态类异常延后到
+        # 老化之后。
+        valid_ops = (
+            _OP_ESTABLISH,
+            _OP_OFFLINE,
+            _OP_MIGRATE,
+            _OP_TAKEOVER,
+            _OP_SUSPEND,
+            _OP_RESUME,
+        )
         if self._pools:
             valid_ops = (
                 _OP_ESTABLISH,
@@ -1364,6 +1404,8 @@ class Sessions:
                 _OP_OFFLINE,
                 _OP_MIGRATE,
                 _OP_TAKEOVER,
+                _OP_SUSPEND,
+                _OP_RESUME,
             )
         if op not in valid_ops:
             raise ValueError(f"op must be one of {valid_ops}, got {op!r}")
@@ -1396,6 +1438,16 @@ class Sessions:
                     f"got {len(args)} items"
                 )
             _check_credential("old", args[0])
+            _check_credential("password", args[1])
+        elif op == _OP_RESUME:
+            if not isinstance(args, tuple):
+                raise TypeError(f"args must be a tuple, got {type(args).__name__}")
+            if len(args) != 2:
+                raise ValueError(
+                    "args must be a 2-tuple (pool, password), "
+                    f"got {len(args)} items"
+                )
+            _check_credential("pool", args[0])
             _check_credential("password", args[1])
         elif args is not None:
             raise ValueError(f"args must be None for {op}, got {args!r}")
@@ -1747,6 +1799,73 @@ class Sessions:
         self._release(session)
         address = "" if self._pools else None
         return self._render(sid, _STATE_OFFLINE, now_ms, 0, address, 0)
+
+    def _suspend(self, sid, now_ms):
+        """在线→挂起：期限清零、释址退租；未知 sid KeyError，非在线 StateError。"""
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        if session["state"] != _STATE_ONLINE:
+            raise StateError(
+                f"cannot suspend sid {sid!r} in state {session['state']!r}"
+            )
+        session["state"] = _STATE_SUSPENDED
+        session["deadline"] = 0
+        self._release(session)
+        return self._render_suspend_resume(sid, _STATE_SUSPENDED, now_ms, 0, "", "", 0)
+
+    def _resume(self, sid, pool_id, password, now_ms):
+        """挂起→在线：自指定池取用户静态址或最小动态址，失败不留半分配。
+
+        依次：未知 sid/池 KeyError、非挂起 StateError、认证非 ok AuthError、
+        池故障演练/静态址占用/动态址耗尽 ResourceError；全部通过才落库，
+        期限 = now_ms+idle_ms、租期 = now_ms+lease_ms。定位、停用与后端
+        检查已在老化前由 do 完成。
+        """
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        pool = self._pools.get(pool_id)
+        if pool is None:
+            raise KeyError(f"unknown pool: {pool_id!r}")
+        if session["state"] != _STATE_SUSPENDED:
+            raise StateError(
+                f"cannot resume sid {sid!r} in state {session['state']!r}"
+            )
+
+        user = session["user"]
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        # 取址：耗尽演练期该池视为无址；静态址专属该用户但同时只能租给
+        # 一个会话；非静态用户取池内最小动态空闲址。
+        if self._pool_is_exhausted(pool_id, now_ms):
+            raise ResourceError("address pool exhausted")
+        ip_int = pool.static.get(user)
+        if ip_int is None:
+            if not pool.free:
+                raise ResourceError("address pool exhausted")
+            ip_int = heapq.heappop(pool.free)
+        elif ip_int in pool.leases:
+            raise ResourceError(
+                f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
+                "already in use"
+            )
+
+        # 全部校验通过：原子落库，置在线。
+        pool.leases[ip_int] = sid
+        deadline = now_ms + self._idle_ms
+        lease = now_ms + self._lease_ms
+        session["state"] = _STATE_ONLINE
+        session["deadline"] = deadline
+        session["ip"] = ip_int
+        session["lease"] = lease
+        session["pool"] = pool_id
+        address = str(ipaddress.IPv4Address(ip_int))
+        return self._render_suspend_resume(
+            sid, _STATE_ONLINE, now_ms, deadline, pool_id, address, lease
+        )
 
     def pool_stats(self, now_ms):
         """返回各池占用统计 JSON；无池抛 StateError，否则先老化再统计。"""
@@ -5745,6 +5864,21 @@ class Sessions:
         return (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+
+    @staticmethod
+    def _render_suspend_resume(sid, state, now_ms, deadline, pool_id, address, lease):
+        # 键序：会话、状态、时刻、期限、池、地址、租期；会话/状态/池/地址为
+        # str，余为 int；挂起时池/地址为 ""、期限与租期为 0。
+        payload = {
+            "会话": sid,
+            "状态": state,
+            "时刻": now_ms,
+            "期限": deadline,
+            "池": pool_id,
+            "地址": address,
+            "租期": lease,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
     def _render_migration(
