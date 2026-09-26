@@ -19,6 +19,11 @@
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
+  backend_checkpoint/backend_restore 提供后端故障态检查点（版本 1，
+  顶层版本/时刻/截至/退避/失败/摘要，摘要覆盖前五键）与按 key 原子
+  恢复（只读不清到期项；仅缓存成功，同 key 同型同 text 重放原字节，
+  异参 ValueError；未知用户 ResourceError；首次成功与重放写既有
+  防篡改审计链：操作“后端恢复”、会话空串、成功/重放）。
   pool_fault 注入/恢复指定地址池的可恢复耗尽演练（不改真实租约及配置）：
   注入期该池视为无可分配地址，建立、迁入、无址接管在既有认证与老化后抛
   ResourceError，capacity 申请排队、推进跳过，到刻自动正常；首果独立域
@@ -901,6 +906,9 @@ _ADMIN_ENABLED = "启用"
 _ADMIN_CHAIN_DISABLE = "用户停用"
 _ADMIN_CHAIN_ENABLE = "用户启用"
 
+# backend_restore 后端故障态恢复入防篡改审计链的操作名。
+_BACKEND_CHAIN_RESTORE = "后端恢复"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -1284,6 +1292,11 @@ class Sessions:
         # （含参数错）不占 key。
         self._timeout_storm_cache = {}
         self._timeout_storm_chain_index = {}
+        # backend_restore 后端故障态恢复的重放缓存，与其余各域独立：
+        # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）不占 key。
+        # 原序号索引亦独立分域。
+        self._backend_restore_cache = {}
+        self._backend_restore_chain_index = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -3469,6 +3482,193 @@ class Sessions:
             ],
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _backend_payload(self, now_ms):
+        """组装后端故障态检查点文档 dict（顶层键序：版本/时刻/截至/退避/失败/
+        摘要）。
+
+        退避按用户 Unicode 码点升序，项为 [用户, 次数, 下次]，仅导出现存退避
+        （次数 > 0）；失败为 [故障, 退避]。摘要为前五键紧凑 JSON（无 LF）
+        UTF-8 字节的 sha256 小写十六进制串。纯渲染，只读、不清到期项、不老化。
+        """
+        rows = [
+            [user, n, retry_at]
+            for user, (n, retry_at) in sorted(self._backoff.items())
+        ]
+        doc = {
+            "版本": 1,
+            "时刻": now_ms,
+            "截至": self._fault_until,
+            "退避": rows,
+            "失败": [self._fault_fail[0], self._fault_fail[1]],
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return doc
+
+    def _backend_checkpoint_text(self, now_ms):
+        """后端故障态检查点的 LF 结尾紧凑 JSON（基线序列化，只读、不改态）。"""
+        return json.dumps(
+            self._backend_payload(now_ms), ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def backend_checkpoint(self, now_ms):
+        """返回后端故障态检查点的 LF 结尾紧凑 JSON；只读，不清到期项、不老化、
+        不审计。时间 O(U log U)、空间 O(U)，U 为现存退避记录数。
+
+        now_ms 为非 bool 非负 int：类型错 TypeError、取值错 ValueError。
+        顶层键序为“版本/时刻/截至/退避/失败/摘要”，版本为 1；截至为故障截
+        至时刻（0 表示无故障，到期不清零照录）；退避按用户 Unicode 码点升序，
+        项为 [用户, 次数, 下次]，次数为 > 0 的非 bool int、下次为非负 int
+        （到期记录照录）；失败为 [故障, 退避]，值为非负 int；摘要为前五键
+        紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值。
+        """
+        _check_int("now_ms", now_ms, 0)
+        return self._backend_checkpoint_text(now_ms)
+
+    def backend_restore(self, key, text):
+        """按检查点原子替换故障截至、按用户退避与后端失败计数，返回规范包的
+        LF 结尾基线 JSON。
+
+        key 沿用凭据约束，text 须为 str，否则 TypeError。JSON 解析、重键、
+        键集/键序、结构、类型、取值范围、退避排序、重复用户或摘要非法均抛
+        ValueError；引用未注册用户抛 ResourceError。全部校验通过后才原子替换
+        截至、退避与失败计数；任何失败不改实例（不老化、不审计、不改统计、
+        缓存与配置）。不老化、不清到期项，故到期的截至与退避照录照设。
+
+        重放缓存与各域独立：仅缓存首次成功，同 key 同型同 text 重放不解析、
+        不替换，直接返回缓存规范包，异参抛 ValueError；失败（含参数错）不占
+        key。首次成功与成功的同参重放写既有防篡改审计链：操作“后端恢复”、
+        会话空串，首次结果“成功”、原序号 0，重放结果“重放”、原序号指认首次。
+        首次时间 O(U log U)、空间 O(U)，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._backend_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text 后返回缓存规范包。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 首次成功的同参重放入链记“重放”，原序号指认首次事件。
+            self._chain_append(
+                key,
+                _BACKEND_CHAIN_RESTORE,
+                "",
+                "重放",
+                0,
+                self._backend_restore_chain_index[key],
+                self._backend_restore_chain_index,
+            )
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        now_ms, until, backoff, fault_fail = self._parse_backend_checkpoint(text)
+        for user, _count, _retry_at in backoff:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"backend checkpoint references unregistered user: {user!r}"
+                )
+
+        # 全部校验通过：原子替换截至、退避与失败计数（替换即提交，步骤皆为
+        # 简单赋值，不存在可失败的部分提交）。时刻仅为取包观测时刻，随包回放。
+        self._fault_until = until
+        self._backoff = {user: (n, retry_at) for user, n, retry_at in backoff}
+        self._fault_fail = [fault_fail[0], fault_fail[1]]
+
+        result = self._backend_checkpoint_text(now_ms)
+        self._backend_restore_cache[key] = (text, result)
+        self._chain_append(
+            key,
+            _BACKEND_CHAIN_RESTORE,
+            "",
+            "成功",
+            0,
+            index=self._backend_restore_chain_index,
+        )
+        return result
+
+    def _parse_backend_checkpoint(self, text):
+        """解析并全量校验后端故障态检查点文本，返回 (时刻, 截至, 退避行, 失败
+        二元组)；退避行为 (用户, 次数, 下次) 元组列表；任何文本非法均抛
+        ValueError。
+
+        顶层须恰含“版本/时刻/截至/退避/失败/摘要”且键序如此；版本为 1，
+        时刻/截至/次数/下次/失败值为非 bool 非负 int，退避为三元列表、次数
+        严格 > 0，用户按 Unicode 码点严格升序且不重复，失败恰为二元列表，
+        摘要须为规范化前五键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值
+        （与原文排版无关）。仅做结构自洽校验；用户注册由调用方判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"backend checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("backend checkpoint top level must be an object")
+        # 键集与键序：恰为六键且依此序（dict 保序）。
+        if list(doc) != ["版本", "时刻", "截至", "退避", "失败", "摘要"]:
+            raise ValueError(
+                "backend checkpoint top-level keys must be "
+                "版本/时刻/截至/退避/失败/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+        until = self._cp_int(doc["截至"], "截至", 0)
+        fail_raw = doc["失败"]
+        if not isinstance(fail_raw, list) or len(fail_raw) != 2:
+            raise ValueError("失败 must be a list of 2 elements [故障, 退避]")
+        fault_fail = (
+            self._cp_int(fail_raw[0], "失败.故障", 0),
+            self._cp_int(fail_raw[1], "失败.退避", 0),
+        )
+        rows_raw = doc["退避"]
+        if not isinstance(rows_raw, list):
+            raise ValueError("退避 must be a list")
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        backoff = []
+        last_user = None
+        for index, item in enumerate(rows_raw, start=1):
+            if not isinstance(item, list) or len(item) != 3:
+                raise ValueError(
+                    f"backoff {index} must be a list of 3 elements [用户, 次数, 下次]"
+                )
+            user, count, retry_at = item
+            try:
+                user = self._cp_str(user, "用户")
+            except ValueError as exc:
+                # 含孤代理等引发的 UnicodeEncodeError（ValueError 子类），
+                # 统一归为文本 ValueError。
+                raise ValueError(str(exc)) from exc
+            count = self._cp_int(count, "次数", 1)
+            retry_at = self._cp_int(retry_at, "下次", 0)
+            if last_user is not None and user <= last_user:
+                raise ValueError(
+                    "backoff rows must be strictly sorted by 用户 ascending "
+                    "with no duplicates"
+                )
+            last_user = user
+            backoff.append((user, count, retry_at))
+
+        # 摘要：用规范化行重建前五键（数值相等即与生成方基线逐字节一致）。
+        canonical_head = {
+            "版本": 1,
+            "时刻": now_ms,
+            "截至": until,
+            "退避": [[user, count, retry_at] for user, count, retry_at in backoff],
+            "失败": [fault_fail[0], fault_fail[1]],
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical backend checkpoint")
+        return now_ms, until, backoff, fault_fail
 
     def _record_user_failure(self, user, exc):
         """为已定位用户按异常类记一次失败（认证/资源/状态/后端），O(1) 时空。
