@@ -6,7 +6,9 @@
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/升级/加载/回滚
   export_config/upgrade_config/load_config/rollback_config、QoS 模板查询 qos、按模板
-  令牌桶加配额计量 meter、按用户/模板分组的计量统计 meter_stats、容量申请
+  令牌桶加配额计量 meter（计量态按 (用户, 模板) 共享账本保存，避免并发会话
+  重置配额）、按用户/模板分组的计量统计 meter_stats、用户配额只读快照
+  quota_stats、容量申请
   capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按入队序晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
   creplay 提供 capacity 状态检查点、事件哈希链校验与原子重放恢复。
@@ -819,8 +821,13 @@ class Sessions:
     旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
-    会话所绑模板做令牌桶加配额计量：通过则提交累计，超限取模板动作
-    （拒绝不提交，下线原子清场），重放缓存与 do 分域。meter 新 key 首次
+    会话所绑模板做令牌桶加配额计量：计量态按 (用户, 模板) 共享账本保存
+    累计 u、上次通过时刻 t 与千分字节令牌 c，通过则原子提交累计，超限取
+    模板动作（拒绝不提交，下线原子清场），拒绝、下线、异常与重放均不改账，
+    重放缓存与 do 分域；下线、新建、接管不清账，配置提交后同标识保留 u/t
+    并截顶 c，改绑用独立账本，加载或回滚失败不改账。quota_stats(user,
+    now_ms) 返回用户所绑模板的配额只读快照：不老化、不建账、不改态，无账本
+    按累计 0、满桶返回。meter 新 key 首次
     结果为通过/拒绝/下线时按当时会话用户与当次模板标识各记一次统计
     （通过另计字节），配置热加载或回滚不迁移历史计数；meter_stats
     (now_ms, group) 老化后按用户或查询时生效绑定（未绑定归空串）汇总
@@ -963,14 +970,17 @@ class Sessions:
         self._max_wait_ms = 0
 
         # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
-        #         "lease": int, "pool": str|None,
-        #         "meter": [累计, 上次通过时刻, 千分字节令牌] | None}
+        #         "lease": int, "pool": str|None}
         self._sessions = {}
         # key -> (op, sid, args, now_ms, outcome)
         # outcome 为 ("ok", json_str) 或 ("err", (exc_class, exc_args))
         self._cache = {}
         # meter 的重放缓存，与 do 分域：key -> (sid, size, now_ms, outcome)
         self._meter_cache = {}
+        # QoS 计量共享账本：(用户, 模板标识) -> [累计 u, 上次通过时刻 t,
+        # 千分字节令牌 c]；仅“通过”原子提交，拒绝、下线、异常与重放不改账，
+        # 下线、新建、接管不清账，配置提交后同标识保留 u/t 并截顶 c。
+        self._meter_ledgers = {}
         # 计量统计：标识 -> [通过, 拒绝, 下线, 通过字节]，用户组按当时会话
         # 用户、模板组按当次模板标识归集；历史计数不随配置热加载或回滚迁移。
         self._meter_stats_user = {}
@@ -1387,7 +1397,6 @@ class Sessions:
             "ip": ip_int,
             "lease": lease,
             "pool": pool_id,
-            "meter": None,
         }
         return deadline, lease
 
@@ -1590,7 +1599,6 @@ class Sessions:
             "ip": ip_int,
             "lease": lease,
             "pool": pool_id,
-            "meter": None,
         }
         old_address = (
             str(ipaddress.IPv4Address(old_ip)) if old_ip is not None else ""
@@ -1682,8 +1690,9 @@ class Sessions:
         TypeError、范围错 ValueError。重放缓存与 do 分域：首个结果（成功或
         异常）永久缓存，同型同参重放不老化、直接返回或重抛，异参抛
         ValueError。首次调用先老化；未知 sid 抛 KeyError，会话非在线、用户
-        未绑模板或 now_ms 早于上次通过时刻抛 StateError；异常仅保留老化
-        结果。单次 O(S) 时间、O(1) 辅助空间，重放 O(1)。
+        未绑模板或 now_ms 早于账本上次通过时刻抛 StateError；异常仅保留
+        老化结果，不改账。计量态按 (用户, 模板) 共享账本保存，并发会话
+        共用配额。单次 O(S) 时间、O(1) 辅助空间，重放 O(1)。
         """
         _check_credential("key", key)
 
@@ -1733,12 +1742,13 @@ class Sessions:
     def _meter(self, sid, size, now_ms):
         """令牌桶加配额计量：通过则提交，拒绝不提交，下线原子清场。
 
-        每会话计量态 (u, t, c) 为累计字节、上次通过时刻、千分字节令牌，
-        初始 (0, now_ms, C)，C=(限速+突发)*1000；之后 c 按限速补足并以 C
-        截顶（配置变更后亦按新模板限速与桶容截顶，u/t 续存）。
-        size*1000 <= c 且 u+size <= 配额则通过并提交 (u+size, now_ms,
-        c-size*1000)；否则取超限动作：拒绝不提交任何计量态，下线不累计并
-        原子下线、清期限、释址退租。
+        计量态按 (用户, 模板) 共享账本 (u, t, c) 保存：累计字节、上次通过
+        时刻、千分字节令牌，首笔为 (0, now_ms, C)，C=(限速+突发)*1000；
+        之后 c 按限速补足并以 C 截顶（配置提交后同标识保留 u/t 并截顶 c，
+        改绑用独立账本）。size*1000 <= c 且 u+size <= 配额则通过并原子提交
+        (u+size, now_ms, c-size*1000)；否则取超限动作：拒绝不提交任何
+        计量态，下线不累计并原子下线、清期限、释址退租。拒绝、下线、异常
+        与重放均不改账；下线、新建、接管不清账。
         """
         session = self._sessions.get(sid)
         if session is None:
@@ -1754,11 +1764,13 @@ class Sessions:
         rate, burst, quota, exceed = self._templates[template_id]
         capacity = (rate + burst) * 1000
 
-        meter = session["meter"]
-        if meter is None:
-            # 首次计量：满桶起步，时刻即此刻。
-            meter = [0, now_ms, capacity]
-        used, last, tokens = meter
+        ledger_key = (user, template_id)
+        ledger = self._meter_ledgers.get(ledger_key)
+        if ledger is None:
+            # 首笔：满桶起步，时刻即此刻；未通过则不落账。
+            used, last, tokens = 0, now_ms, capacity
+        else:
+            used, last, tokens = ledger
         if now_ms < last:
             raise StateError(
                 f"now_ms {now_ms} before last meter time {last} for sid {sid!r}"
@@ -1766,10 +1778,10 @@ class Sessions:
         tokens = min(capacity, tokens + rate * (now_ms - last))
 
         if size * 1000 <= tokens and used + size <= quota:
-            # 通过：提交累计、时刻与扣减后的令牌。
+            # 通过：原子提交累计、时刻与扣减后的令牌。
             used += size
             tokens -= size * 1000
-            session["meter"] = [used, now_ms, tokens]
+            self._meter_ledgers[ledger_key] = [used, now_ms, tokens]
             result = "通过"
         else:
             result = exceed
@@ -1849,6 +1861,48 @@ class Sessions:
                 }
             )
         payload = {"时刻": now_ms, "分组": group, "汇总": summary}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def quota_stats(self, user, now_ms):
+        """返回用户所绑模板的配额只读快照 JSON，O(1) 时空。
+
+        user 沿用凭据约束，now_ms 为非 bool 非负 int；类型/值错分别抛
+        TypeError/ValueError，未知用户抛 KeyError，未绑模板或 now_ms 早于
+        账本上次通过时刻 t 抛 StateError。查询只读：不认证、不老化、不建账、
+        不改账；无账本按累计 0、满桶返回。键序“时刻/用户/模板/累计/剩余/
+        令牌”：累计为账本 u，剩余为 max(0, 配额-u)，令牌为按限速补充、以
+        桶容截顶后的千分字节数；时刻/累计/剩余/令牌为 int，用户/模板为 str。
+        """
+        _check_credential("user", user)
+        _check_int("now_ms", now_ms, 0)
+        if user not in self._auth:
+            raise KeyError(f"unknown user: {user!r}")
+        template_id = self._user_templates.get(user)
+        if template_id is None:
+            raise StateError(f"no qos template bound for user {user!r}")
+        rate, burst, quota, _exceed = self._templates[template_id]
+        capacity = (rate + burst) * 1000
+
+        ledger = self._meter_ledgers.get((user, template_id))
+        if ledger is None:
+            # 无账本：累计 0、满桶，不落账。
+            used, tokens = 0, capacity
+        else:
+            used, last, tokens = ledger
+            if now_ms < last:
+                raise StateError(
+                    f"now_ms {now_ms} before last meter time {last} "
+                    f"for user {user!r}"
+                )
+            tokens = min(capacity, tokens + rate * (now_ms - last))
+        payload = {
+            "时刻": now_ms,
+            "用户": user,
+            "模板": template_id,
+            "累计": used,
+            "剩余": max(0, quota - used),
+            "令牌": tokens,
+        }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def fault(self, key, op, ms, now_ms):
@@ -3832,7 +3886,6 @@ class Sessions:
                 "ip": ip_int,
                 "lease": row["租期"],
                 "pool": pool_id,
-                "meter": None,
             }
         self._sessions = new_sessions
         # 以承载租约重建全部池（租约表与空闲堆为在租会话的派生态）。
@@ -4085,6 +4138,13 @@ class Sessions:
             for pool_id, until in self._pool_fault.items()
             if pool_id in new_pools
         }
+        # 计量账本：同 (用户, 模板) 标识保留 u/t，c 按新模板桶容截顶；改绑
+        # （用户改绑或模板删除）用独立账本，原账本保留不可达。加载/回滚失败
+        # 不经过本方法，账本不变。
+        for _ident, ledger in self._meter_ledgers.items():
+            template = self._templates.get(_ident[1])
+            if template is not None:
+                ledger[2] = min(ledger[2], (template[0] + template[1]) * 1000)
 
     def load_config(self, text):
         """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v4 JSON。
