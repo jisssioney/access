@@ -63,6 +63,15 @@
   成功首果与成功同参重放写防篡改审计链（用户停用/用户启用，会话=user，
   成功/重放），参数错及业务异常不审计。
   停用态不随配置加载/回滚与检查点恢复改变。
+- Sessions.fault_plan 批量故障演练计划：key 沿用凭据，mode 仅预检/执行，
+  steps 为 1..1000 项 (domain,target,op,value) 四元组；域仅后端/池/超时、
+  op 仅注入/恢复，后端/超时 target 为 "" 且各唯一，池 target 沿标识且互异，
+  后端/池注入 value 为正 int（截至=now_ms+value），超时注入 value>=now_ms，
+  恢复 value=None；型/结构值/未知池分别抛 TypeError/ValueError/KeyError。
+  全验演算，预检只读、执行原子提交；后端变更清退避、留失败计数，未列域不变。
+  执行以 key 缓存首个成功/KeyError，同参重放原果、异参 ValueError；首果与
+  重放写防篡改审计链（故障计划，会话空串，结果/原序号沿 config_change），
+  预检与参数错不缓存、不审计；成功返回演算态 fault_checkpoint(now_ms) 包。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -853,6 +862,16 @@ _BACKEND_RESTORE_OP = "后端恢复"
 # fault_restore 入防篡改审计链的操作名。
 _FAULT_RESTORE_OP = "故障恢复"
 
+# fault_plan 批量故障演练计划：模式仅预检/执行，域仅后端/池/超时；
+# 入防篡改审计链的操作名“故障计划”。
+_FAULT_PLAN_MODE_PRECHECK = "预检"
+_FAULT_PLAN_MODE_EXECUTE = "执行"
+_FAULT_PLAN_DOMAIN_BACKEND = "后端"
+_FAULT_PLAN_DOMAIN_POOL = "池"
+_FAULT_PLAN_DOMAIN_TIMEOUT = "超时"
+_FAULT_PLAN_OP = "故障计划"
+_FAULT_PLAN_MAX_STEPS = 1000
+
 # pool_fault 池演练状态：仅耗尽/正常。
 _POOL_EXHAUSTED = "耗尽"
 _POOL_NORMAL = "正常"
@@ -1174,6 +1193,22 @@ class Sessions:
     失败仅保留老化、认证计数与退避，不半分配。二者返回键序
     会话/状态/时刻/期限/池/地址/租期的 LF 尾 JSON（会话/状态/池/地址
     为 str，余为 int；挂起时池/地址空串、租期 0），缓存与审计沿用 do。
+    fault_plan(key, mode, steps, now_ms) 批量演算后端/池/超时三域故障注入
+    或恢复：key 沿用凭据约束，mode 仅预检/执行；steps 为 1..1000 项 tuple，
+    每项 (domain, target, op, value)，domain 限后端/池/超时、op 限注入/恢复；
+    后端与超时项 target 须为 "" 且在各自域唯一（至多一项），池项 target 沿用
+    池标识凭据且互异；后端/池注入 value 为非 bool 正 int（截至=now_ms+value），
+    超时注入 value 为非 bool int 且 >= now_ms，恢复 value 须 None；now_ms 为
+    非 bool 非负 int。类型错 TypeError、结构/值错 ValueError、未知池
+    KeyError。全验后整体演算：后端注入/恢复均清全部用户退避、失败计数保留，
+    池注入置截至/恢复移除，超时注入覆盖待触发/恢复取消，未列域不变。预检只读
+    演算、不落实例；执行在副本上演算（异常实例不变）后原子提交三域。成功返回
+    演算态 fault_checkpoint(now_ms) 契约的 LF 尾基线 JSON。执行以 key 缓存首个
+    成功或 KeyError（预检不缓存）：严格同参重放原字节或重抛同类同 args，异参
+    ValueError，参数错不占 key；首果（成功/KeyError）及同参重放写现有防篡改
+    审计链：操作“故障计划”、会话空串，首次结果“成功/KeyError”、原序号 0，
+    重放结果“重放成功/重放KeyError”、原序号指认首次，审计时刻取 now_ms；预检、
+    参数错不审计。首次 O(U log U+P log P+K) 时间、O(U+P+K) 空间，重放 O(1)。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1315,6 +1350,11 @@ class Sessions:
         # （含参数错）不占 key。
         self._timeout_storm_cache = {}
         self._timeout_storm_chain_index = {}
+        # fault_plan 批量故障演练计划的重放缓存与原序号索引，与其余各域独立：
+        # key -> (mode, steps, now_ms, outcome)；仅首次成功与 KeyError 占位，
+        # 参数错不占 key。预检永不缓存。
+        self._fault_plan_cache = {}
+        self._fault_plan_chain_index = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -3010,9 +3050,21 @@ class Sessions:
         self._timeout_at = None
         return [order for _sid, order in timed_out]
 
-    def _fault_payload(self, now_ms):
+    def _fault_payload(
+        self,
+        now_ms,
+        until=None,
+        backoff=None,
+        fail=None,
+        pool_fault=None,
+        timeout_waiting=None,
+        timeout_at=0,
+    ):
         """组装故障演练总检查点文档 dict（顶层键序：
         版本/时刻/后端/池/超时/摘要）。
+
+        缺省渲染当前实例状态；fault_plan 传入演算态（until/backoff/fail/
+        pool_fault/timeout_waiting/timeout_at）渲染同契约包，渲染后状态不变。
 
         后端对象键序“截至/退避/失败”，契约同 backend_checkpoint 同名字段
         （退避按用户 Unicode 码点升序，项键序“用户/次数/下次”；失败键序
@@ -3021,35 +3073,48 @@ class Sessions:
         紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。纯渲染：
         不老化、不清到期项、不改态。
         """
+        if until is None:
+            until = self._fault_until
+        if backoff is None:
+            backoff = self._backoff
+        if fail is None:
+            fail = self._fault_fail
+        if pool_fault is None:
+            pool_fault = self._pool_fault
+        if timeout_waiting is None:
+            timeout_waiting = self._timeout_at is not None
+            timeout_at = self._timeout_at if timeout_waiting else 0
         backend = {
-            "截至": self._fault_until,
+            "截至": until,
             "退避": [
                 {"用户": user, "次数": n, "下次": retry_at}
-                for user, (n, retry_at) in sorted(self._backoff.items())
+                for user, (n, retry_at) in sorted(backoff.items())
             ],
-            "失败": {"故障": self._fault_fail[0], "退避": self._fault_fail[1]},
+            "失败": {"故障": fail[0], "退避": fail[1]},
         }
         pools = [
-            {"标识": pool_id, "截至": until}
-            for pool_id, until in sorted(self._pool_fault.items())
+            {"标识": pool_id, "截至": pool_until}
+            for pool_id, pool_until in sorted(pool_fault.items())
         ]
-        waiting = self._timeout_at is not None
         doc = {
             "版本": 1,
             "时刻": now_ms,
             "后端": backend,
             "池": pools,
-            "超时": {"等待": waiting, "触发": self._timeout_at if waiting else 0},
+            "超时": {"等待": timeout_waiting, "触发": timeout_at},
         }
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return doc
 
+    @staticmethod
+    def _fault_doc_text(doc):
+        """给定故障演练总检查点文档 dict 渲染 LF 结尾紧凑 JSON（基线序列化）。"""
+        return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _fault_checkpoint_text(self, now_ms):
         """故障演练总检查点的 LF 结尾紧凑 JSON（基线序列化，不老化、不改态）。"""
-        return json.dumps(
-            self._fault_payload(now_ms), ensure_ascii=False, separators=(",", ":")
-        ) + "\n"
+        return self._fault_doc_text(self._fault_payload(now_ms))
 
     def fault_checkpoint(self, now_ms):
         """只读输出故障演练总检查点的 LF 结尾基线 JSON，覆盖后端故障、池演练
@@ -3286,6 +3351,264 @@ class Sessions:
             waiting,
             trigger,
         )
+
+    def fault_plan(self, key, mode, steps, now_ms):
+        """按步骤列表批量演算后端/池/超时三域故障注入或恢复，返回演算态
+        fault_checkpoint(now_ms) 契约的 LF 尾基线 JSON。
+
+        key 沿用凭据约束；mode 仅“预检/执行”；steps 为 1..1000 项 tuple，
+        每项 (domain, target, op, value) 四元组：domain/op 为非 bool str，
+        domain 仅后端/池/超时，op 仅注入/恢复。后端与超时项 target 须为 ""
+        且在各自域内唯一（至多一项）；池项 target 沿用池标识凭据约束、各项
+        互异。后端/池注入 value 为非 bool 正 int，截至 = now_ms+value；超时
+        注入 value 为非 bool int 且 >= now_ms（触发时刻）；恢复 value 须为
+        None。now_ms 为非 bool 非负 int。类型错 TypeError，结构/取值错
+        ValueError，池项引用未知池 KeyError。
+
+        全量校验后整体演算：后端注入置故障截至、恢复清零，二者均清全部用户
+        退避（失败计数保留）；池注入置该池截至、恢复移除；超时注入覆盖待触发
+        时刻、恢复取消。未列域与字段不变。预检只读：演算不落实例；执行原子
+        提交：先在副本上演算（任何异常实例不变），再一次性替换三域。
+
+        执行以 key 缓存首个成功或 KeyError：同 (mode, steps, now_ms) 严格
+        同参重放原果（KeyError 重抛同类同 args），异参 ValueError；预检、
+        参数错不缓存、不审计。首个成功/KeyError 及其同参重放写现有防篡改
+        审计链：操作“故障计划”、会话记空串，结果与原序号沿用 config_change
+        口径（首次“成功”/“KeyError”、原序号 0，重放“重放成功”/“重放
+        KeyError”、原序号指认首次），审计时刻取 now_ms。
+
+        首次 O(U log U + P log P + K) 时间、O(U+P+K) 辅助空间，U/P/K 为
+        退避用户数、池演练记录数、步骤数；重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._fault_plan_cache.get(key)
+        if cached is not None:
+            # 仅执行模式缓存首果；重放不演算、不老化、不改态，直接返回或重抛。
+            c_mode, c_steps, c_now_ms, outcome = cached
+            if not _strict_equal(
+                (mode, steps, now_ms), (c_mode, c_steps, c_now_ms)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            origin = self._fault_plan_chain_index[key]
+            if outcome[0] == "ok":
+                chain_result = "重放成功"
+            else:
+                chain_result = "重放" + outcome[1][0].__name__
+            self._chain_append(
+                key,
+                _FAULT_PLAN_OP,
+                "",
+                chain_result,
+                now_ms,
+                origin,
+                self._fault_plan_chain_index,
+            )
+            if outcome[0] == "ok":
+                return outcome[1]
+            raise _replay_exception(outcome[1][0], outcome[1][1])
+
+        # 预检与执行共用同一全量校验；参数错不缓存、不审计，实例不变。
+        self._validate_fault_plan_params(mode, steps, now_ms)
+
+        # 在副本上演算全部步骤：未知池在演算阶段抛 KeyError，实例不变。
+        # 后端退避为仅在本计划内清空的副本；失败计数沿用且不改。
+        new_until = self._fault_until
+        new_backoff = dict(self._backoff)
+        new_pool_fault = dict(self._pool_fault)
+        new_timeout_waiting = self._timeout_at is not None
+        new_timeout_at = self._timeout_at if new_timeout_waiting else 0
+        try:
+            for domain, target, op, value in steps:
+                if domain == _FAULT_PLAN_DOMAIN_BACKEND:
+                    # 后端变更（注入与恢复）均清退避、保留失败计数。
+                    new_backoff.clear()
+                    if op == _OP_INJECT:
+                        new_until = now_ms + value
+                    else:
+                        new_until = 0
+                elif domain == _FAULT_PLAN_DOMAIN_POOL:
+                    if target not in self._pools:
+                        raise KeyError(f"unknown pool: {target!r}")
+                    if op == _OP_INJECT:
+                        new_pool_fault[target] = now_ms + value
+                    else:
+                        new_pool_fault.pop(target, None)
+                else:  # _FAULT_PLAN_DOMAIN_TIMEOUT
+                    if op == _OP_INJECT:
+                        new_timeout_waiting = True
+                        new_timeout_at = value
+                    else:
+                        new_timeout_waiting = False
+                        new_timeout_at = 0
+        except KeyError as exc:
+            # 执行模式缓存首个 KeyError（业务首果）并写审计；预检不缓存、不审计。
+            if mode == _FAULT_PLAN_MODE_EXECUTE:
+                self._fault_plan_cache[key] = (
+                    mode,
+                    steps,
+                    now_ms,
+                    ("err", (KeyError, exc.args)),
+                )
+                self._chain_append(
+                    key,
+                    _FAULT_PLAN_OP,
+                    "",
+                    "KeyError",
+                    now_ms,
+                    index=self._fault_plan_chain_index,
+                )
+            raise
+
+        doc = self._fault_payload(
+            now_ms,
+            until=new_until,
+            backoff=new_backoff,
+            fail=self._fault_fail,
+            pool_fault=new_pool_fault,
+            timeout_waiting=new_timeout_waiting,
+            timeout_at=new_timeout_at,
+        )
+        result = self._fault_doc_text(doc)
+
+        if mode == _FAULT_PLAN_MODE_EXECUTE:
+            # 演算全过：原子提交三域（失败计数本就未改）。
+            self._fault_until = new_until
+            self._backoff = new_backoff
+            self._pool_fault = new_pool_fault
+            self._timeout_at = new_timeout_at if new_timeout_waiting else None
+            self._fault_plan_cache[key] = (
+                mode,
+                steps,
+                now_ms,
+                ("ok", result),
+            )
+            self._chain_append(
+                key,
+                _FAULT_PLAN_OP,
+                "",
+                "成功",
+                now_ms,
+                index=self._fault_plan_chain_index,
+            )
+        return result
+
+    @staticmethod
+    def _validate_fault_plan_params(mode, steps, now_ms):
+        """校验 fault_plan 三参数：类型错先于结构/取值错。
+
+        mode 限预检/执行；steps 须为 tuple，含 1..1000 项 4 元组
+        (domain, target, op, value)：domain/op 为非 bool str，域限后端/池/
+        超时，op 限注入/恢复；后端/超时项 target 为 ""、各域至多一项，池项
+        target 满足凭据约束且各项互异；后端/池注入 value 为非 bool 正 int，
+        超时注入 value 为非 bool int 且 >= now_ms，恢复 value 须 None；
+        now_ms 为非 bool 非负 int。池存在与否不在本结构校验内（演算阶段查，
+        未知池抛 KeyError）。
+        """
+        # 类型阶段：容器/模式/各步前三字段/注入 value/now_ms 的任一类型错，
+        # 先于任何长度、取值、重复等结构/值错抛出（沿 batch/pool_fault 约定）。
+        if isinstance(mode, bool) or not isinstance(mode, str):
+            raise TypeError(f"mode must be a str, got {type(mode).__name__}")
+        if not isinstance(steps, tuple):
+            raise TypeError(f"steps must be a tuple, got {type(steps).__name__}")
+        for step in steps:
+            if not isinstance(step, tuple):
+                raise TypeError(
+                    f"step must be a tuple, got {type(step).__name__}"
+                )
+            # 长度未定前仅查存在的前三字段：domain/target/op 均须为 str
+            # （bool 非 str）；长度属结构错，留待取值阶段。
+            for field in step[:3]:
+                if not isinstance(field, str):
+                    raise TypeError(
+                        "domain/target/op must be str, got "
+                        f"{type(field).__name__}"
+                    )
+            # 注入 value 的 int 类型仅在恰为四项且 op 恰为“注入”时可判定，
+            # 沿 pool_fault：恢复 value 非 None 归取值错（含 bool）。
+            if len(step) == 4 and step[2] == _OP_INJECT:
+                value = step[3]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError(
+                        f"value must be an int, got {type(value).__name__}"
+                    )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值/结构阶段：模式、时钟下界、步数、逐项长度/域/操作/target/
+        # 唯一性/value 取值。
+        if mode not in (_FAULT_PLAN_MODE_PRECHECK, _FAULT_PLAN_MODE_EXECUTE):
+            raise ValueError(
+                f"mode must be one of 预检/执行, got {mode!r}"
+            )
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(steps) <= _FAULT_PLAN_MAX_STEPS):
+            raise ValueError(
+                f"steps must contain 1..{_FAULT_PLAN_MAX_STEPS} items, "
+                f"got {len(steps)}"
+            )
+
+        backend_seen = False
+        timeout_seen = False
+        pool_targets = set()
+        for step in steps:
+            if len(step) != 4:
+                raise ValueError(
+                    "step must be a 4-tuple (domain, target, op, value), "
+                    f"got {len(step)} items"
+                )
+            domain, target, op, value = step
+            if domain not in (
+                _FAULT_PLAN_DOMAIN_BACKEND,
+                _FAULT_PLAN_DOMAIN_POOL,
+                _FAULT_PLAN_DOMAIN_TIMEOUT,
+            ):
+                raise ValueError(
+                    "domain must be one of 后端/池/超时, got "
+                    f"{domain!r}"
+                )
+            if op not in (_OP_INJECT, _OP_RECOVER):
+                raise ValueError(
+                    f"op must be one of 注入/恢复, got {op!r}"
+                )
+            if domain == _FAULT_PLAN_DOMAIN_BACKEND:
+                if target != "":
+                    raise ValueError(
+                        f"backend target must be \"\", got {target!r}"
+                    )
+                if backend_seen:
+                    raise ValueError("backend step must be unique")
+                backend_seen = True
+            elif domain == _FAULT_PLAN_DOMAIN_TIMEOUT:
+                if target != "":
+                    raise ValueError(
+                        f"timeout target must be \"\", got {target!r}"
+                    )
+                if timeout_seen:
+                    raise ValueError("timeout step must be unique")
+                timeout_seen = True
+            else:  # 池
+                _check_credential("pool target", target)
+                if target in pool_targets:
+                    raise ValueError(
+                        f"pool target must be unique, got duplicate {target!r}"
+                    )
+                pool_targets.add(target)
+
+            if op == _OP_INJECT:
+                # 类型已在类型阶段确认；此处仅查取值范围。
+                if domain == _FAULT_PLAN_DOMAIN_TIMEOUT:
+                    if value < now_ms:
+                        raise ValueError(
+                            "timeout value must be >= now_ms, got "
+                            f"{value} < {now_ms}"
+                        )
+                elif value < 1:
+                    raise ValueError(f"value must be >= 1, got {value}")
+            elif value is not None:
+                raise ValueError(f"value must be None for 恢复, got {value!r}")
+
     def timeout_sweep(self, key, now_ms, limit=100):
         """清扫到期的在线会话与排队项，返回 LF 结尾的基线 JSON。
 
