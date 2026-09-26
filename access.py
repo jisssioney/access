@@ -38,6 +38,11 @@
   永久缓存；首次合法先老化，逐项经后端、认证、容量、default 池与静态址
   规则建立，业务异常不抛而记项结果类名；非原子逐项提交，原子演算全部、
   任一失败整批回滚（保留老化、认证计数与退避），不记审计或容量事件。
+- Sessions.runtime_checkpoint/runtime_restore 运行态检查点：验参后老化
+  一次导出覆盖会话/租约、容量队列/事件与共享 QoS 账本的带摘要包（顶层
+  版本/时刻/容量/配额/摘要，容量/配额沿用同刻 clog/quota_checkpoint
+  对象），供续租、计量、推进一致恢复；恢复全验后原子替换并返回规范包，
+  仅缓存成功，失败不改运行态、配置、缓存与审计，不审计。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -720,6 +725,8 @@ _CAP_VERDICTS_WITH_ORDER = frozenset(
 _MAX_QUEUE = 1024
 _MAX_QUEUE_LIMIT = 10000
 _CONFIG_VERSION = 4
+# runtime_checkpoint 运行态检查点版本。
+_RUNTIME_VERSION = 1
 
 # fault 操作与后端状态。
 _OP_INJECT = "注入"
@@ -946,6 +953,16 @@ class Sessions:
     结果仅提交（全上线）/部分（非原子有失败）/回滚（原子有失败），
     项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务异常类名/
     回滚。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+    runtime_checkpoint(now_ms) 验参后老化一次，输出运行态检查点 LF 尾
+    紧凑 JSON：顶层键序版本/时刻/容量/配额/摘要，版本 1，容量/配额为
+    同刻 clog/quota_checkpoint 对象（容量时刻等于顶层），摘要为前四键
+    紧凑 JSON 的 UTF-8 字节 sha256 小写值；不审计。runtime_restore(key,
+    text) 全验后原子替换会话/租约/队列/事件账本与共享 QoS 账本并返回
+    规范包：JSON/重键/键序/结构/类型/值/排序/版本/摘要/时刻错
+    ValueError，用户/模板/池址/令牌/容量或引用不承载 ResourceError，
+    目标有不同摘要的覆盖状态 StateError；仅缓存成功，同 key 同型同
+    text 重放无副作用，异参 ValueError；失败不改运行态、配置、缓存与
+    审计；不审计、不老化。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1053,6 +1070,9 @@ class Sessions:
         # quota_restore 共享 QoS 账本恢复的重放缓存，与其余各域独立：
         # key -> (text, outcome)；仅首次成功缓存，失败（含参数错）不占 key。
         self._quota_restore_cache = {}
+        # runtime_restore 运行态检查点恢复的重放缓存，与其余各域独立：
+        # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）不占 key。
+        self._runtime_restore_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -1905,12 +1925,11 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-    def _quota_checkpoint_text(self):
-        """导出模板仍存在的全部现存账本的检查点文本（不老化、不建账、不改账）。
+    def _quota_checkpoint_payload(self):
+        """共享 QoS 账本检查点文档 dict（顶层键序：版本/账本）。
 
-        顶层依次为“版本/账本”，版本 1；项依次为
-        [用户, 模板, 累计, 上次, 令牌]，整数非 bool 且 >= 0，按用户、模板
-        Unicode 码点升序。已删模板的历史账本不在导出范围。
+        项依次为 [用户, 模板, 累计, 上次, 令牌]，整数非 bool 且 >= 0，
+        按用户、模板 Unicode 码点升序。已删模板的历史账本不在导出范围。
         """
         rows = [
             [user, template_id, used, last, tokens]
@@ -1918,7 +1937,16 @@ class Sessions:
             in sorted(self._meter_ledgers.items())
             if template_id in self._templates
         ]
-        payload = {"版本": 1, "账本": rows}
+        return {"版本": 1, "账本": rows}
+
+    def _quota_checkpoint_text(self):
+        """导出模板仍存在的全部现存账本的检查点文本（不老化、不建账、不改账）。
+
+        顶层依次为“版本/账本”，版本 1；项依次为
+        [用户, 模板, 累计, 上次, 令牌]，整数非 bool 且 >= 0，按用户、模板
+        Unicode 码点升序。已删模板的历史账本不在导出范围。
+        """
+        payload = self._quota_checkpoint_payload()
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def quota_checkpoint(self):
@@ -3901,12 +3929,18 @@ class Sessions:
             self._rebuild_pool_leases(live_leases)
             return self.capacity_stats(now_ms)
 
+        self._checkpoint_divergence_check(events, sessions, queued)
+        required_leases = self._checkpoint_carry_check(sessions, queued)
+        self._checkpoint_commit(events, sessions, queued, required_leases)
+        return self.capacity_stats(now_ms)
+
+    def _checkpoint_divergence_check(self, events, sessions, queued):
+        """非同批覆盖状态检查（StateError 先于承载力判定）：账本只能在同链
+        上延展，目标现存会话（在线/挂起/下线墓碑）与排队项必须与检查点
+        同批行逐字段一致；包外任一项（含包外墓碑）即非同批轨迹。"""
         target_sessions = {row["会话"]: row for row in sessions}
         target_queued = {row["会话"]: row for row in queued}
 
-        # 非同批状态（StateError 先于承载力判定）：账本只能在同链上延展，
-        # 目标现存会话（在线/挂起/下线墓碑）与排队项必须与检查点同批行
-        # 逐字段一致；包外任一项（含包外墓碑）即非同批轨迹。
         if len(self._capacity_events) > len(events):
             raise StateError("current ledger has events beyond checkpoint")
         for current, wanted in zip(self._capacity_events, events):
@@ -3949,8 +3983,10 @@ class Sessions:
             ):
                 raise StateError(f"current queued sid {queued_sid!r} diverges")
 
-        # 承载力（ResourceError）：用户注册（墓碑仍归属已注册用户）、全局/单用户
-        # 上限（仅计在线/挂起，墓碑不计容量）、池与地址（墓碑不建租约）。
+    def _checkpoint_carry_check(self, sessions, queued):
+        """承载力检查（ResourceError）：用户注册（墓碑仍归属已注册用户）、
+        全局/单用户上限（仅计在线/挂起，墓碑不计容量）、池与地址（墓碑
+        不建租约）；全部可承载时返回 pool -> {ip_int: sid} 的承载租约。"""
         for row in sessions:
             if row["用户"] not in self._auth:
                 raise ResourceError(
@@ -4020,8 +4056,12 @@ class Sessions:
                     f"{pool_leases[ip_int]!r} and {row['会话']!r}"
                 )
             pool_leases[ip_int] = row["会话"]
+        return required_leases
 
-        # 全部校验通过：原子替换会话（含墓碑）、租约、队列、入队序游标与账本。
+    def _checkpoint_commit(self, events, sessions, queued, required_leases):
+        """全部校验通过后原子替换会话（含墓碑）、租约、队列、入队序游标与
+        账本；配置、认证器、QoS、计量账本与统计、各域重放缓存、接管与 do
+        审计链均不受影响。"""
         new_sessions = {}
         for row in sessions:
             if row["池"] == "":
@@ -4061,7 +4101,218 @@ class Sessions:
         )
         self._capacity_events = list(events)
         self._capacity_tail = events[-1][6] if events else "0" * 64
-        return self.capacity_stats(now_ms)
+
+    @staticmethod
+    def _runtime_digest(head):
+        """运行态包前四键（版本/时刻/容量/配额）紧凑 JSON（无 LF）的
+        UTF-8 字节 sha256 小写十六进制串。"""
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def runtime_checkpoint(self, now_ms):
+        """输出运行态检查点：先验参再老化一次，返回 LF 结尾的基线 JSON。
+
+        now_ms 为非 bool 非负 int，类型错 TypeError、取值错 ValueError。
+        顶层键序为“版本/时刻/容量/配额/摘要”：版本为 1；容量/配额为同刻
+        clog/quota_checkpoint 的对象（容量时刻等于顶层时刻，配额不老化、
+        不建账、不改账）；摘要为前四键紧凑 JSON（无 LF）的 UTF-8 字节
+        sha256 小写十六进制。不审计、不改缓存；O(N log N) 时间、O(N) 空间。
+        """
+        _check_int("now_ms", now_ms, 0)
+        self._age(now_ms)
+        head = {
+            "版本": _RUNTIME_VERSION,
+            "时刻": now_ms,
+            "容量": self._checkpoint_payload(now_ms),
+            "配额": self._quota_checkpoint_payload(),
+        }
+        payload = dict(head)
+        payload["摘要"] = self._runtime_digest(head)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _parse_runtime_package(self, text):
+        """解析并全量校验运行态检查点文本，返回 (时刻, 事件七元组, 会话行,
+        排队行, 配额行, 摘要, 规范包文本)；任何文本非法均抛 ValueError。
+
+        仅做结构自洽与数值校验（含容量/配额的规范形态复核与摘要比对）；
+        用户注册、模板存在、上限与池址承载力由 runtime_restore 判定
+        （ResourceError/StateError）。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"runtime package is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("runtime package top level must be an object")
+        # 键集与键序：恰为“版本/时刻/容量/配额/摘要”且按此序（dict 保序）。
+        if list(doc) != ["版本", "时刻", "容量", "配额", "摘要"]:
+            raise ValueError(
+                "runtime package top-level keys must be "
+                "版本/时刻/容量/配额/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != _RUNTIME_VERSION:
+            raise ValueError(f"版本 must be {_RUNTIME_VERSION}, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+        digest = self._cp_hex64(doc["摘要"], "摘要")
+
+        capacity = doc["容量"]
+        if not isinstance(capacity, dict):
+            raise ValueError("容量 must be an object")
+        capacity_text = json.dumps(capacity, ensure_ascii=False, separators=(",", ":"))
+        cap_now, events, sessions, queued, state_hash = self._parse_checkpoint(
+            capacity_text
+        )
+        if cap_now != now_ms:
+            raise ValueError("容量.时刻 must equal top-level 时刻")
+        # 规范形态复核：键序/形态偏差令规范化重编码与原编码不一致。
+        canonical_capacity = {
+            "时刻": cap_now,
+            "事件": [
+                {
+                    "序号": seq,
+                    "时刻": ev_now,
+                    "会话": sid,
+                    "结果": verdict,
+                    "入队序": order,
+                    "前哈希": prev_hash,
+                    "哈希": event_digest,
+                }
+                for seq, ev_now, sid, verdict, order, prev_hash, event_digest
+                in events
+            ],
+            "会话": sessions,
+            "排队": queued,
+            "状态哈希": state_hash,
+        }
+        if (
+            json.dumps(canonical_capacity, ensure_ascii=False, separators=(",", ":"))
+            != capacity_text
+        ):
+            raise ValueError("容量 must be a canonical clog checkpoint object")
+
+        quota = doc["配额"]
+        if not isinstance(quota, dict):
+            raise ValueError("配额 must be an object")
+        quota_text = json.dumps(quota, ensure_ascii=False, separators=(",", ":"))
+        quota_rows = self._parse_quota_checkpoint(quota_text)
+        canonical_quota = {
+            "版本": 1,
+            "账本": [
+                [user, template_id, used, last, tokens]
+                for user, template_id, used, last, tokens in quota_rows
+            ],
+        }
+        if (
+            json.dumps(canonical_quota, ensure_ascii=False, separators=(",", ":"))
+            != quota_text
+        ):
+            raise ValueError("配额 must be a canonical quota checkpoint object")
+
+        # 摘要：前四键紧凑 JSON（无 LF）的 UTF-8 字节 sha256 小写值。
+        head = {
+            "版本": _RUNTIME_VERSION,
+            "时刻": now_ms,
+            "容量": capacity,
+            "配额": quota,
+        }
+        if self._runtime_digest(head) != digest:
+            raise ValueError("摘要 does not match the canonical runtime package digest")
+        payload = dict(head)
+        payload["摘要"] = digest
+        result = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        return now_ms, events, sessions, queued, quota_rows, digest, result
+
+    def runtime_restore(self, key, text):
+        """按运行态检查点原子替换会话/租约/队列/事件账本与共享 QoS 账本，
+        返回规范包的 LF 结尾 JSON。
+
+        key 沿用凭据约束，text 须为 str；类型错抛 TypeError。重放缓存与
+        各域独立：仅缓存首次成功结果，同型同 text 重放不验参、不替换，
+        直接返回缓存规范包，异参抛 ValueError；任何失败（含参数错）不占
+        key。JSON 解析失败、重键、键序/结构/类型/取值/排序、版本、摘要
+        或时刻非法均抛 ValueError（容量时刻须等于顶层时刻，容量/配额须
+        为规范形态）；用户/模板/池址/令牌/容量或引用不承载抛
+        ResourceError；目标持有与包不同摘要的覆盖状态（账本延展、包外
+        会话或排队、同标识字段互异）抛 StateError。全部校验通过后原子
+        替换：容量部分同 creplay（含下线墓碑、租约派生重建与入队序游标），
+        配额部分同 quota_restore（仅覆盖模板仍存在的账本，已删模板的
+        历史账本原样保留）。当前状态与包同摘要时为空操作（不替换，租约
+        派生态顺带对齐）。失败不改运行态、配置、缓存与审计；不审计、不
+        老化。首次 O(N log N) 时间、O(N) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._runtime_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text 后返回缓存规范包。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        now_ms, events, sessions, queued, quota_rows, digest, result = (
+            self._parse_runtime_package(text)
+        )
+
+        # 同摘要空操作（以当前实况、不老化重算前四键）：会话（含墓碑）、
+        # 队列、账本与 QoS 账本已与包逐字段一致，不替换；租约表为在租会话
+        # 的派生态，顺带对齐。
+        current_head = {
+            "版本": _RUNTIME_VERSION,
+            "时刻": now_ms,
+            "容量": self._checkpoint_payload(now_ms),
+            "配额": self._quota_checkpoint_payload(),
+        }
+        if self._runtime_digest(current_head) == digest:
+            live_leases = {}
+            for sid, session in self._sessions.items():
+                if session["ip"] is not None:
+                    live_leases.setdefault(session["pool"], {})[session["ip"]] = sid
+            self._rebuild_pool_leases(live_leases)
+            self._runtime_restore_cache[key] = (text, result)
+            return result
+
+        # 容量部分：非同批覆盖状态（StateError 先于承载力判定）。
+        self._checkpoint_divergence_check(events, sessions, queued)
+        required_leases = self._checkpoint_carry_check(sessions, queued)
+        # 配额承载：用户已注册、模板现存、令牌不超其 (限速+突发)*1000 桶容。
+        for user, template_id, _used, _last, tokens in quota_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"runtime package references unregistered user: {user!r}"
+                )
+            template = self._templates.get(template_id)
+            if template is None:
+                raise ResourceError(
+                    f"runtime package references unknown template: {template_id!r}"
+                )
+            if tokens > (template[0] + template[1]) * 1000:
+                raise ResourceError(
+                    f"令牌 for {(user, template_id)!r} exceeds template bucket "
+                    f"capacity {(template[0] + template[1]) * 1000}"
+                )
+
+        # 全部校验通过：原子替换容量运行态与共享 QoS 账本。
+        self._checkpoint_commit(events, sessions, queued, required_leases)
+        # 检查点仅覆盖模板仍存在的账本，已删模板的历史账本原样保留。
+        new_ledgers = {
+            ledger_key: ledger
+            for ledger_key, ledger in self._meter_ledgers.items()
+            if ledger_key[1] not in self._templates
+        }
+        for user, template_id, used, last, tokens in quota_rows:
+            new_ledgers[(user, template_id)] = [used, last, tokens]
+        self._meter_ledgers = new_ledgers
+
+        self._runtime_restore_cache[key] = (text, result)
+        return result
 
     @staticmethod
     def _render_capacity(sid, result, now_ms, deadline):
