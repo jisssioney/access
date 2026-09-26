@@ -826,9 +826,17 @@ _TIMEOUT_STORM_OP = "超时风暴"
 
 # config_change 配置事务操作名与入防篡改审计链的操作名。
 _CONFIG_OP_LOAD = "加载"
+_CONFIG_OP_UPGRADE = "升级"
 _CONFIG_OP_ROLLBACK = "回滚"
 _CONFIG_CHAIN_LOAD = "配置加载"
+_CONFIG_CHAIN_UPGRADE = "配置升级"
 _CONFIG_CHAIN_ROLLBACK = "配置回滚"
+# 事务操作名 -> 审计链操作名。
+_CONFIG_CHAIN_OPS = {
+    _CONFIG_OP_LOAD: _CONFIG_CHAIN_LOAD,
+    _CONFIG_OP_UPGRADE: _CONFIG_CHAIN_UPGRADE,
+    _CONFIG_OP_ROLLBACK: _CONFIG_CHAIN_ROLLBACK,
+}
 
 # batch_offline 批量下线：单批 sid 数上界。
 _BATCH_MAX_SIDS = 1000
@@ -1198,8 +1206,8 @@ class Sessions:
         # pool_fault/timeout_fault/batch_offline 分域：
         # key -> (items, now_ms, atomic, outcome)。
         self._batch_online_cache = {}
-        # config_change 配置加载/回滚事务的重放缓存，与 do/meter/capacity/
-        # fault/pool_fault/timeout_fault/batch_offline 分域：
+        # config_change 配置加载/升级/回滚事务的重放缓存，与 do/meter/
+        # capacity/fault/pool_fault/timeout_fault/batch_offline 分域：
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
         self._config_change_cache = {}
         self._config_change_chain_index = {}
@@ -5232,25 +5240,28 @@ class Sessions:
         return self.export_config()
 
     def config_change(self, key, op, text, now_ms):
-        """配置加载/回滚的幂等事务入口，原样返回 load_config/rollback_config
-        的 v5、LF 尾紧凑 JSON。
+        """配置加载/升级/回滚的幂等事务入口，原样返回 load_config/
+        upgrade_config/rollback_config 的 v5、LF 尾紧凑 JSON。
 
-        依次校验：key 沿用凭据约束；op 须为非 bool str 且仅“加载/回滚”；
-        加载时 text 须为 str，回滚时 text 须为 None；now_ms 须为非 bool
-        非负 int。类型错抛 TypeError，值或模式错抛 ValueError。key 有效后以
-        独立域永久缓存余参与首果（含参数异常）：严格同型同参重放不改配置，
-        直接返回或重抛首果；异参抛 ValueError；参数错也缓存但不审计。
+        依次校验：key 沿用凭据约束；op 须为非 bool str 且仅“加载/升级/
+        回滚”；加载与升级时 text 须为 str，回滚时 text 须为 None；now_ms
+        须为非 bool 非负 int。类型错抛 TypeError，值或模式错抛 ValueError。
+        key 有效后以独立域永久缓存余参与首果（含参数异常）：严格同型同参
+        重放不改配置，直接返回或重抛首果；异参抛 ValueError；参数错也缓存
+        但不审计。
 
-        首次合法调用分别执行既有 load_config(text)/rollback_config()：成功
-        原样返回其 JSON；配置非法抛 ValueError、承载冲突抛 ResourceError、
-        无回滚点抛 StateError，异常类型与 args 一并缓存。除缓存、审计外，
-        失败不得改变配置、回滚点、用户、会话、租约、队列、统计或故障态。
+        首次合法调用分别执行既有 load_config(text)/upgrade_config(text, 5)/
+        rollback_config()：成功原样返回其 JSON；升级只读，仅返回升级包，
+        配置、运行态与回滚点不变；加载配置非法抛 ValueError、承载冲突抛
+        ResourceError、无回滚点抛 StateError，异常类型与 args 一并缓存。
+        除缓存、审计外，失败不得改变配置、回滚点、用户、会话、租约、队列、
+        统计或故障态。
 
         首次业务结果（成功或异常）与同参重放均向既有防篡改审计哈希链追加
-        一项：操作为“配置加载/配置回滚”，会话记空串；首次原序号 0，结果为
-        “成功”或异常类名；重放原序号指认首次事件，结果为“重放成功”或
-        “重放”加异常类名，并返回或重抛首果。异参不审计。首次复杂度沿既有
-        接口，重放 O(1) 时空。
+        一项：操作为“配置加载/配置升级/配置回滚”，会话记空串；首次原序号
+        0，结果为“成功”或异常类名；重放原序号指认首次事件，结果为“重放
+        成功”或“重放”加异常类名，并返回或重抛首果。异参不审计。首次复杂
+        度沿既有接口，重放 O(1) 时空。
         """
         _check_credential("key", key)
 
@@ -5266,10 +5277,7 @@ class Sessions:
             # 加异常类名，原序号指认首次事件；参数错不在本域链索引中，自然跳过。
             origin = self._config_change_chain_index.get(key)
             if origin is not None:
-                chain_op = (
-                    _CONFIG_CHAIN_LOAD if c_op == _CONFIG_OP_LOAD
-                    else _CONFIG_CHAIN_ROLLBACK
-                )
+                chain_op = _CONFIG_CHAIN_OPS[c_op]
                 if outcome[0] == "ok":
                     chain_result = "重放成功"
                 else:
@@ -5300,48 +5308,33 @@ class Sessions:
             )
             raise
 
-        # 首次合法调用：执行既有加载/回滚；业务异常（ValueError/
+        # 首次合法调用：执行既有加载/升级/回滚；业务异常（ValueError/
         # ResourceError/StateError）缓存类型与 args 并入链，不改配置与运行态。
         if op == _CONFIG_OP_LOAD:
-            chain_op = _CONFIG_CHAIN_LOAD
-            try:
-                result = self.load_config(text)
-            except (ValueError, ResourceError, StateError) as exc:
-                self._config_change_cache[key] = (
-                    op,
-                    text,
-                    now_ms,
-                    ("err", (type(exc), exc.args)),
-                )
-                self._chain_append(
-                    key,
-                    chain_op,
-                    "",
-                    type(exc).__name__,
-                    now_ms,
-                    index=self._config_change_chain_index,
-                )
-                raise
+            run = lambda: self.load_config(text)
+        elif op == _CONFIG_OP_UPGRADE:
+            run = lambda: self.upgrade_config(text, _CONFIG_VERSION)
         else:
-            chain_op = _CONFIG_CHAIN_ROLLBACK
-            try:
-                result = self.rollback_config()
-            except (ValueError, ResourceError, StateError) as exc:
-                self._config_change_cache[key] = (
-                    op,
-                    text,
-                    now_ms,
-                    ("err", (type(exc), exc.args)),
-                )
-                self._chain_append(
-                    key,
-                    chain_op,
-                    "",
-                    type(exc).__name__,
-                    now_ms,
-                    index=self._config_change_chain_index,
-                )
-                raise
+            run = self.rollback_config
+        chain_op = _CONFIG_CHAIN_OPS[op]
+        try:
+            result = run()
+        except (ValueError, ResourceError, StateError) as exc:
+            self._config_change_cache[key] = (
+                op,
+                text,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            self._chain_append(
+                key,
+                chain_op,
+                "",
+                type(exc).__name__,
+                now_ms,
+                index=self._config_change_chain_index,
+            )
+            raise
         self._config_change_cache[key] = (
             op,
             text,
@@ -5362,21 +5355,24 @@ class Sessions:
     def _validate_config_change_params(op, text, now_ms):
         """校验 config_change 三参数（key 已由调用方校验）：类型错先于值错。
 
-        op 限加载/回滚；加载 text 须为 str，回滚 text 须为 None（任何非 None
-        皆值错）；now_ms 为非 bool 非负 int。加载文本的内容合法性由
-        load_config 复核（空串等在此仅视为 str，业务失败归 ValueError）。
+        op 限加载/升级/回滚；加载与升级 text 须为 str，回滚 text 须为 None
+        （任何非 None 皆值错）；now_ms 为非 bool 非负 int。加载/升级文本的
+        内容合法性由 load_config/upgrade_config 复核（空串等在此仅视为
+        str，业务失败归 ValueError）。
         """
         # 类型阶段：任一类型错先于任何值/模式错抛出。
         if isinstance(op, bool) or not isinstance(op, str):
             raise TypeError(f"op must be a str, got {type(op).__name__}")
-        if op == _CONFIG_OP_LOAD and not isinstance(text, str):
+        if op in (_CONFIG_OP_LOAD, _CONFIG_OP_UPGRADE) and not isinstance(
+            text, str
+        ):
             raise TypeError(f"text must be a str, got {type(text).__name__}")
         if isinstance(now_ms, bool) or not isinstance(now_ms, int):
             raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
 
         # 取值/模式阶段。
-        if op not in (_CONFIG_OP_LOAD, _CONFIG_OP_ROLLBACK):
-            raise ValueError(f"op must be one of 加载/回滚, got {op!r}")
+        if op not in (_CONFIG_OP_LOAD, _CONFIG_OP_UPGRADE, _CONFIG_OP_ROLLBACK):
+            raise ValueError(f"op must be one of 加载/升级/回滚, got {op!r}")
         if op == _CONFIG_OP_ROLLBACK and text is not None:
             raise ValueError(f"text must be None for 回滚, got {text!r}")
         if now_ms < 0:
