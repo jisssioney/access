@@ -47,6 +47,18 @@
   AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
   已入队队项保留；首果（成功/AuthError/KeyError）及同参重放写防篡改审计链
   （凭据轮换，会话=user），参数错不审计。
+- Sessions.user_admin 用户停用/启用：key/user 沿用凭据，op 仅停用/启用，
+  now_ms 为非 bool 非负 int、force 为 bool，启用限 force=False；型/值错
+  TypeError/ValueError，未知用户 KeyError。停用遇非下线会话或队项且
+  force=False 抛 StateError；force=True 原子下线其非下线会话、清期限退租
+  并删队项，无容量事件；失败不变。停用后 do 建立/迁移/接管、capacity
+  申请、batch_online 及 credential_change 先于后端和认证拒绝（单项
+  AuthError、批量项 AuthError），锁定、退避、失败计数不变；启用恢复；
+  同态成功且下线/取消二数为 0。独立域首果（含异常）永久缓存，同型同参
+  重放、异参 ValueError；返回 LF 尾紧凑 JSON（用户/状态/时刻/下线/取消）；
+  成功首果与成功同参重放写防篡改审计链（用户停用/用户启用，会话=user，
+  成功/重放），参数错及业务异常不审计。
+  停用态不随配置加载/回滚与检查点恢复改变。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -775,6 +787,15 @@ _BATCH_ITEM_ONLINE = "上线"
 _CREDENTIAL_OP = "凭据轮换"
 _CREDENTIAL_ROTATED = "已轮换"
 
+# user_admin 用户管理：op 仅停用/启用，返回状态仅停用/启用。
+_ADMIN_OP_DISABLE = "停用"
+_ADMIN_OP_ENABLE = "启用"
+_ADMIN_DISABLED = "停用"
+_ADMIN_ENABLED = "启用"
+# user_admin 入防篡改审计链的操作名。
+_ADMIN_CHAIN_DISABLE = "用户停用"
+_ADMIN_CHAIN_ENABLE = "用户启用"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -987,6 +1008,24 @@ class Sessions:
     审计；首果（成功/AuthError/KeyError）及同参重放写现有防篡改审计链：操作
     “凭据轮换”、会话记 user，首次原序号 0、重放原序号指认首次且结果加“重放”
     前缀。O(1) 时空（凭据长度有界）。
+    user_admin(key, op, user, now_ms, force=False) 停用或启用用户：key/user
+    沿用凭据约束，op 仅停用/启用，now_ms 为非 bool 非负 int，force 为 bool，
+    启用限 force=False；型/值错分别抛 TypeError/ValueError，未知用户
+    KeyError。停用遇该用户非下线（在线/挂起）会话或排队队项且 force=False
+    抛 StateError、状态不变；force=True 原子下线其全部非下线会话（清期限、
+    释址退租）并删除其全部排队队项，不记 capacity 事件；失败不改态。启用无
+    副作用；同态成功且下线/取消恒 0。停用后该用户 do 建立/迁移/接管、
+    capacity 申请、batch_online、credential_change 先于后端检查与认证拒绝：
+    单项抛 AuthError、批量项结果记 AuthError，不老化、不退避、不认证，锁定、
+    退避与失败计数不变；启用恢复。返回键序“用户/状态/时刻/下线/取消”的
+    LF 尾紧凑 JSON（ensure_ascii=False、separators=(',',':')），状态仅
+    停用/启用，下线/取消为 int。验 key 后以独立域永久缓存余参与首果（含参数
+    异常），同型同参重放不改态、异参 ValueError；参数错与 StateError/KeyError
+    等业务异常不审计，成功首果及成功的同参重放写现有防篡改审计链：操作
+    “用户停用/用户启用”、会话记 user，首次原序号 0、结果“成功”，重放
+    原序号指认首次、结果“重放”。停用态不随配置加载/回滚或
+    creplay/runtime_restore 改变。首次
+    O(S+Q) 时间、O(1) 辅助空间，重放 O(1)。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1096,6 +1135,13 @@ class Sessions:
         # 索引亦独立分域。
         self._credential_change_cache = {}
         self._credential_change_chain_index = {}
+        # user_admin 用户停用/启用管理：停用态用户集合（停用即先于后端与认证
+        # 拒绝建立/迁移/接管、capacity 申请、batch_online 与 credential_change）。
+        # 重放缓存与各域独立：key -> (op, user, now_ms, force, outcome)；
+        # 原序号索引亦独立分域。
+        self._disabled_users = set()
+        self._user_admin_cache = {}
+        self._user_admin_chain_index = {}
         # quota_restore 共享 QoS 账本恢复的重放缓存，与其余各域独立：
         # key -> (text, outcome)；仅首次成功缓存，失败（含参数错）不占 key。
         self._quota_restore_cache = {}
@@ -1225,6 +1271,18 @@ class Sessions:
             backend_user = old_session["user"]
         else:
             backend_user = None
+        # 停用态用户：建立/迁移/接管先于后端检查与认证拒绝，只入缓存；
+        # 不老化、不退避、不认证、不计失败、不入审计链（重放自然不重记入链）。
+        if backend_user is not None and backend_user in self._disabled_users:
+            exc = AuthError(f"user {backend_user!r} is disabled")
+            self._cache[key] = (
+                op,
+                sid,
+                args,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise exc
         if backend_user is not None:
             try:
                 self._backend_check(backend_user, now_ms)
@@ -2973,6 +3031,10 @@ class Sessions:
         all_ok = True
         for sid, user, password in items:
             try:
+                # 停用态用户先于后端检查与认证拒绝：项结果记 AuthError，
+                # 不认证、不退避、不计失败计数。
+                if user in self._disabled_users:
+                    raise AuthError(f"user {user!r} is disabled")
                 self._backend_check(user, now_ms, count_fault=False)
                 self._batch_establish(
                     sid, user, password, now_ms, total_count, per_user
@@ -3387,6 +3449,19 @@ class Sessions:
                 ("err", (type(exc), exc.args)),
             )
             raise
+
+        # 申请：停用态用户先于后端检查与认证拒绝，只入缓存；不老化、不退避、
+        # 不认证、不计失败、不记 capacity 事件。
+        if op == _OP_APPLY and args[0] in self._disabled_users:
+            exc = AuthError(f"user {args[0]!r} is disabled")
+            self._capacity_cache[key] = (
+                op,
+                sid,
+                args,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise exc
 
         # 申请：验参后、老化前查后端（用户取自 args）；BackendError 只入
         # 计数与缓存，不老化、不认证、不入队、不记事件。
@@ -5186,6 +5261,26 @@ class Sessions:
             )
             raise
 
+        # 首次合法：停用态用户先于认证拒绝（保留失败计数与锁定，不换密）。
+        if user in self._disabled_users:
+            exc = AuthError(f"user {user!r} is disabled")
+            self._credential_change_cache[key] = (
+                user,
+                old_password,
+                new_password,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            self._chain_append(
+                key,
+                _CREDENTIAL_OP,
+                user,
+                type(exc).__name__,
+                now_ms,
+                index=self._credential_change_chain_index,
+            )
+            raise exc
+
         # 首次合法：先用 Authenticator 校验旧密码；未知用户由其抛 KeyError。
         try:
             _, status, _ = self._auth.authenticate(user, old_password, now_ms)
@@ -5284,6 +5379,212 @@ class Sessions:
     def _render_credential_change(user, now_ms):
         # 键序：用户、时刻、结果；用户/结果为 str，时刻为 int。
         payload = {"用户": user, "时刻": now_ms, "结果": _CREDENTIAL_ROTATED}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def user_admin(self, key, op, user, now_ms, force=False):
+        """停用或启用用户，返回 LF 结尾的紧凑 JSON。
+
+        key/user 沿用凭据约束；op 仅“停用/启用”；now_ms 为非 bool 非负
+        int；force 为 bool。类型错抛 TypeError、取值错抛 ValueError，未知
+        用户抛 KeyError；启用限 force=False（force=True 为值错）。
+
+        停用：该用户存在非下线（在线/挂起）会话或排队队项且 force=False
+        时抛 StateError，状态不变；force=True 原子下线其全部非下线会话
+        （期限清零、释放地址租约）并删除其全部排队队项（不记 capacity
+        事件），无容量事件。失败不改任何状态。启用无副作用，恢复其正常
+        认证与操作。停用后 do 建立/迁移/接管、capacity 申请、batch_online
+        及 credential_change 均先于后端检查与认证拒绝：单项抛 AuthError，
+        批量项结果记 AuthError，锁定、退避与失败计数不变；启用后恢复。
+
+        返回键序“用户/状态/时刻/下线/取消”：状态仅停用/启用，下线为本次
+        停用强制下线的非下线会话数，取消为删除的排队队项数（启用二者恒 0，
+        同态成功亦为 0）。验 key 后以独立域永久缓存余参与首果（含参数
+        异常）：同型同参重放不改态、直接返回或重抛，异参抛 ValueError。
+        首果（成功）及成功的同参重放写现有防篡改审计链：操作“用户停用/用户
+        启用”、会话记 user，首次原序号 0、结果“成功”，重放原序号指认首次、
+        结果“重放”；参数错与 StateError/KeyError 等业务异常不审计。
+        首次 O(S+Q) 时间、O(1) 辅助空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._user_admin_cache.get(key)
+        if cached is not None:
+            # 重放：不改停用态，仅按缓存返回或重抛。
+            c_op, c_user, c_now_ms, c_force, outcome = cached
+            if not _strict_equal(
+                (op, user, now_ms, force), (c_op, c_user, c_now_ms, c_force)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 仅首次成功的同参重放入链记“重放”，原序号沿用首次；
+            # 首次异常不在本域链索引中，自然跳过。
+            origin = self._user_admin_chain_index.get(key)
+            if origin is not None:
+                chain_op = (
+                    _ADMIN_CHAIN_DISABLE if c_op == _ADMIN_OP_DISABLE
+                    else _ADMIN_CHAIN_ENABLE
+                )
+                self._chain_append(
+                    key,
+                    chain_op,
+                    c_user,
+                    "重放",
+                    now_ms,
+                    origin,
+                    self._user_admin_chain_index,
+                )
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise _replay_exception(exc_class, exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存但不审计；校验失败不改任何状态。
+        try:
+            self._validate_user_admin_params(op, user, now_ms, force)
+        except (TypeError, ValueError) as exc:
+            self._user_admin_cache[key] = (
+                op,
+                user,
+                now_ms,
+                force,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 类型、值校验全过后方查用户存在：未知用户 KeyError（业务失败，缓存、
+        # 不审计、不改态）。
+        if user not in self._auth:
+            exc = KeyError(f"unknown user: {user!r}")
+            self._user_admin_cache[key] = (
+                op,
+                user,
+                now_ms,
+                force,
+                ("err", (type(exc), exc.args)),
+            )
+            raise exc
+
+        if op == _ADMIN_OP_ENABLE:
+            # 启用无副作用；同态（本就启用）成功，下线/取消恒 0。
+            self._disabled_users.discard(user)
+            offline = 0
+            cancelled = 0
+            status = _ADMIN_ENABLED
+            chain_op = _ADMIN_CHAIN_ENABLE
+        else:
+            if not force:
+                # 先探测在途项（不随扫描改态）：存在任一非下线会话或排队队项
+                # 即拒，O(S+Q) 时间、O(1) 辅助空间。
+                blocked = False
+                for session in self._sessions.values():
+                    if (
+                        session["user"] == user
+                        and session["state"] != _STATE_OFFLINE
+                    ):
+                        blocked = True
+                        break
+                if not blocked:
+                    for queued_sid in self._queue_order:
+                        if self._capacity_queue[queued_sid][0] == user:
+                            blocked = True
+                            break
+                if blocked:
+                    exc = StateError(
+                        "cannot disable user "
+                        f"{user!r} with active sessions or queued items"
+                    )
+                    self._user_admin_cache[key] = (
+                        op,
+                        user,
+                        now_ms,
+                        force,
+                        ("err", (type(exc), exc.args)),
+                    )
+                    raise exc
+                offline = 0
+                cancelled = 0
+            else:
+                # force=True：原子下线该用户全部非下线会话（清期限、释址退租），
+                # 再原地压缩队列、删除其全部排队队项；不记 capacity 事件、不老化。
+                # 仅改会话项与池租约值、不动会话表键，遍历中修改安全；O(S+Q)
+                # 时间、O(1) 辅助空间。下线墓碑不重复下线。
+                offline = 0
+                for session in self._sessions.values():
+                    if (
+                        session["user"] == user
+                        and session["state"] != _STATE_OFFLINE
+                    ):
+                        session["state"] = _STATE_OFFLINE
+                        session["deadline"] = 0
+                        self._release(session)
+                        offline += 1
+                cancelled = 0
+                write = 0
+                for queued_sid in self._queue_order:
+                    if self._capacity_queue[queued_sid][0] == user:
+                        del self._capacity_queue[queued_sid]
+                        cancelled += 1
+                    else:
+                        self._queue_order[write] = queued_sid
+                        write += 1
+                del self._queue_order[write:]
+            self._disabled_users.add(user)
+            status = _ADMIN_DISABLED
+            chain_op = _ADMIN_CHAIN_DISABLE
+
+        result = self._render_user_admin(user, status, now_ms, offline, cancelled)
+        self._user_admin_cache[key] = (
+            op,
+            user,
+            now_ms,
+            force,
+            ("ok", result),
+        )
+        self._chain_append(
+            key,
+            chain_op,
+            user,
+            "成功",
+            now_ms,
+            index=self._user_admin_chain_index,
+        )
+        return result
+
+    @staticmethod
+    def _validate_user_admin_params(op, user, now_ms, force):
+        """校验 user_admin 的余参（key 已由调用方校验）：类型错先于值错。
+
+        op 限停用/启用；user 为凭据约束串；now_ms 为非 bool 非负 int；
+        force 为 bool，且启用仅允许 force=False。
+        """
+        # 类型阶段：任一类型错先于任何取值错抛出。
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if not isinstance(user, str):
+            raise TypeError(f"user must be a str, got {type(user).__name__}")
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(force, bool):
+            raise TypeError(f"force must be a bool, got {type(force).__name__}")
+
+        # 取值阶段。
+        if op not in (_ADMIN_OP_DISABLE, _ADMIN_OP_ENABLE):
+            raise ValueError(f"op must be one of 停用/启用, got {op!r}")
+        _check_credential("user", user)
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if op == _ADMIN_OP_ENABLE and force:
+            raise ValueError("force must be False for 启用")
+
+    @staticmethod
+    def _render_user_admin(user, status, now_ms, offline, cancelled):
+        # 键序：用户、状态、时刻、下线、取消；用户/状态为 str，余为 int。
+        payload = {
+            "用户": user,
+            "状态": status,
+            "时刻": now_ms,
+            "下线": offline,
+            "取消": cancelled,
+        }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _audit_append(self, key, old, sid, result, now_ms, origin=0):
