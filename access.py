@@ -1071,6 +1071,9 @@ class Sessions:
         # runtime_restore 运行态检查点恢复的重放缓存，与其余各域独立：
         # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）不占 key。
         self._runtime_restore_cache = {}
+        # timeout_sweep 超时清扫的重放缓存，与其余各域独立：
+        # key -> (now_ms, limit, 结果 JSON)；仅首次成功缓存，失败不占 key。
+        self._timeout_sweep_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -2428,6 +2431,124 @@ class Sessions:
         # 触发后清除待触发值。
         self._timeout_at = None
         return [order for _sid, order in timed_out]
+
+    def timeout_sweep(self, key, now_ms, limit=100):
+        """清扫到期的在线会话与排队项，返回 LF 结尾的基线 JSON。
+
+        key 沿用凭据约束；now_ms 为非 bool 非负 int，limit 为非 bool int
+        且 1..1000：类型错 TypeError、取值错 ValueError。重放缓存与各域
+        独立：仅缓存首次成功，同 key 同型同参重放不清扫、不改态，直接
+        返回缓存结果，异参抛 ValueError；任何失败（含参数错）不占 key。
+
+        不做普通老化。候选为期限非 0 且 <= now_ms 的在线会话与截止
+        <= now_ms 的排队项，按（截止, 类别, 次序）升序取前 limit 项：
+        类别会话先于排队，会话按 sid 升序、排队按入队序。会话挂起、
+        期限清零并释放租约（静态址仅退租）；排队项删除并按处理序追加
+        既有超时容量事件（沿用其 sid 与入队序）。整批原子：先全部选定
+        再一次性提交，不晋升、不半释放。
+
+        顶层键序为“时刻/处理/会话超时/排队超时/剩余/完成/项目”：处理
+        为本次处理项数，剩余为处理后仍候选的项数，完成当且仅当剩余为
+        0。项目按处理序，项键序为“类型/标识/结果/截止/入队序”：类型
+        仅会话/排队，标识为 sid，会话入队序恒 0，结果仅挂起/超时。
+        时间 O(S+Q+limit log limit)、空间 O(limit)。
+        """
+        _check_credential("key", key)
+
+        cached = self._timeout_sweep_cache.get(key)
+        if cached is not None:
+            # 重放：不清扫、不改态，仅核对同型同参后返回缓存结果。
+            c_now_ms, c_limit, result = cached
+            if not _strict_equal((now_ms, limit), (c_now_ms, c_limit)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        _check_int("now_ms", now_ms, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        # 候选扫描（不老化）：在线且期限非 0 到期者、截止到期队项。类别键
+        # “会话”码点小于“排队”，会话次序取 sid、排队取入队序；同类内次序
+        # 互异，异类先比类别，故混合长度元组不会跨类比较次序。
+        candidate_count = 0
+
+        def candidates():
+            nonlocal candidate_count
+            for sid, session in self._sessions.items():
+                if (
+                    session["state"] == _STATE_ONLINE
+                    and session["deadline"] != 0
+                    and session["deadline"] <= now_ms
+                ):
+                    candidate_count += 1
+                    yield (session["deadline"], "会话", sid)
+            for queued_sid in self._queue_order:
+                entry = self._capacity_queue[queued_sid]
+                if entry[3] <= now_ms:
+                    candidate_count += 1
+                    yield (entry[3], "排队", entry[4], queued_sid)
+
+        # nsmallest 惰性消费生成器：仅留前 limit 项（升序），空间 O(limit)。
+        selected = heapq.nsmallest(limit, candidates())
+        remaining = candidate_count - len(selected)
+
+        # 整批原子：选定不改态，提交步骤不可失败，一次性落库。
+        items = []
+        session_timeouts = 0
+        queued_timeouts = 0
+        removed = set()
+        for entry in selected:
+            deadline = entry[0]
+            if entry[1] == "会话":
+                sid = entry[2]
+                session = self._sessions[sid]
+                self._release(session)
+                session["state"] = _STATE_SUSPENDED
+                session["deadline"] = 0
+                session_timeouts += 1
+                items.append(
+                    {
+                        "类型": "会话",
+                        "标识": sid,
+                        "结果": "挂起",
+                        "截止": deadline,
+                        "入队序": 0,
+                    }
+                )
+            else:
+                order = entry[2]
+                sid = entry[3]
+                del self._capacity_queue[sid]
+                removed.add(sid)
+                self._cap_event(now_ms, sid, _CAP_TIMEOUT, order)
+                queued_timeouts += 1
+                items.append(
+                    {
+                        "类型": "排队",
+                        "标识": sid,
+                        "结果": "超时",
+                        "截止": deadline,
+                        "入队序": order,
+                    }
+                )
+        if removed:
+            self._queue_order = [
+                sid for sid in self._queue_order if sid not in removed
+            ]
+
+        payload = {
+            "时刻": now_ms,
+            "处理": len(selected),
+            "会话超时": session_timeouts,
+            "排队超时": queued_timeouts,
+            "剩余": remaining,
+            "完成": remaining == 0,
+            "项目": items,
+        }
+        output = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._timeout_sweep_cache[key] = (now_ms, limit, output)
+        return output
 
     def batch_offline(self, key, sids, now_ms, atomic=False):
         """批量下线一批会话，返回 LF 结尾的 JSON 字符串。
@@ -4268,7 +4389,8 @@ class Sessions:
 
         顶层须恰含“版本/时刻/容量/配额/摘要”且键序如此；版本为 1，时刻为
         非 bool 非负 int，容量/配额分别沿用 clog/quota_checkpoint 对象契约
-        （经 _parse_checkpoint/_parse_quota_checkpoint 全量校验），容量时刻
+        （嵌套键序按原文校验后，经 _parse_checkpoint/_parse_quota_checkpoint
+        全量校验），容量时刻
         须等于顶层时刻，摘要须为规范化前四键紧凑 JSON（无 LF）UTF-8 字节的
         sha256 小写值（与原文排版无关）。仅做结构自洽校验；用户注册、模板
         存在、令牌桶容、上限与池址承载力由 runtime_restore 判定。
@@ -4296,6 +4418,32 @@ class Sessions:
             raise ValueError("容量 must be an object")
         if not isinstance(doc["配额"], dict):
             raise ValueError("配额 must be an object")
+
+        # 嵌套键序按原文校验（dict 保序），先于规范化与摘要重算：容量顶层
+        # 及事件/会话/排队各项沿用 clog 键序，配额沿用 quota_checkpoint
+        # 键序；错序即 ValueError。非 list 列与非 dict 项交由下游解析器
+        # 按其键集/类型规则报 ValueError。
+        capacity = doc["容量"]
+        if list(capacity) != ["时刻", "事件", "会话", "排队", "状态哈希"]:
+            raise ValueError(
+                "容量 keys must be 时刻/事件/会话/排队/状态哈希 in order"
+            )
+        if list(doc["配额"]) != ["版本", "账本"]:
+            raise ValueError("配额 keys must be 版本/账本 in order")
+        for label, key_order in (
+            ("事件", ["序号", "时刻", "会话", "结果", "入队序", "前哈希", "哈希"]),
+            ("会话", ["会话", "用户", "状态", "期限", "池", "地址", "租期"]),
+            ("排队", ["会话", "用户", "申请时刻", "等待", "截止", "入队序"]),
+        ):
+            rows = capacity[label]
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if isinstance(item, dict) and list(item) != key_order:
+                    raise ValueError(
+                        f"容量.{label} item keys must be "
+                        f"{'/'.join(key_order)} in order"
+                    )
 
         # 子文档重编码为紧凑 JSON 后沿用既有解析器全量校验（重键已在顶层
         # 解析时拒绝；规范化行由解析器返回，与原文排版无关）。
