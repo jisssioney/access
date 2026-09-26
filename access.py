@@ -881,6 +881,9 @@ _MAX_QUEUE_LIMIT = 10000
 # QoS 模板并发会话上限：0..10000，0 表示不限。
 _MAX_TEMPLATE_SESSIONS = 10000
 _CONFIG_VERSION = 6
+# 配置修订历史保留的修订快照数上限：含构造态修订 0，按修订号升序淘汰
+# 最旧项，当前修订永不淘汰（始终补位），故历史空间 O(256n)。
+_CONFIG_HISTORY_LIMIT = 256
 
 # fault 操作与后端状态。
 _OP_INJECT = "注入"
@@ -1330,8 +1333,14 @@ class Sessions:
         self._chain_events = []
         self._chain_index = {}
         self._chain_tail = "0" * 64
-        # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None。
+        # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None；
+        # rollback_config 成功清除，config_revert 成功覆盖为回退前当前快照。
         self._rollback = None
+        # 配置修订历史：修订号（int）-> 该修订提交时的规范化 spec，按修订号
+        # 升序保留至多 _CONFIG_HISTORY_LIMIT 项。构造态修订 0 入库，仅
+        # load_config/rollback_config/config_cas/config_revert 首次成功后
+        # 追加新提交态；失败、升级与重放不保存。淘汰最旧项但永不淘汰当前项。
+        self._config_history = {0: self._current_spec()}
         # 配置修订号：初值 0，load_config/rollback_config 成功（含经
         # config_change/config_cas 提交）加 1；失败、导出与升级不变。
         self._revision = 0
@@ -1393,6 +1402,11 @@ class Sessions:
         # key -> (text, expected, now_ms, 结果)；仅首次成功缓存，失败
         # （含参数错与修订不符）不占 key。本接口不审计，无原序号索引。
         self._config_cas_cache = {}
+        # config_revert 配置历史回退的重放缓存，与其余各域独立：
+        # key -> (target, expected, now_ms, 结果)；仅首次成功缓存，失败
+        # （含参数错、修订不符、目标越界/未保留、承载冲突）不占 key。
+        # 本接口不审计，无原序号索引。
+        self._config_revert_cache = {}
         # credential_change 凭据轮换的重放缓存，与其余各域独立：
         # key -> (user, old_password, new_password, now_ms, outcome)；原序号
         # 索引亦独立分域。
@@ -6774,6 +6788,8 @@ class Sessions:
         self._rollback = self._current_spec()
         self._install_spec(spec, new_pools)
         self._revision += 1
+        self._config_history[self._revision] = self._current_spec()
+        self._trim_config_history()
         return self.export_config()
 
     def rollback_config(self):
@@ -6790,7 +6806,18 @@ class Sessions:
         self._rollback = None
         self._install_spec(spec, new_pools)
         self._revision += 1
+        self._config_history[self._revision] = self._current_spec()
+        self._trim_config_history()
         return self.export_config()
+
+    def _trim_config_history(self):
+        """修订历史超 256 项时淘汰修订号最小者；当前修订永不淘汰。
+
+        新提交态已先行入表（表长恰为上限+1），故最小项恒非当前项；按修订号
+        升序取最小删除即“淘汰最旧项”。O(256)，与配置规模 n 无关。
+        """
+        if len(self._config_history) > _CONFIG_HISTORY_LIMIT:
+            del self._config_history[min(self._config_history)]
 
     def _config_summary(self):
         """当前配置摘要：export_config 去尾 LF 的 UTF-8 字节 sha256 小写值。"""
@@ -6867,6 +6894,97 @@ class Sessions:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
         self._config_cas_cache[key] = (text, expected, now_ms, result)
+        return result
+
+    def config_revert(self, key, target, expected, now_ms):
+        """比较修订号并原子回退到已保留的历史配置快照，返回 LF 尾紧凑 JSON。
+
+        key 沿用凭据约束；target/expected/now_ms 须为非 bool 非负 int；类型
+        错抛 TypeError，负值抛 ValueError。验参后先比较 expected 与当前修订号：
+        不等抛 StateError(expected, current) 且不查目标；target >= expected
+        （含目标即当前修订）抛 ValueError；目标修订未保留（构造态 0 与最近
+        255 次成功提交之外）抛 KeyError(target)。目标命中时按 load_config
+        承载规则原子加载目标快照：用户模板引用或承载冲突抛 ValueError/
+        ResourceError；成功覆盖回滚点（回退前当前配置）、生成并保存新修订
+        （修订号沿现有规则加 1，历史按最旧项淘汰），返回键序/型
+        “修订:int、目标:int、前摘要:str、后摘要:str”的 JSON，两摘要同
+        config_revision 定义（分别为回退前、后的配置摘要）。任何失败不改
+        配置、回滚点、修订号、历史与运行态。
+
+        重放缓存与各域独立且仅缓存首次成功：同型同参重放不再比较修订号、
+        不查目标、不加载，原样返回首次字节；异参抛 ValueError；任何失败
+        （含参数错、修订不符、目标越界/未保留与承载冲突）不占 key 且不改
+        实例。本接口不审计。首次 O(n log n + S + Q) 时间、O(n) 空间，
+        重放 O(1)；历史空间 O(256n)。
+        """
+        _check_credential("key", key)
+
+        cached = self._config_revert_cache.get(key)
+        if cached is not None:
+            # 重放：不比较修订号、不查目标、不加载，仅核对同型同参后返回原字节。
+            c_target, c_expected, c_now_ms, result = cached
+            if not _strict_equal(
+                (target, expected, now_ms), (c_target, c_expected, c_now_ms)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        # 类型阶段：任一类型错先于任何值错抛出。
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise TypeError(f"target must be an int, got {type(target).__name__}")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise TypeError(
+                f"expected must be an int, got {type(expected).__name__}"
+            )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值阶段：负值先行拒绝。
+        if target < 0:
+            raise ValueError(f"target must be >= 0, got {target}")
+        if expected < 0:
+            raise ValueError(f"expected must be >= 0, got {expected}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+
+        # 先比修订号，不符不得查目标；失败不占 key、不改实例。
+        if expected != self._revision:
+            raise StateError(expected, self._revision)
+        # 目标须为严格早于当前的修订；当前修订及未来修订非法。
+        if target >= expected:
+            raise ValueError(
+                f"target must be an earlier revision than {expected}, got {target}"
+            )
+        spec = self._config_history.get(target)
+        if spec is None:
+            raise KeyError(target)
+
+        before = self._config_summary()
+        # 按 load_config 承载规则原子加载历史快照：先复核用户模板引用，再校验
+        # 承载力；引用错 ValueError、承载冲突 ResourceError 时在任何改动前中止，
+        # 实例不变；成功覆盖回滚点并将修订号加 1、保存新提交态。
+        for user, _template_id in spec[6]:
+            if user not in self._auth:
+                raise ValueError(
+                    f"user template user not in authenticator: {user!r}"
+                )
+        new_pools = self._build_pools(spec)
+        self._rollback = self._current_spec()
+        self._install_spec(spec, new_pools)
+        self._revision += 1
+        self._config_history[self._revision] = self._current_spec()
+        self._trim_config_history()
+        after = self._config_summary()
+        payload = {
+            "修订": self._revision,
+            "目标": target,
+            "前摘要": before,
+            "后摘要": after,
+        }
+        result = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        self._config_revert_cache[key] = (target, expected, now_ms, result)
         return result
 
     def config_change(self, key, op, text, now_ms):
