@@ -853,6 +853,16 @@ _BACKEND_RESTORE_OP = "后端恢复"
 # fault_restore 入防篡改审计链的操作名。
 _FAULT_RESTORE_OP = "故障恢复"
 
+# fault_plan 故障计划：模式仅预检/执行，域仅后端/池/超时，单计划步数
+# 1..1000；入防篡改审计链的操作名。
+_FAULT_PLAN_MODE_DRY = "预检"
+_FAULT_PLAN_MODE_EXEC = "执行"
+_FAULT_PLAN_DOMAIN_BACKEND = "后端"
+_FAULT_PLAN_DOMAIN_POOL = "池"
+_FAULT_PLAN_DOMAIN_TIMEOUT = "超时"
+_FAULT_PLAN_MAX_STEPS = 1000
+_FAULT_PLAN_OP = "故障计划"
+
 # pool_fault 池演练状态：仅耗尽/正常。
 _POOL_EXHAUSTED = "耗尽"
 _POOL_NORMAL = "正常"
@@ -1307,6 +1317,11 @@ class Sessions:
         # （含参数错）不占 key。
         self._fault_restore_cache = {}
         self._fault_restore_chain_index = {}
+        # fault_plan 故障计划（预检/执行多域演练）的重放缓存与原序号索引，与
+        # 其余各域独立：key -> (mode, steps, now_ms, outcome)；仅执行的首个
+        # 成功/KeyError 缓存，预检与参数错不占 key。
+        self._fault_plan_cache = {}
+        self._fault_plan_chain_index = {}
         # timeout_sweep 超时清扫的重放缓存，与其余各域独立：
         # key -> (now_ms, limit, 结果 JSON)；仅首次成功缓存，失败不占 key。
         self._timeout_sweep_cache = {}
@@ -3021,25 +3036,41 @@ class Sessions:
         紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。纯渲染：
         不老化、不清到期项、不改态。
         """
+        return self._fault_payload_of(
+            now_ms,
+            self._fault_until,
+            self._backoff,
+            self._fault_fail,
+            self._pool_fault,
+            self._timeout_at,
+        )
+
+    @staticmethod
+    def _fault_payload_of(now_ms, until, backoff, fail, pool_fault, timeout_at):
+        """按给定三域状态组装故障演练总检查点文档 dict（键序与契约同
+        _fault_payload 文档）；backoff 为 user -> (n, retry_at)，fail 为
+        [故障, 退避]，pool_fault 为 标识 -> 截至，timeout_at 为 None 或
+        触发时刻。纯渲染：不老化、不清到期项、不改态。
+        """
         backend = {
-            "截至": self._fault_until,
+            "截至": until,
             "退避": [
                 {"用户": user, "次数": n, "下次": retry_at}
-                for user, (n, retry_at) in sorted(self._backoff.items())
+                for user, (n, retry_at) in sorted(backoff.items())
             ],
-            "失败": {"故障": self._fault_fail[0], "退避": self._fault_fail[1]},
+            "失败": {"故障": fail[0], "退避": fail[1]},
         }
         pools = [
-            {"标识": pool_id, "截至": until}
-            for pool_id, until in sorted(self._pool_fault.items())
+            {"标识": pool_id, "截至": pool_until}
+            for pool_id, pool_until in sorted(pool_fault.items())
         ]
-        waiting = self._timeout_at is not None
+        waiting = timeout_at is not None
         doc = {
             "版本": 1,
             "时刻": now_ms,
             "后端": backend,
             "池": pools,
-            "超时": {"等待": waiting, "触发": self._timeout_at if waiting else 0},
+            "超时": {"等待": waiting, "触发": timeout_at if waiting else 0},
         }
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -3286,6 +3317,248 @@ class Sessions:
             waiting,
             trigger,
         )
+
+    def fault_plan(self, key, mode, steps, now_ms):
+        """按故障计划批量预检或执行后端/池/超时三域的注入与恢复，返回演算态
+        fault_checkpoint(now_ms) 包的 LF 结尾基线 JSON。
+
+        key 沿用凭据约束；mode 仅“预检/执行”；steps 为 1..1000 项 tuple，
+        每项为 (domain, target, op, value) 四元 tuple：domain/op 为 str，
+        domain 限“后端/池/超时”、op 限“注入/恢复”；后端与超时 target 须为
+        "" 且各至多一项，池 target 沿用凭据约束且互异；后端/池注入 value 为
+        非 bool 正 int（截至 = now_ms+value），超时注入 value 为非 bool int
+        且 >= now_ms，恢复 value 须为 None；now_ms 为非 bool 非负 int。
+        类型错 TypeError，结构/取值错 ValueError；类型、结构、取值全过后方
+        查池存在，未知池抛 KeyError。校验失败不改任何状态。
+
+        全验后演算：后端变更（注入/恢复）清全部用户退避、留失败计数；池
+        注入置该池截至、恢复移除该池演练；超时注入置待触发、恢复取消；未列
+        域不变。预检只读：不提交、不缓存、不审计，直接返回演算态检查点。
+        执行原子提交三域后返回同一演算态检查点；失败（未知池）仅写缓存与
+        审计，余状态不变。
+
+        执行以 key 于独立域（与其余各域分域）永久缓存首个成功/KeyError：
+        严格同型同参重放不演算、不提交，直接返回原字节或重抛，异参抛
+        ValueError；预检与参数错不缓存。执行的首果（成功/KeyError）与同参
+        重放写既有防篡改审计链：操作“故障计划”、会话记空串，结果与原序号
+        沿 config_change（首次“成功”/异常类名、原序号 0；重放“重放成功”/
+        “重放”加异常类名、原序号指认首次）；预检、参数错与异参不审计。
+        首次 O(U log U + P log P + K) 时间、O(U+P+K) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        # 仅执行查缓存：预检不读不写缓存。
+        if mode == _FAULT_PLAN_MODE_EXEC:
+            cached = self._fault_plan_cache.get(key)
+            if cached is not None:
+                # 重放：不演算、不提交，仅按缓存返回或重抛。
+                c_mode, c_steps, c_now_ms, outcome = cached
+                if not _strict_equal(
+                    (mode, steps, now_ms), (c_mode, c_steps, c_now_ms)
+                ):
+                    raise ValueError(f"key {key!r} reused with different parameters")
+                # 首果（成功/KeyError）的同参重放入链记“重放成功”或“重放”
+                # 加异常类名，原序号指认首次事件。
+                origin = self._fault_plan_chain_index.get(key)
+                if origin is not None:
+                    if outcome[0] == "ok":
+                        chain_result = "重放成功"
+                    else:
+                        chain_result = "重放" + outcome[1][0].__name__
+                    self._chain_append(
+                        key,
+                        _FAULT_PLAN_OP,
+                        "",
+                        chain_result,
+                        now_ms,
+                        origin,
+                        self._fault_plan_chain_index,
+                    )
+                if outcome[0] == "ok":
+                    return outcome[1]
+                exc_class, exc_args = outcome[1]
+                raise _replay_exception(exc_class, exc_args)
+
+        # 参数错（TypeError/ValueError）不缓存、不审计，失败不改任何状态。
+        self._validate_fault_plan_params(mode, steps, now_ms)
+
+        # 类型、结构、取值全过后方查池存在：未知池 KeyError；执行缓存并审计，
+        # 预检不缓存、不审计。
+        for domain, target, _op, _value in steps:
+            if domain == _FAULT_PLAN_DOMAIN_POOL and target not in self._pools:
+                exc = KeyError(f"unknown pool: {target!r}")
+                if mode == _FAULT_PLAN_MODE_EXEC:
+                    self._fault_plan_cache[key] = (
+                        mode,
+                        steps,
+                        now_ms,
+                        ("err", (type(exc), exc.args)),
+                    )
+                    self._chain_append(
+                        key,
+                        _FAULT_PLAN_OP,
+                        "",
+                        type(exc).__name__,
+                        now_ms,
+                        index=self._fault_plan_chain_index,
+                    )
+                raise exc
+
+        # 全验后演算新三域状态：后端变更清退避、留失败计数，未列域不变。
+        until = self._fault_until
+        backoff = self._backoff
+        pool_fault = dict(self._pool_fault)
+        timeout_at = self._timeout_at
+        backend_changed = False
+        for domain, target, op, value in steps:
+            if domain == _FAULT_PLAN_DOMAIN_BACKEND:
+                until = now_ms + value if op == _OP_INJECT else 0
+                backend_changed = True
+            elif domain == _FAULT_PLAN_DOMAIN_POOL:
+                if op == _OP_INJECT:
+                    pool_fault[target] = now_ms + value
+                else:
+                    pool_fault.pop(target, None)
+            else:
+                timeout_at = value if op == _OP_INJECT else None
+        if backend_changed:
+            backoff = {}
+
+        result = (
+            json.dumps(
+                self._fault_payload_of(
+                    now_ms, until, backoff, self._fault_fail, pool_fault, timeout_at
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+        if mode == _FAULT_PLAN_MODE_DRY:
+            # 预检只读：不提交、不缓存、不审计。
+            return result
+
+        # 执行：原子提交三域，缓存首果并写审计。
+        self._fault_until = until
+        if backend_changed:
+            self._backoff = {}
+        self._pool_fault = pool_fault
+        self._timeout_at = timeout_at
+        self._fault_plan_cache[key] = (mode, steps, now_ms, ("ok", result))
+        self._chain_append(
+            key,
+            _FAULT_PLAN_OP,
+            "",
+            "成功",
+            now_ms,
+            index=self._fault_plan_chain_index,
+        )
+        return result
+
+    @staticmethod
+    def _validate_fault_plan_params(mode, steps, now_ms):
+        """校验 fault_plan 三参数（key 已由调用方校验）：类型错先于结构/值错。
+
+        mode 限预检/执行；steps 为 1..1000 项 tuple，每项为 (domain, target,
+        op, value) 四元 tuple：domain/op/target 为 str，domain 限后端/池/
+        超时，op 限注入/恢复；后端、超时 target 须为 "" 且各至多一项，池
+        target 沿用凭据约束且互异；后端/池注入 value 为非 bool 正 int，超时
+        注入为非 bool int 且 >= now_ms，恢复 value 须为 None（任何非 None
+        皆值错）；now_ms 为非 bool 非负 int。未知池由调用方查。
+        """
+        # 类型阶段：任一类型错先于任何结构/取值错抛出；元数错属结构错，
+        # 取值阶段统一抛。
+        if isinstance(mode, bool) or not isinstance(mode, str):
+            raise TypeError(f"mode must be a str, got {type(mode).__name__}")
+        if not isinstance(steps, tuple):
+            raise TypeError(f"steps must be a tuple, got {type(steps).__name__}")
+        for step in steps:
+            if not isinstance(step, tuple):
+                raise TypeError(
+                    f"step must be a tuple, got {type(step).__name__}"
+                )
+            if len(step) != 4:
+                continue
+            domain, target, op, value = step
+            if not isinstance(domain, str):
+                raise TypeError(
+                    f"domain must be a str, got {type(domain).__name__}"
+                )
+            if not isinstance(target, str):
+                raise TypeError(
+                    f"target must be a str, got {type(target).__name__}"
+                )
+            if not isinstance(op, str):
+                raise TypeError(f"op must be a str, got {type(op).__name__}")
+            if op == _OP_INJECT and (
+                isinstance(value, bool) or not isinstance(value, int)
+            ):
+                raise TypeError(
+                    f"value must be an int, got {type(value).__name__}"
+                )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 结构/取值阶段。
+        if mode not in (_FAULT_PLAN_MODE_DRY, _FAULT_PLAN_MODE_EXEC):
+            raise ValueError(f"mode must be one of 预检/执行, got {mode!r}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(steps) <= _FAULT_PLAN_MAX_STEPS):
+            raise ValueError(
+                f"steps must contain 1..{_FAULT_PLAN_MAX_STEPS} items, "
+                f"got {len(steps)}"
+            )
+        seen_backend = False
+        seen_timeout = False
+        seen_pools = set()
+        for step in steps:
+            if len(step) != 4:
+                raise ValueError(
+                    "step must be a 4-tuple (domain, target, op, value), "
+                    f"got {len(step)} items"
+                )
+            domain, target, op, value = step
+            if domain not in (
+                _FAULT_PLAN_DOMAIN_BACKEND,
+                _FAULT_PLAN_DOMAIN_POOL,
+                _FAULT_PLAN_DOMAIN_TIMEOUT,
+            ):
+                raise ValueError(
+                    f"domain must be one of 后端/池/超时, got {domain!r}"
+                )
+            if op not in (_OP_INJECT, _OP_RECOVER):
+                raise ValueError(f"op must be one of 注入/恢复, got {op!r}")
+            if domain == _FAULT_PLAN_DOMAIN_POOL:
+                _check_credential("target", target)
+                if target in seen_pools:
+                    raise ValueError(f"duplicate pool target: {target!r}")
+                seen_pools.add(target)
+            else:
+                if target != "":
+                    raise ValueError(
+                        f'target must be "" for {domain}, got {target!r}'
+                    )
+                if domain == _FAULT_PLAN_DOMAIN_BACKEND:
+                    if seen_backend:
+                        raise ValueError("duplicate 后端 step")
+                    seen_backend = True
+                else:
+                    if seen_timeout:
+                        raise ValueError("duplicate 超时 step")
+                    seen_timeout = True
+            if op == _OP_INJECT:
+                if domain == _FAULT_PLAN_DOMAIN_TIMEOUT:
+                    if value < now_ms:
+                        raise ValueError(
+                            f"value must be >= now_ms, got {value} < {now_ms}"
+                        )
+                elif value < 1:
+                    raise ValueError(f"value must be >= 1, got {value}")
+            elif value is not None:
+                raise ValueError(f"value must be None for 恢复, got {value!r}")
+
     def timeout_sweep(self, key, now_ms, limit=100):
         """清扫到期的在线会话与排队项，返回 LF 结尾的基线 JSON。
 
