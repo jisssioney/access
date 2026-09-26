@@ -261,6 +261,166 @@ class ConfigChangeRollbackTest(unittest.TestCase):
         self.assertEqual(second.exception.args, first.exception.args)
 
 
+class ConfigChangeUpgradeTest(unittest.TestCase):
+    V1 = json.dumps({
+        "版本": 1,
+        "会话": {"总数": 3, "每用户": 2, "空闲毫秒": 0, "租期毫秒": 7},
+        "地址池": {"CIDR": "10.9.0.0/24", "保留": ["10.9.0.1"],
+                   "静态": [["alice", "10.9.0.2"]]},
+    }, ensure_ascii=False)
+
+    def test_first_upgrade_returns_envelope_and_is_read_only(self):
+        s = make()
+        before = s.export_config()
+        out = s.config_change("U", "升级", self.V1, 100)
+        # 首调等同 upgrade_config(text, 5)，原字节返回升级包。
+        self.assertEqual(out, s.upgrade_config(self.V1, 5))
+        self.assertTrue(out.endswith("\n"))
+        self.assertNotIn(" ", out.strip())
+        doc = json.loads(out)
+        self.assertEqual(
+            list(doc), ["源版本", "目标版本", "改变", "摘要", "配置"]
+        )
+        self.assertEqual(doc["源版本"], 1)
+        self.assertEqual(doc["目标版本"], 5)
+        self.assertIs(doc["改变"], True)
+        self.assertIsInstance(doc["摘要"], str)
+        self.assertIsInstance(doc["配置"], dict)
+        # 只读：配置、运行态不变。
+        self.assertEqual(s.export_config(), before)
+        self.assertEqual(
+            ops(s), [(1, "配置升级", "", "成功", 0)]
+        )
+        self.assertTrue(s.verify_audit())
+        # 不产生回滚点。
+        with self.assertRaises(StateError):
+            s.rollback_config()
+
+    def test_upgrade_replay_returns_same_bytes_and_links_origin(self):
+        s = make()
+        direct = s.upgrade_config(self.V1, 5)
+        out1 = s.config_change("U", "升级", self.V1, 100)
+        # 外部改变配置与认证策略；重放不预检、不重跑，仍返回首果原字节。
+        loaded = json.loads(s.export_config())
+        loaded["会话"]["租期毫秒"] = 3
+        s.load_config(json.dumps(loaded, ensure_ascii=False))
+        out2 = s.config_change("U", "升级", self.V1, 100)
+        self.assertEqual(out1, direct)
+        self.assertEqual(out2, direct)
+        self.assertEqual(
+            ops(s),
+            [(1, "配置升级", "", "成功", 0),
+             (2, "配置升级", "", "重放成功", 1)],
+        )
+        self.assertTrue(s.verify_audit())
+
+    def test_upgrade_v5_changed_false(self):
+        s = make()
+        v5 = s.export_config()
+        doc = json.loads(s.config_change("V", "升级", v5, 0))
+        self.assertEqual(doc["源版本"], 5)
+        self.assertIs(doc["改变"], False)
+        self.assertEqual(ops(s), [(1, "配置升级", "", "成功", 0)])
+
+    def test_upgrade_invalid_json_audited_and_replayed(self):
+        s = make()
+        with self.assertRaises(ValueError):
+            s.config_change("bad", "升级", "{not json", 5)
+        self.assertEqual(ops(s)[0][:4], (1, "配置升级", "", "JSONDecodeError"))
+        with self.assertRaises(ValueError) as cm:
+            s.config_change("bad", "升级", "{not json", 5)
+        self.assertEqual(type(cm.exception).__name__, "JSONDecodeError")
+        self.assertEqual(
+            ops(s)[1], (2, "配置升级", "", "重放JSONDecodeError", 1)
+        )
+        self.assertTrue(s.verify_audit())
+
+    def test_upgrade_structural_value_error_class_name(self):
+        s = make()
+        with self.assertRaises(ValueError) as cm:
+            s.config_change("bad", "升级", "[1,2]", 0)
+        self.assertIs(type(cm.exception), ValueError)
+        self.assertEqual(ops(s), [(1, "配置升级", "", "ValueError", 0)])
+
+    def test_upgrade_bad_version_and_dup_keys_value_error(self):
+        s = make()
+        for i, bad in enumerate((
+            '{"版本":0}',
+            '{"版本":6}',
+            '{"版本":2,"版本":2}',
+        )):
+            with self.assertRaises(ValueError, msg=bad):
+                s.config_change(f"k{i}", "升级", bad, 0)
+
+    def test_upgrade_param_types(self):
+        s = make()
+        for i, bad in enumerate((1, True, None)):
+            with self.assertRaises(TypeError):
+                s.config_change(f"t{i}", "升级", bad, 0)
+        for i, bad in enumerate((True, 1.5, "0", None)):
+            with self.assertRaises(TypeError):
+                s.config_change(f"n{i}", "升级", self.V1, bad)
+        with self.assertRaises(TypeError):
+            s.config_change("u", "升级", None, 0)
+
+    def test_upgrade_op_value_and_negative_now(self):
+        s = make()
+        with self.assertRaises(ValueError):
+            s.config_change("op", "建立", None, 0)
+        with self.assertRaises(ValueError):
+            s.config_change("neg", "升级", self.V1, -1)
+
+    def test_upgrade_param_errors_cached_not_audited(self):
+        s = make()
+        with self.assertRaises(TypeError):
+            s.config_change("k", "升级", 1, 0)
+        with self.assertRaises(TypeError):
+            s.config_change("k", "升级", 1, 0)
+        self.assertEqual(ops(s), [])
+        with self.assertRaises(ValueError):
+            s.config_change("k", "升级", self.V1, 0)
+        self.assertEqual(ops(s), [])
+
+    def test_upgrade_different_params_value_error_not_audited(self):
+        s = make()
+        s.config_change("U", "升级", self.V1, 0)
+        other = json.dumps({
+            "版本": 2,
+            "会话": {"总数": 4, "每用户": 2, "空闲毫秒": 5000,
+                     "租期毫秒": 1000},
+            "地址池": [],
+        }, ensure_ascii=False)
+        with self.assertRaises(ValueError):
+            s.config_change("U", "升级", other, 0)
+        with self.assertRaises(ValueError):
+            s.config_change("U", "升级", self.V1, 1)
+        with self.assertRaises(ValueError):
+            s.config_change("U", "加载", self.V1, 0)
+        with self.assertRaises(ValueError):
+            s.config_change("U", "回滚", None, 0)
+        self.assertEqual(len(s._chain_events), 1)
+
+    def test_upgrade_exception_args_preserved_on_replay(self):
+        s = make()
+        with self.assertRaises(ValueError) as first:
+            s.config_change("e", "升级", "{bad", 0)
+        with self.assertRaises(ValueError) as second:
+            s.config_change("e", "升级", "{bad", 0)
+        self.assertEqual(second.exception.args, first.exception.args)
+
+    def test_upgrade_does_not_touch_runtime(self):
+        s = make()
+        r = json.loads(s.do("k1", "建立", "s1", ("alice", "pw"), 0))
+        self.assertEqual(r["地址"], "10.0.0.2")
+        before = s.export_config()
+        s.config_change("U", "升级", self.V1, 99999)
+        self.assertEqual(
+            json.loads(s.do("k2", "续租", "s1", None, 1))["地址"],
+            "10.0.0.2",
+        )
+        self.assertEqual(s.export_config(), before)
+
+
 class ConfigChangeChainIntegrationTest(unittest.TestCase):
     def test_separate_cache_and_index_domains(self):
         s = make()
