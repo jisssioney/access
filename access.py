@@ -32,6 +32,10 @@
 - Sessions.batch_offline 批量下线：按 key 独立重放缓存，首果（含参数异常）
   永久缓存；首次合法先老化，非原子逐项下线/未知、原子全存在才提交否则整批
   回滚（保留老化），不记审计或容量事件。
+  Sessions.config_change 配置加载/回滚幂等事务：按 key 独立域永久缓存余参与
+  首果（含参数错，参数错不审计），重放同型同参只认 (op, text)、每 key 仅
+  一次（now_ms 仅作重放事件时刻），不改配置，再次复用或异参 ValueError；
+  首次业务结果与那一次重放写防篡改审计链（配置加载/配置回滚，会话空串）。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -731,6 +735,12 @@ _BATCH_COMMIT = "提交"
 _BATCH_PARTIAL = "部分"
 _BATCH_ROLLBACK = "回滚"
 
+# config_change 配置变更操作与入防篡改审计链的操作名。
+_CONFIG_OP_LOAD = "加载"
+_CONFIG_OP_ROLLBACK = "回滚"
+_CONFIG_CHAIN_LOAD = "配置加载"
+_CONFIG_CHAIN_ROLLBACK = "配置回滚"
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -793,6 +803,21 @@ class Sessions:
     rollback_config 经同样校验恢复旧配置并清除回滚点，无回滚点抛 StateError。
     export/load/rollback 成功均返回 v4 配置 JSON，会话状态、期限、地址、租期与
     旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
+    config_change(key, op, text, now_ms) 为配置加载/回滚提供幂等事务与审计：
+    key 沿用凭据约束，op 须 str 且仅加载/回滚（加载 text 须 str、回滚 text
+    须 None），now_ms 须非 bool 非负 int，类型错 TypeError、值或模式错
+    ValueError；入参自身的参数错先于重放判定直接抛出且不审计，仅新 key 的
+    参数错入缓存。验 key 后以独立域永久缓存余参与首果：重放同型同参只认
+    (op, text)（now_ms 仅作重放事件时刻）、每 key 仅允许一次，重放不改
+    配置并返回或重抛首果，再次复用或异参 ValueError 且不审计。首次合法
+    分别执行既有 load_config(text)/rollback_config()，成功原样返回其 v4
+    LF 尾紧凑 JSON，配置非法 ValueError（JSON 解析错规范化为 ValueError）、
+    承载冲突 ResourceError、无回滚点 StateError，异常类型与 args 缓存。首次
+    业务结果与那一次同参重放均追加现有防篡改审计哈希链一项：操作配置加载/
+    配置回滚、会话空串，首次原序号 0、结果成功或异常类名，重放原序号指
+    首次事件、时刻取重放 now_ms、结果重放成功或重放加异常类名；除缓存与
+    审计外失败不改配置、回滚点、用户、会话、租约、队列、统计或故障态。
+    首次复杂度沿既有接口，重放 O(1) 时空。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
     会话所绑模板做令牌桶加配额计量：通过则提交累计，超限取模板动作
@@ -989,6 +1014,15 @@ class Sessions:
         # batch_offline 批量下线的重放缓存，与 do/meter/capacity/fault/
         # pool_fault/timeout_fault 分域：key -> (sids, now_ms, atomic, outcome)。
         self._batch_offline_cache = {}
+        # config_change 配置变更的重放缓存与原序号索引，与 do/meter/capacity/
+        # fault/pool_fault/timeout_fault/batch_offline 分域：
+        # key -> (op, text, outcome)。重放同型同参只认 (op, text)（now_ms 仅
+        # 作重放事件时刻），且每 key 仅允许一次重放，已重放记于
+        # _config_change_replayed；成功或业务异常均入审计链，参数异常仅缓存
+        # 不入链。
+        self._config_change_cache = {}
+        self._config_change_replayed = set()
+        self._config_change_chain_index = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -3880,6 +3914,149 @@ class Sessions:
         self._rollback = None
         self._install_spec(spec, new_pools)
         return self.export_config()
+
+    def config_change(self, key, op, text, now_ms):
+        """配置加载/回滚的幂等事务入口，返回既有 v4 紧凑配置 JSON（LF 尾）。
+
+        key 沿用凭据约束；op 须为 str 且仅“加载/回滚”：加载时 text 须 str，
+        回滚时 text 须 None；now_ms 须为非 bool 非负 int。依次校验：类型错
+        抛 TypeError，值或模式错抛 ValueError。验 key 通过后以独立域（与
+        do/meter/capacity/fault/pool_fault/timeout_fault/batch_offline 分域）
+        永久缓存余参与首果：重放同型同参只认 (op, text)（now_ms 仅作重放事件
+        时刻），每 key 仅允许一次同参重放，重放不改配置、直接返回或重抛首果；
+        再次复用或异参均抛 ValueError。入参自身的类型/值/模式错先于重放判定
+        直接抛出且不审计，仅新 key 的参数错入缓存。
+
+        首次合法调用分别执行既有 load_config(text)/rollback_config()，成功
+        原样返回其 v4、LF 尾紧凑 JSON；配置非法抛 ValueError、承载冲突抛
+        ResourceError、无回滚点抛 StateError，异常类型与 args 缓存（JSON
+        解析错规范化为 ValueError）。除缓存与审计外，失败不得改变配置、回滚
+        点、用户、会话、租约、队列、统计或故障态。
+
+        首次业务结果（成功或上述业务异常）与那一次同参重放均向既有防篡改
+        审计哈希链追加一项：操作为“配置加载/配置回滚”、会话记空串；首次
+        原序号为 0，结果为“成功”或异常类名；重放原序号指认首次事件、时刻
+        取重放调用的 now_ms，结果为“重放成功”或“重放”加异常类名（如
+        “重放ValueError”），并返回或重抛首果。参数错与异参不审计。首次
+        复杂度沿既有 load/rollback 接口，重放 O(1) 时空。其余配置接口不变。
+        """
+        _check_credential("key", key)
+
+        # 无论重放与否先校验本次余参：入参自身的类型/值/模式错先于重放判定
+        # 直接抛出，不改缓存、不审计；仅新 key 的参数错入缓存。
+        try:
+            self._validate_config_change_params(op, text, now_ms)
+        except (TypeError, ValueError) as exc:
+            if key not in self._config_change_cache:
+                self._config_change_cache[key] = (
+                    op,
+                    text,
+                    ("err", (type(exc), exc.args)),
+                )
+            raise
+
+        cached = self._config_change_cache.get(key)
+        if cached is not None:
+            c_op, c_text, outcome = cached
+            # 重放同型同参只认 (op, text)，不含 now_ms；异参 ValueError 不审计。
+            if not _strict_equal((op, text), (c_op, c_text)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 每 key 仅允许一次同参重放；再次复用一律 ValueError、不审计。
+            if key in self._config_change_replayed:
+                raise ValueError(f"key {key!r} replayed more than once")
+            self._config_change_replayed.add(key)
+            # 仅首次业务结果（成功/业务异常）入链；参数错不在本域链索引中。
+            origin = self._config_change_chain_index.get(key)
+            if origin is not None:
+                chain_op = (
+                    _CONFIG_CHAIN_LOAD
+                    if c_op == _CONFIG_OP_LOAD
+                    else _CONFIG_CHAIN_ROLLBACK
+                )
+                if outcome[0] == "ok":
+                    chain_result = "重放成功"
+                else:
+                    chain_result = "重放" + outcome[1][0].__name__
+                self._chain_append(
+                    key,
+                    chain_op,
+                    "",
+                    chain_result,
+                    now_ms,
+                    origin,
+                    self._config_change_chain_index,
+                )
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 首次合法：业务异常（ValueError/ResourceError/StateError）亦缓存，
+        # 其类型与 args 供重放原样重抛；既有 load/rollback 失败本身不改任何
+        # 状态。JSONDecodeError 为 ValueError 构造参数特殊的子类，缓存时规范
+        # 化为普通 ValueError，审计结果与重抛一律为 ValueError。
+        try:
+            if op == _CONFIG_OP_LOAD:
+                result = self.load_config(text)
+            else:
+                result = self.rollback_config()
+        except (ValueError, ResourceError, StateError) as exc:
+            # ValueError 的特殊子类（如 JSONDecodeError）构造需额外参数，
+            # 无法以 (*args) 重建；沿代码库惯例规范化为普通 ValueError，
+            # 使首次与重放抛同型同 args，审计结果亦为 "ValueError"。
+            if isinstance(exc, ValueError) and type(exc) is not ValueError:
+                normalized = ValueError(str(exc))
+            else:
+                normalized = exc
+            self._config_change_cache[key] = (
+                op,
+                text,
+                ("err", (type(normalized), normalized.args)),
+            )
+            self._chain_append(
+                key,
+                _CONFIG_CHAIN_LOAD
+                if op == _CONFIG_OP_LOAD
+                else _CONFIG_CHAIN_ROLLBACK,
+                "",
+                type(normalized).__name__,
+                now_ms,
+                index=self._config_change_chain_index,
+            )
+            raise normalized from exc
+        self._config_change_cache[key] = (op, text, ("ok", result))
+        self._chain_append(
+            key,
+            _CONFIG_CHAIN_LOAD if op == _CONFIG_OP_LOAD else _CONFIG_CHAIN_ROLLBACK,
+            "",
+            "成功",
+            now_ms,
+            index=self._config_change_chain_index,
+        )
+        return result
+
+    @staticmethod
+    def _validate_config_change_params(op, text, now_ms):
+        """校验 config_change 余参：类型错先于值/模式错。
+
+        op 限加载/回滚；加载 text 须 str，回滚 text 须 None（任何非 None 皆
+        模式错）；now_ms 为非 bool 非负 int。
+        """
+        # 类型阶段：任一类型错先于任何值/模式错抛出。
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if op == _CONFIG_OP_LOAD and not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值/模式阶段。
+        if op not in (_CONFIG_OP_LOAD, _CONFIG_OP_ROLLBACK):
+            raise ValueError(f"op must be one of 加载/回滚, got {op!r}")
+        if op == _CONFIG_OP_ROLLBACK and text is not None:
+            raise ValueError(f"text must be None for 回滚, got {text!r}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
 
     def _audit_append(self, key, old, sid, result, now_ms, origin=0):
         """追加一条接管审计事件，O(1) 时空。
