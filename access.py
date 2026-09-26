@@ -12,6 +12,10 @@
   capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按入队序晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
   creplay 提供 capacity 状态检查点、事件哈希链校验与原子重放恢复。
+  runtime_checkpoint/runtime_restore 提供覆盖会话/租约、容量队列/事件与
+  共享 QoS 账本的运行态检查点（版本 1，摘要覆盖前四键）与按 key 原子
+  恢复（仅缓存成功，同摘要空操作，异摘要覆盖状态 StateError），供续租、
+  计量、推进一致恢复。
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
@@ -946,6 +950,17 @@ class Sessions:
     结果仅提交（全上线）/部分（非原子有失败）/回滚（原子有失败），
     项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务异常类名/
     回滚。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+    runtime_checkpoint(now_ms) 先验参再老化一次，输出运行态检查点基线
+    JSON（LF 尾）：顶层键序版本/时刻/容量/配额/摘要，版本 1，容量沿用
+    同刻 clog 对象契约（时刻等于顶层）、配额沿用同刻 quota_checkpoint
+    对象契约，摘要为前四键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写
+    值；覆盖会话/租约、容量队列/事件与共享 QoS 账本。
+    runtime_restore(key, text) 校验并原子恢复上述运行态：key 沿用凭据、
+    text 须 str（类型错 TypeError）；JSON/重键/键序/结构/类型/值/排序、
+    版本/摘要/时刻错均 ValueError，用户/模板/池址/令牌/容量或引用不承载
+    ResourceError，目标有不同摘要的覆盖状态 StateError；全验后原子替换
+    并返回规范包，同摘要空操作，失败不改运行态、配置、缓存、审计；仅
+    缓存成功，同 key 同型同 text 重放无副作用，异参 ValueError；不审计。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1053,6 +1068,9 @@ class Sessions:
         # quota_restore 共享 QoS 账本恢复的重放缓存，与其余各域独立：
         # key -> (text, outcome)；仅首次成功缓存，失败（含参数错）不占 key。
         self._quota_restore_cache = {}
+        # runtime_restore 运行态检查点恢复的重放缓存，与其余各域独立：
+        # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）不占 key。
+        self._runtime_restore_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -3867,6 +3885,83 @@ class Sessions:
             ]
             heapq.heapify(pool.free)
 
+    def _checkpoint_carry_leases(self, sessions, queued):
+        """检查点承载力校验（ResourceError）：用户注册（墓碑仍归属已注册
+        用户）、全局/单用户上限（仅计在线/挂起，墓碑不计容量）、池与地址
+        （墓碑不建租约）。sessions/queued 为 _parse_checkpoint 的规范化行；
+        通过则返回 pool -> {ip_int: sid} 的承载租约表，供重建全部池租约。
+        """
+        for row in sessions:
+            if row["用户"] not in self._auth:
+                raise ResourceError(
+                    f"checkpoint references unregistered user: {row['用户']!r}"
+                )
+        for row in queued:
+            if row["用户"] not in self._auth:
+                raise ResourceError(
+                    f"checkpoint references unregistered user: {row['用户']!r}"
+                )
+        live_sessions = [
+            row for row in sessions if row["状态"] != _STATE_OFFLINE
+        ]
+        if len(live_sessions) > self._total:
+            raise ResourceError(
+                f"total session limit {self._total} below "
+                f"{len(live_sessions)} sessions"
+            )
+        per_user = {}
+        for row in live_sessions:
+            user = row["用户"]
+            per_user[user] = per_user.get(user, 0) + 1
+        for user, count in per_user.items():
+            if count > self._per:
+                raise ResourceError(
+                    f"per-user session limit {self._per} below {count} sessions "
+                    f"for {user!r}"
+                )
+        # pool -> ip_int -> sid：同址重复占用即不可承载。
+        pool_usable = {}
+
+        def usable_of(pool_id):
+            usable = pool_usable.get(pool_id)
+            if usable is None:
+                usable = {
+                    int(host)
+                    for host in ipaddress.IPv4Network(self._pools[pool_id].cidr).hosts()
+                }
+                pool_usable[pool_id] = usable
+            return usable
+
+        required_leases = {}
+        for row in sessions:
+            if row["池"] == "":
+                continue
+            pool = self._pools.get(row["池"])
+            if pool is None:
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
+                    f"no pool {row['池']!r}"
+                )
+            ip_int = _check_ip("会话.地址", row["地址"])
+            if ip_int not in usable_of(row["池"]) or ip_int in pool.reserved:
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
+                    f"address {row['地址']} not usable in pool {row['池']!r}"
+                )
+            if ip_int in pool.static_ips and pool.static.get(row["用户"]) != ip_int:
+                raise ResourceError(
+                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
+                    f"address {row['地址']} is static for another user"
+                )
+            pool_leases = required_leases.setdefault(row["池"], {})
+            if ip_int in pool_leases:
+                raise ResourceError(
+                    f"address {row['地址']} in pool {row['池']!r} rented by "
+                    f"{pool_leases[ip_int]!r} and {row['会话']!r}"
+                )
+            pool_leases[ip_int] = row["会话"]
+        return required_leases
+
     def creplay(self, text):
         """按检查点恢复所列会话（含下线墓碑）、租约、队列与 capacity 事件
         账本，返回检查点时刻 capacity_stats 的 LF 结尾 JSON。
@@ -3951,75 +4046,7 @@ class Sessions:
 
         # 承载力（ResourceError）：用户注册（墓碑仍归属已注册用户）、全局/单用户
         # 上限（仅计在线/挂起，墓碑不计容量）、池与地址（墓碑不建租约）。
-        for row in sessions:
-            if row["用户"] not in self._auth:
-                raise ResourceError(
-                    f"checkpoint references unregistered user: {row['用户']!r}"
-                )
-        for row in queued:
-            if row["用户"] not in self._auth:
-                raise ResourceError(
-                    f"checkpoint references unregistered user: {row['用户']!r}"
-                )
-        live_sessions = [
-            row for row in sessions if row["状态"] != _STATE_OFFLINE
-        ]
-        if len(live_sessions) > self._total:
-            raise ResourceError(
-                f"total session limit {self._total} below "
-                f"{len(live_sessions)} sessions"
-            )
-        per_user = {}
-        for row in live_sessions:
-            user = row["用户"]
-            per_user[user] = per_user.get(user, 0) + 1
-        for user, count in per_user.items():
-            if count > self._per:
-                raise ResourceError(
-                    f"per-user session limit {self._per} below {count} sessions "
-                    f"for {user!r}"
-                )
-        # pool -> ip_int -> sid：同址重复占用即不可承载。
-        pool_usable = {}
-
-        def usable_of(pool_id):
-            usable = pool_usable.get(pool_id)
-            if usable is None:
-                usable = {
-                    int(host)
-                    for host in ipaddress.IPv4Network(self._pools[pool_id].cidr).hosts()
-                }
-                pool_usable[pool_id] = usable
-            return usable
-
-        required_leases = {}
-        for row in sessions:
-            if row["池"] == "":
-                continue
-            pool = self._pools.get(row["池"])
-            if pool is None:
-                raise ResourceError(
-                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
-                    f"no pool {row['池']!r}"
-                )
-            ip_int = _check_ip("会话.地址", row["地址"])
-            if ip_int not in usable_of(row["池"]) or ip_int in pool.reserved:
-                raise ResourceError(
-                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
-                    f"address {row['地址']} not usable in pool {row['池']!r}"
-                )
-            if ip_int in pool.static_ips and pool.static.get(row["用户"]) != ip_int:
-                raise ResourceError(
-                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
-                    f"address {row['地址']} is static for another user"
-                )
-            pool_leases = required_leases.setdefault(row["池"], {})
-            if ip_int in pool_leases:
-                raise ResourceError(
-                    f"address {row['地址']} in pool {row['池']!r} rented by "
-                    f"{pool_leases[ip_int]!r} and {row['会话']!r}"
-                )
-            pool_leases[ip_int] = row["会话"]
+        required_leases = self._checkpoint_carry_leases(sessions, queued)
 
         # 全部校验通过：原子替换会话（含墓碑）、租约、队列、入队序游标与账本。
         new_sessions = {}
@@ -4062,6 +4089,256 @@ class Sessions:
         self._capacity_events = list(events)
         self._capacity_tail = events[-1][6] if events else "0" * 64
         return self.capacity_stats(now_ms)
+
+    def _runtime_payload(self, now_ms):
+        """组装运行态检查点文档 dict（顶层键序：版本/时刻/容量/配额/摘要）。
+
+        容量为同刻 clog 对象（其时刻等于顶层时刻），配额为同刻
+        quota_checkpoint 对象；摘要为前四键紧凑 JSON（无 LF）UTF-8 字节的
+        sha256 小写十六进制串。纯渲染，不老化、不改态。
+        """
+        doc = {
+            "版本": 1,
+            "时刻": now_ms,
+            "容量": self._checkpoint_payload(now_ms),
+            "配额": json.loads(self._quota_checkpoint_text()),
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return doc
+
+    def _runtime_checkpoint_text(self, now_ms):
+        """运行态检查点的 LF 结尾紧凑 JSON（基线序列化，不老化、不改态）。"""
+        return json.dumps(
+            self._runtime_payload(now_ms), ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def runtime_checkpoint(self, now_ms):
+        """输出运行态检查点：先验参再老化一次，返回 LF 结尾的基线 JSON。
+
+        now_ms 为非 bool 非负 int，类型错 TypeError、取值错 ValueError。
+        顶层键序为“版本/时刻/容量/配额/摘要”，版本为 1；容量沿用同刻
+        clog 对象契约（时刻等于顶层时刻），配额沿用同刻 quota_checkpoint
+        对象契约；摘要为前四键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写
+        值。检查点覆盖会话/租约、容量队列/事件与共享 QoS 账本，供续租、
+        计量、推进一致恢复。时间 O(N log N)、空间 O(N)。
+        """
+        _check_int("now_ms", now_ms, 0)
+        self._age(now_ms)
+        return self._runtime_checkpoint_text(now_ms)
+
+    def runtime_restore(self, key, text):
+        """按运行态检查点原子替换会话/租约、容量队列/事件与共享 QoS 账本，
+        返回规范包的 LF 结尾基线 JSON。
+
+        key 沿用凭据约束，text 须为 str；类型错抛 TypeError。JSON 解析、
+        重键、键序/结构/类型/取值/排序、版本、摘要或时刻（容量时刻不等于
+        顶层时刻）非法均抛 ValueError；检查点引用未注册用户、未知模板、
+        池址不承载、令牌超桶容、全局/单用户上限或引用不承载抛
+        ResourceError；目标持有与包摘要不同的覆盖状态（待替换的会话、
+        队列、事件或现存模板账本）抛 StateError。全部校验通过后原子替换；
+        目标现状与包同摘要时为空操作（顺带对齐派生租约）。任何失败不改
+        运行态、配置、缓存与审计；不审计。重放缓存与各域独立：仅缓存首次
+        成功，同 key 同型同 text 重放无副作用，异参抛 ValueError。
+        时间 O(N log N)、空间 O(N)。
+        """
+        _check_credential("key", key)
+
+        cached = self._runtime_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text 后返回缓存规范包。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        now_ms, events, sessions, queued, quota_rows, summary = (
+            self._parse_runtime_checkpoint(text)
+        )
+
+        # 同摘要（以当前实况、不老化重算规范化前四键）：会话（含墓碑）、队列、
+        # 账本与现存模板账本已与检查点逐字段一致，空操作不替换；租约表为在租
+        # 会话的派生态，顺带对齐。
+        if self._runtime_payload(now_ms)["摘要"] == summary:
+            live_leases = {}
+            for sid, session in self._sessions.items():
+                if session["ip"] is not None:
+                    live_leases.setdefault(session["pool"], {})[session["ip"]] = sid
+            self._rebuild_pool_leases(live_leases)
+            result = self._runtime_checkpoint_text(now_ms)
+            self._runtime_restore_cache[key] = (text, result)
+            return result
+
+        # 承载力（ResourceError）：容量部分沿 creplay 口径（用户、全局/单用户
+        # 上限、池址）；配额部分沿 quota_restore 口径（用户、模板、令牌桶容，
+        # 本题归为不承载 ResourceError）。
+        required_leases = self._checkpoint_carry_leases(sessions, queued)
+        for user, template_id, _used, _last, tokens in quota_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"runtime checkpoint references unregistered user: {user!r}"
+                )
+            template = self._templates.get(template_id)
+            if template is None:
+                raise ResourceError(
+                    f"runtime checkpoint references unknown template: "
+                    f"{template_id!r}"
+                )
+            if tokens > (template[0] + template[1]) * 1000:
+                raise ResourceError(
+                    f"令牌 for {(user, template_id)!r} exceeds template bucket "
+                    f"capacity {(template[0] + template[1]) * 1000}"
+                )
+
+        # 覆盖状态（StateError）：目标持有待替换的会话（含墓碑）、排队项、
+        # 事件或现存模板账本，且摘要与包不同（同摘要已在上方空操作返回）。
+        if (
+            self._sessions
+            or self._capacity_queue
+            or self._capacity_events
+            or any(
+                template_id in self._templates
+                for _user, template_id in self._meter_ledgers
+            )
+        ):
+            raise StateError(
+                "current runtime state diverges from checkpoint 摘要"
+            )
+
+        # 全部校验通过：原子替换会话（含墓碑）、租约、队列、入队序游标、
+        # 事件账本与现存模板账本；已删模板的历史账本原样保留。
+        new_sessions = {}
+        for row in sessions:
+            if row["池"] == "":
+                pool_id = None
+                ip_int = None
+            else:
+                pool_id = row["池"]
+                ip_int = _check_ip("会话.地址", row["地址"])
+            new_sessions[row["会话"]] = {
+                "user": row["用户"],
+                "state": row["状态"],
+                "deadline": row["期限"],
+                "ip": ip_int,
+                "lease": row["租期"],
+                "pool": pool_id,
+            }
+        self._sessions = new_sessions
+        # 以承载租约重建全部池（租约表与空闲堆为在租会话的派生态）。
+        self._rebuild_pool_leases(required_leases)
+        self._capacity_queue = {
+            row["会话"]: [
+                row["用户"],
+                row["申请时刻"],
+                row["等待"],
+                row["截止"],
+                row["入队序"],
+            ]
+            for row in queued
+        }
+        self._queue_order = [row["会话"] for row in queued]
+        # 入队序计数取账本中历次排队事件的最大序（消费不回收序号）。
+        self._queue_seq = max(
+            (order for _s, _t, _sid, verdict, order, _p, _h in events
+             if verdict == _CAP_QUEUED),
+            default=0,
+        )
+        self._capacity_events = list(events)
+        self._capacity_tail = events[-1][6] if events else "0" * 64
+        new_ledgers = {
+            ledger_key: ledger
+            for ledger_key, ledger in self._meter_ledgers.items()
+            if ledger_key[1] not in self._templates
+        }
+        for user, template_id, used, last, tokens in quota_rows:
+            new_ledgers[(user, template_id)] = [used, last, tokens]
+        self._meter_ledgers = new_ledgers
+
+        result = self._runtime_checkpoint_text(now_ms)
+        self._runtime_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_runtime_checkpoint(self, text):
+        """解析并全量校验运行态检查点文本，返回 (时刻, 事件七元组, 会话行,
+        排队行, 配额行, 摘要)；任何文本非法均抛 ValueError。
+
+        顶层须恰含“版本/时刻/容量/配额/摘要”且键序如此；版本为 1，时刻为
+        非 bool 非负 int，容量/配额分别沿用 clog/quota_checkpoint 对象契约
+        （经 _parse_checkpoint/_parse_quota_checkpoint 全量校验），容量时刻
+        须等于顶层时刻，摘要须为规范化前四键紧凑 JSON（无 LF）UTF-8 字节的
+        sha256 小写值（与原文排版无关）。仅做结构自洽校验；用户注册、模板
+        存在、令牌桶容、上限与池址承载力由 runtime_restore 判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"runtime checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("runtime checkpoint top level must be an object")
+        # 键集与键序：恰为“版本/时刻/容量/配额/摘要”且依此序（dict 保序）。
+        if list(doc) != ["版本", "时刻", "容量", "配额", "摘要"]:
+            raise ValueError(
+                "runtime checkpoint top-level keys must be "
+                "版本/时刻/容量/配额/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+        if not isinstance(doc["容量"], dict):
+            raise ValueError("容量 must be an object")
+        if not isinstance(doc["配额"], dict):
+            raise ValueError("配额 must be an object")
+
+        # 子文档重编码为紧凑 JSON 后沿用既有解析器全量校验（重键已在顶层
+        # 解析时拒绝；规范化行由解析器返回，与原文排版无关）。
+        cap_now, events, sessions, queued, state_hash = self._parse_checkpoint(
+            json.dumps(doc["容量"], ensure_ascii=False, separators=(",", ":"))
+        )
+        if cap_now != now_ms:
+            raise ValueError(
+                f"容量.时刻 must equal top-level 时刻 {now_ms}, got {cap_now}"
+            )
+        quota_rows = self._parse_quota_checkpoint(
+            json.dumps(doc["配额"], ensure_ascii=False, separators=(",", ":"))
+        )
+
+        # 摘要：用规范化行重建前四键（数值相等即与生成方基线逐字节一致）。
+        canonical_capacity = {
+            "时刻": cap_now,
+            "事件": [
+                {
+                    "序号": seq,
+                    "时刻": ev_now,
+                    "会话": sid,
+                    "结果": verdict,
+                    "入队序": order,
+                    "前哈希": prev_hash,
+                    "哈希": digest,
+                }
+                for seq, ev_now, sid, verdict, order, prev_hash, digest in events
+            ],
+            "会话": sessions,
+            "排队": queued,
+            "状态哈希": state_hash,
+        }
+        canonical_head = {
+            "版本": 1,
+            "时刻": now_ms,
+            "容量": canonical_capacity,
+            "配额": {"版本": 1, "账本": [list(row) for row in quota_rows]},
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical runtime checkpoint")
+        return now_ms, events, sessions, queued, quota_rows, summary
 
     @staticmethod
     def _render_capacity(sid, result, now_ms, deadline):
