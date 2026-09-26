@@ -72,6 +72,15 @@
   执行以 key 缓存首个成功/KeyError，同参重放原果、异参 ValueError；首果与
   重放写防篡改审计链（故障计划，会话空串，结果/原序号沿 config_change），
   预检与参数错不缓存、不审计；成功返回演算态 fault_checkpoint(now_ms) 包。
+- Sessions.fault_impact 只读评估计划：steps 沿用 fault_plan 的 1..1000 项
+  tuple 契约（无 key/mode），now_ms 为非 bool 非负 int；型/结构值/重复/未知池
+  分别抛 TypeError/ValueError/KeyError。不老化、不缓存、不审计、不改状态。
+  按 now_ms 取视图（到期在线归挂起；租约须在线且期限、租期均 > now_ms；到期
+  队项不计）：后端在 now_ms<演算截至时计全局四类，池同条件计本池在线/租约
+  （default 另计全队、挂起 0），超时在等待且触发 <=now_ms 时计全局在线/排队/
+  租约、挂起 0，否则行全 0；域行依次后端、升序注入池、超时，后端/超时目标
+  空串。顶层时刻/域/合计/摘要，合计为各行和（可重复），摘要为前三键紧凑
+  JSON UTF-8 字节的 sha256 小写值；LF 尾紧凑，同态同参同字节。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -1209,6 +1218,19 @@ class Sessions:
     审计链：操作“故障计划”、会话空串，首次结果“成功/KeyError”、原序号 0，
     重放结果“重放成功/重放KeyError”、原序号指认首次，审计时刻取 now_ms；预检、
     参数错不审计。首次 O(U log U+P log P+K) 时间、O(U+P+K) 空间，重放 O(1)。
+    fault_impact(steps, now_ms) 只读评估计划在 now_ms 视图下的影响：steps 沿用
+    fault_plan 的 1..1000 项 tuple 契约（无 key/mode），now_ms 为非 bool 非负
+    int；型/结构值/重复/未知池分别抛 TypeError/ValueError/KeyError。不老化、
+    不缓存、不审计、不改状态，演算仅在副本上推演三域生效态。按 now_ms 取视图：
+    到期在线归挂起；租约须在线且期限、租期均 > now_ms；到期队项不计。域行依次
+    为后端、按标识升序的注入池、超时，后端/超时目标为空串，行键序
+    域/目标/生效/在线/挂起/排队/租约；后端在 now_ms<演算截至时计全局四类，
+    池同条件计本池在线/租约（default 另计全队、挂起 0），超时在等待且触发
+    <=now_ms 时计全局在线/排队/租约、挂起 0，否则行全 0。顶层键序
+    时刻/域/合计/摘要，合计键序在线/挂起/排队/租约（各行和，域间可重复），
+    摘要为前三键紧凑 JSON UTF-8 字节的 sha256 小写值；ensure_ascii=False、
+    separators=(',',':')、LF 结尾，同态同参同字节。O(S+Q+P log P+K) 时间、
+    O(P+K) 辅助空间。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -3494,7 +3516,7 @@ class Sessions:
         return result
 
     @staticmethod
-    def _validate_fault_plan_params(mode, steps, now_ms):
+    def _validate_fault_plan_params(mode, steps, now_ms, check_mode=True):
         """校验 fault_plan 三参数：类型错先于结构/取值错。
 
         mode 限预检/执行；steps 须为 tuple，含 1..1000 项 4 元组
@@ -3503,11 +3525,12 @@ class Sessions:
         target 满足凭据约束且各项互异；后端/池注入 value 为非 bool 正 int，
         超时注入 value 为非 bool int 且 >= now_ms，恢复 value 须 None；
         now_ms 为非 bool 非负 int。池存在与否不在本结构校验内（演算阶段查，
-        未知池抛 KeyError）。
+        未知池抛 KeyError）。fault_impact 无 mode 参数，check_mode=False
+        时跳过 mode 的类型与取值校验。
         """
         # 类型阶段：容器/模式/各步前三字段/注入 value/now_ms 的任一类型错，
         # 先于任何长度、取值、重复等结构/值错抛出（沿 batch/pool_fault 约定）。
-        if isinstance(mode, bool) or not isinstance(mode, str):
+        if check_mode and (isinstance(mode, bool) or not isinstance(mode, str)):
             raise TypeError(f"mode must be a str, got {type(mode).__name__}")
         if not isinstance(steps, tuple):
             raise TypeError(f"steps must be a tuple, got {type(steps).__name__}")
@@ -3537,7 +3560,10 @@ class Sessions:
 
         # 取值/结构阶段：模式、时钟下界、步数、逐项长度/域/操作/target/
         # 唯一性/value 取值。
-        if mode not in (_FAULT_PLAN_MODE_PRECHECK, _FAULT_PLAN_MODE_EXECUTE):
+        if check_mode and mode not in (
+            _FAULT_PLAN_MODE_PRECHECK,
+            _FAULT_PLAN_MODE_EXECUTE,
+        ):
             raise ValueError(
                 f"mode must be one of 预检/执行, got {mode!r}"
             )
@@ -3608,6 +3634,164 @@ class Sessions:
                     raise ValueError(f"value must be >= 1, got {value}")
             elif value is not None:
                 raise ValueError(f"value must be None for 恢复, got {value!r}")
+
+    def fault_impact(self, steps, now_ms):
+        """只读评估故障计划在 now_ms 视图下的影响，返回 LF 结尾紧凑 JSON。
+
+        steps 沿用 fault_plan 的 1..1000 项 (domain, target, op, value) tuple
+        契约（无 mode/key）；now_ms 为非 bool 非负 int。类型错 TypeError，
+        结构/取值/重复错 ValueError，池项引用未知池 KeyError。不老化、不缓存、
+        不审计、不改任何实例状态（演算仅在副本上进行）。
+
+        按 now_ms 取视图（口径同 runtime_stats）：在线会话期限 <= now_ms
+        归挂起；租约须在线且期限、租期均 > now_ms；截止 <= now_ms 的到期队项
+        不计排队。域行依次为后端、按标识 Unicode 升序的各注入池、超时；后端与
+        超时行目标恒为空串。行键序“域/目标/生效/在线/挂起/排队/租约”。
+        后端注入在 now_ms < 演算截至时生效，计全局四类计数，否则全 0；各池
+        注入在同条件下生效，仅计本池在线会话与本池有效租约，default 池另计
+        全队排队、挂起恒 0，未生效全 0；超时注入在仍等待（演算不触发）且
+        触发时刻 <= now_ms 时生效，计全局在线/排队/租约、挂起恒 0，否则全 0。
+        顶层键序“时刻/域/合计/摘要”：合计键序“在线/挂起/排队/租约”，为各
+        行对应值之和（域间可重复计数）；摘要为前三键紧凑 JSON（无 LF）UTF-8
+        字节的 sha256 小写值。同态同参逐字节相同。时间 O(S+Q+P log P+K)、
+        辅助空间 O(P+K)，S/Q/P/K 为会话数、队项数、注入池数、步骤数。
+        """
+        # steps/now_ms 沿用 fault_plan 契约（mode 位传预检但跳过其校验）。
+        self._validate_fault_plan_params(
+            _FAULT_PLAN_MODE_PRECHECK, steps, now_ms, check_mode=False
+        )
+
+        # 在副本上推演（与 fault_plan 同口径）：仅决定三域生效态；后端退避与
+        # 失败计数不影响影响评估，无需复制。未知池在演算阶段抛 KeyError。
+        new_until = self._fault_until
+        new_pool_fault = dict(self._pool_fault)
+        new_timeout_waiting = self._timeout_at is not None
+        new_timeout_at = self._timeout_at if new_timeout_waiting else 0
+        for domain, target, op, value in steps:
+            if domain == _FAULT_PLAN_DOMAIN_BACKEND:
+                if op == _OP_INJECT:
+                    new_until = now_ms + value
+                else:
+                    new_until = 0
+            elif domain == _FAULT_PLAN_DOMAIN_POOL:
+                if target not in self._pools:
+                    raise KeyError(f"unknown pool: {target!r}")
+                if op == _OP_INJECT:
+                    new_pool_fault[target] = now_ms + value
+                else:
+                    new_pool_fault.pop(target, None)
+            else:  # _FAULT_PLAN_DOMAIN_TIMEOUT
+                if op == _OP_INJECT:
+                    new_timeout_waiting = True
+                    new_timeout_at = value
+                else:
+                    new_timeout_waiting = False
+                    new_timeout_at = 0
+
+        # 会话表单扫：视图在线/挂起（在线但期限到者归挂起）、有效租约
+        # （持址、在线、期限与租期均 > now_ms）及按池在线/租约归集。池与址
+        # 同置同清，故 pool 非 None 即持址；视图在线但租期到者归本池在线而
+        # 非本池租约（在线、租约两列分计）。
+        global_online = 0
+        global_suspended = 0
+        global_leased = 0
+        pool_online = {}
+        pool_leased = {}
+        for session in self._sessions.values():
+            state = session["state"]
+            view_online = state == _STATE_ONLINE and session["deadline"] > now_ms
+            if view_online:
+                global_online += 1
+                pool_id = session["pool"]
+                if pool_id is not None:
+                    pool_online[pool_id] = pool_online.get(pool_id, 0) + 1
+            elif state == _STATE_OFFLINE:
+                # 下线墓碑不计任何影响行。
+                continue
+            else:
+                # 挂起，或在线但期限已到（视图归挂起）。
+                global_suspended += 1
+            if (
+                view_online
+                and session["ip"] is not None
+                and session["lease"] > now_ms
+            ):
+                global_leased += 1
+                pool_leased[session["pool"]] = (
+                    pool_leased.get(session["pool"], 0) + 1
+                )
+
+        # 队列表单扫：截止 > now_ms 者计排队（到期不摘队、仅不计）。
+        global_queued = 0
+        for entry in self._capacity_queue.values():
+            if entry[3] > now_ms:
+                global_queued += 1
+
+        rows = []
+
+        def add_row(domain, target, active, online, suspended, queued, leased):
+            rows.append(
+                {
+                    "域": domain,
+                    "目标": target,
+                    "生效": active,
+                    "在线": online if active else 0,
+                    "挂起": suspended if active else 0,
+                    "排队": queued if active else 0,
+                    "租约": leased if active else 0,
+                }
+            )
+
+        # 后端行：now_ms < 演算截至时计全局四类。
+        backend_active = now_ms < new_until
+        add_row(
+            _FAULT_PLAN_DOMAIN_BACKEND,
+            "",
+            backend_active,
+            global_online,
+            global_suspended,
+            global_queued,
+            global_leased,
+        )
+
+        # 池行：仅列演算后仍在册的注入池（注入新增/覆盖、恢复移除），按标识
+        # Unicode 升序；在册池均为现存池（注入验未知、配置提交裁剪已删池）。
+        for pool_id in sorted(new_pool_fault):
+            active = now_ms < new_pool_fault[pool_id]
+            add_row(
+                _FAULT_PLAN_DOMAIN_POOL,
+                pool_id,
+                active,
+                pool_online.get(pool_id, 0),
+                0,
+                global_queued if pool_id == _DEFAULT_POOL_ID else 0,
+                pool_leased.get(pool_id, 0),
+            )
+
+        # 超时行：演算仅覆盖待触发态、从不触发清场，故仍等待且触发时刻已到
+        # （含同刻）时生效，计全局在线/排队/租约、挂起 0。
+        timeout_active = new_timeout_waiting and new_timeout_at <= now_ms
+        add_row(
+            _FAULT_PLAN_DOMAIN_TIMEOUT,
+            "",
+            timeout_active,
+            global_online,
+            0,
+            global_queued,
+            global_leased,
+        )
+
+        totals = {"在线": 0, "挂起": 0, "排队": 0, "租约": 0}
+        for row in rows:
+            totals["在线"] += row["在线"]
+            totals["挂起"] += row["挂起"]
+            totals["排队"] += row["排队"]
+            totals["租约"] += row["租约"]
+
+        doc = {"时刻": now_ms, "域": rows, "合计": totals}
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def timeout_sweep(self, key, now_ms, limit=100):
         """清扫到期的在线会话与排队项，返回 LF 结尾的基线 JSON。
