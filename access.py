@@ -850,6 +850,8 @@ _BACKEND_FAULT = "故障"
 _BACKEND_NORMAL = "正常"
 # backend_restore 入防篡改审计链的操作名。
 _BACKEND_RESTORE_OP = "后端恢复"
+# fault_restore 入防篡改审计链的操作名。
+_FAULT_RESTORE_OP = "故障恢复"
 
 # pool_fault 池演练状态：仅耗尽/正常。
 _POOL_EXHAUSTED = "耗尽"
@@ -1300,6 +1302,11 @@ class Sessions:
         # 不占 key。
         self._backend_restore_cache = {}
         self._backend_restore_chain_index = {}
+        # fault_restore 故障演练总检查点恢复的重放缓存与原序号索引，与其余
+        # 各域独立：key -> (text, 规范包, 时刻)；仅首次成功缓存，失败
+        # （含参数错）不占 key。
+        self._fault_restore_cache = {}
+        self._fault_restore_chain_index = {}
         # timeout_sweep 超时清扫的重放缓存，与其余各域独立：
         # key -> (now_ms, limit, 结果 JSON)；仅首次成功缓存，失败不占 key。
         self._timeout_sweep_cache = {}
@@ -3003,6 +3010,282 @@ class Sessions:
         self._timeout_at = None
         return [order for _sid, order in timed_out]
 
+    def _fault_payload(self, now_ms):
+        """组装故障演练总检查点文档 dict（顶层键序：
+        版本/时刻/后端/池/超时/摘要）。
+
+        后端对象键序“截至/退避/失败”，契约同 backend_checkpoint 同名字段
+        （退避按用户 Unicode 码点升序，项键序“用户/次数/下次”；失败键序
+        “故障/退避”）；池为全部池演练记录、按标识 Unicode 码点升序，项键序
+        “标识/截至”；超时键序“等待/触发”，未等待时触发为 0；摘要为前五键
+        紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。纯渲染：
+        不老化、不清到期项、不改态。
+        """
+        backend = {
+            "截至": self._fault_until,
+            "退避": [
+                {"用户": user, "次数": n, "下次": retry_at}
+                for user, (n, retry_at) in sorted(self._backoff.items())
+            ],
+            "失败": {"故障": self._fault_fail[0], "退避": self._fault_fail[1]},
+        }
+        pools = [
+            {"标识": pool_id, "截至": until}
+            for pool_id, until in sorted(self._pool_fault.items())
+        ]
+        waiting = self._timeout_at is not None
+        doc = {
+            "版本": 1,
+            "时刻": now_ms,
+            "后端": backend,
+            "池": pools,
+            "超时": {"等待": waiting, "触发": self._timeout_at if waiting else 0},
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return doc
+
+    def _fault_checkpoint_text(self, now_ms):
+        """故障演练总检查点的 LF 结尾紧凑 JSON（基线序列化，不老化、不改态）。"""
+        return json.dumps(
+            self._fault_payload(now_ms), ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def fault_checkpoint(self, now_ms):
+        """只读输出故障演练总检查点的 LF 结尾基线 JSON，覆盖后端故障、池演练
+        与超时演练三域；O((U+P) log(U+P)) 时间、O(U+P) 空间；不认证、不老化、
+        不清到期项、不审计、不动各域缓存。
+
+        now_ms 限非 bool 非负 int：类型错 TypeError、取值错 ValueError。
+        顶层依次为“版本/时刻/后端/池/超时/摘要”：版本恒为 1，时刻为
+        now_ms；后端为对象，键序“截至/退避/失败”，截至、退避与失败的
+        契约同 backend_checkpoint 同名字段；池为全部池演练记录的列表，
+        按标识 Unicode 码点升序，项键序“标识/截至”，标识为 str、截至为
+        >=0 的非 bool int；超时为对象，键序“等待/触发”，等待为 bool，
+        触发为 >=0 的非 bool int、未等待时恒为 0；摘要为前五键紧凑 JSON
+        （无 LF）UTF-8 字节的 sha256 小写值。同态同时刻查询逐字节相同。
+        """
+        _check_int("now_ms", now_ms, 0)
+        return self._fault_checkpoint_text(now_ms)
+
+    def fault_restore(self, key, text):
+        """按故障演练总检查点原子替换后端故障态、池演练与超时演练三域，
+        返回替换后检查点（规范包）的 LF 结尾基线 JSON。
+
+        key 沿用凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
+        text 非 str 抛 TypeError。JSON 解析、重键、键集/键序、结构、类型、
+        取值范围、排序或重复、版本或摘要错均抛 ValueError；退避项引用未
+        注册用户、池项引用未知池抛 ResourceError。全部校验通过后原子替换
+        故障截至、按用户退避、失败计数、池演练记录与待触发时刻（三者之外
+        的认证器、会话、租约、队列及各域缓存均不变）；任何失败不改实例、
+        不审计。不老化。
+
+        重放缓存与各域独立：仅缓存首次成功，同 key 同型同 text 重放不解析、
+        不重验、不替换，直接返回首次规范包原字节，异参抛 ValueError；失败
+        （含参数错）不占 key。首次成功及成功的同参重放写现有防篡改审计链：
+        操作“故障恢复”、会话记空串，首次结果“成功”、原序号 0，重放结果
+        “重放”、原序号指认首次；事件时刻取检查点“时刻”（接口无时钟参数）；
+        参数与文本异常不记。首次 O((U+P) log(U+P)) 时间、O(U+P) 空间，
+        重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._fault_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text，追加重放审计后
+            # 返回缓存规范包原字节；时刻随缓存保存，重放 O(1)。
+            c_text, result, c_now_ms = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            self._chain_append(
+                key,
+                _FAULT_RESTORE_OP,
+                "",
+                "重放",
+                c_now_ms,
+                self._fault_restore_chain_index[key],
+                self._fault_restore_chain_index,
+            )
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        now_ms, until, backoff_rows, fail, pool_rows, waiting, trigger = (
+            self._parse_fault_checkpoint(text)
+        )
+        for user, _n, _retry_at in backoff_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"fault checkpoint references unregistered user: {user!r}"
+                )
+        for pool_id, _pool_until in pool_rows:
+            if pool_id not in self._pools:
+                raise ResourceError(
+                    f"fault checkpoint references unknown pool: {pool_id!r}"
+                )
+
+        # 全验后原子替换三域：故障截至、退避（存活储为 (n, retry_at) 元组）、
+        # 失败计数、池演练记录与待触发时刻（未等待为 None）。
+        self._fault_until = until
+        self._backoff = {
+            user: (n, retry_at) for user, n, retry_at in backoff_rows
+        }
+        self._fault_fail = [fail[0], fail[1]]
+        self._pool_fault = {
+            pool_id: pool_until for pool_id, pool_until in pool_rows
+        }
+        self._timeout_at = trigger if waiting else None
+
+        result = self._fault_checkpoint_text(now_ms)
+        self._fault_restore_cache[key] = (text, result, now_ms)
+        self._chain_append(
+            key,
+            _FAULT_RESTORE_OP,
+            "",
+            "成功",
+            now_ms,
+            index=self._fault_restore_chain_index,
+        )
+        return result
+
+    def _parse_fault_checkpoint(self, text):
+        """解析并全量校验故障演练总检查点文本，返回
+        (时刻, 截至, 退避行三元组列表 (用户,次数,下次), (失败故障,失败退避),
+        池行二元组列表 (标识,截至), 等待, 触发)；任何文本非法均抛 ValueError。
+
+        顶层须恰含“版本/时刻/后端/池/超时/摘要”且键序如此；版本为 1，
+        时刻为非 bool 非负 int；后端键序“截至/退避/失败”，字段契约同
+        backend_checkpoint 同名字段（退避行按用户 Unicode 码点严格升序、
+        无重复）；池项键序“标识/截至”，标识为凭据约束串、截至为非 bool
+        非负 int，行按标识 Unicode 码点严格升序、无重复；超时键序
+        “等待/触发”，等待为 bool、触发为非 bool 非负 int 且未等待时须为
+        0；摘要须为规范化前五键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写
+        值（与原文排版无关）。仅做结构自洽校验；用户注册与池存在由调用方
+        判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"fault checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("fault checkpoint top level must be an object")
+        if list(doc) != ["版本", "时刻", "后端", "池", "超时", "摘要"]:
+            raise ValueError(
+                "fault checkpoint top-level keys must be "
+                "版本/时刻/后端/池/超时/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+
+        backend_raw = doc["后端"]
+        if not isinstance(backend_raw, dict) or list(backend_raw) != [
+            "截至",
+            "退避",
+            "失败",
+        ]:
+            raise ValueError("后端 keys must be 截至/退避/失败 in order")
+        until = self._cp_int(backend_raw["截至"], "后端.截至", 0)
+
+        backoff_raw = backend_raw["退避"]
+        if not isinstance(backoff_raw, list):
+            raise ValueError("后端.退避 must be a list")
+        backoff_rows = []
+        last_user = None
+        for index, item in enumerate(backoff_raw, start=1):
+            if not isinstance(item, dict) or list(item) != ["用户", "次数", "下次"]:
+                raise ValueError(
+                    f"backoff {index} keys must be 用户/次数/下次 in order"
+                )
+            user = self._cp_str(item["用户"], "后端.退避.用户")
+            n = item["次数"]
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise ValueError(
+                    f"后端.退避.次数 must be an int, got {type(n).__name__}"
+                )
+            if n <= 0:
+                raise ValueError(f"后端.退避.次数 must be > 0, got {n}")
+            retry_at = self._cp_int(item["下次"], "后端.退避.下次", 0)
+            if last_user is not None and user <= last_user:
+                raise ValueError(
+                    "backoff rows must be strictly sorted by 用户 ascending "
+                    "with no duplicates"
+                )
+            last_user = user
+            backoff_rows.append((user, n, retry_at))
+
+        fail_raw = backend_raw["失败"]
+        if not isinstance(fail_raw, dict) or list(fail_raw) != ["故障", "退避"]:
+            raise ValueError("失败 keys must be 故障/退避 in order")
+        fault_fail = self._cp_int(fail_raw["故障"], "失败.故障", 0)
+        backoff_fail = self._cp_int(fail_raw["退避"], "失败.退避", 0)
+
+        pools_raw = doc["池"]
+        if not isinstance(pools_raw, list):
+            raise ValueError("池 must be a list")
+        pool_rows = []
+        last_pool = None
+        for index, item in enumerate(pools_raw, start=1):
+            if not isinstance(item, dict) or list(item) != ["标识", "截至"]:
+                raise ValueError(f"pool {index} keys must be 标识/截至 in order")
+            pool_id = self._cp_str(item["标识"], "池.标识")
+            pool_until = self._cp_int(item["截至"], "池.截至", 0)
+            if last_pool is not None and pool_id <= last_pool:
+                raise ValueError(
+                    "pool rows must be strictly sorted by 标识 ascending "
+                    "with no duplicates"
+                )
+            last_pool = pool_id
+            pool_rows.append((pool_id, pool_until))
+
+        timeout_raw = doc["超时"]
+        if not isinstance(timeout_raw, dict) or list(timeout_raw) != ["等待", "触发"]:
+            raise ValueError("超时 keys must be 等待/触发 in order")
+        waiting = timeout_raw["等待"]
+        if not isinstance(waiting, bool):
+            raise ValueError(
+                f"超时.等待 must be a bool, got {type(waiting).__name__}"
+            )
+        trigger = self._cp_int(timeout_raw["触发"], "超时.触发", 0)
+        if not waiting and trigger != 0:
+            raise ValueError(f"超时.触发 must be 0 when 等待 is false, got {trigger}")
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        # 摘要：用规范化值重建前五键（数值相等即与生成方基线逐字节一致）。
+        canonical_head = {
+            "版本": 1,
+            "时刻": now_ms,
+            "后端": {
+                "截至": until,
+                "退避": [
+                    {"用户": user, "次数": n, "下次": retry_at}
+                    for user, n, retry_at in backoff_rows
+                ],
+                "失败": {"故障": fault_fail, "退避": backoff_fail},
+            },
+            "池": [
+                {"标识": pool_id, "截至": pool_until}
+                for pool_id, pool_until in pool_rows
+            ],
+            "超时": {"等待": waiting, "触发": trigger},
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical fault checkpoint")
+        return (
+            now_ms,
+            until,
+            backoff_rows,
+            (fault_fail, backoff_fail),
+            pool_rows,
+            waiting,
+            trigger,
+        )
     def timeout_sweep(self, key, now_ms, limit=100):
         """清扫到期的在线会话与排队项，返回 LF 结尾的基线 JSON。
 
