@@ -12,15 +12,15 @@ def make(pool=("10.0.0.0/24", ("10.0.0.9",), (("alice", "10.0.0.2"),))):
 
 
 class ConfigTest(unittest.TestCase):
-    def test_export_v4_key_order_and_sorting(self):
+    def test_export_v5_key_order_and_sorting(self):
         s = make()
         s.add_pool("bpool", ("192.168.0.0/24", ("192.168.0.5", "192.168.0.3"),
                              (("zoe", "192.168.0.8"), ("amy", "192.168.0.9"))))
         out = s.export_config()
         self.assertTrue(out.endswith("\n"))
         doc = json.loads(out)
-        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量"])
-        self.assertEqual(doc["版本"], 4)
+        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"])
+        self.assertEqual(doc["版本"], 5)
         self.assertEqual(list(doc["会话"]), ["总数", "每用户", "空闲毫秒", "租期毫秒"])
         self.assertEqual(doc["会话"], {"总数": 4, "每用户": 2, "空闲毫秒": 5000, "租期毫秒": 1000})
         self.assertEqual([p["标识"] for p in doc["地址池"]], ["bpool", "default"])
@@ -37,8 +37,11 @@ class ConfigTest(unittest.TestCase):
         # 容量默认 1024 项、不限等待
         self.assertEqual(list(doc["容量"]), ["队列上限", "最大等待毫秒"])
         self.assertEqual(doc["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
+        # 认证即认证器当前策略
+        self.assertEqual(list(doc["认证"]), ["最大失败", "锁定毫秒"])
+        self.assertEqual(doc["认证"], {"最大失败": 3, "锁定毫秒": 1000})
         # 紧凑分隔符
-        self.assertIn('"版本":4,', out)
+        self.assertIn('"版本":5,', out)
         self.assertNotIn(" ", out.strip())
 
     def test_export_zero_pools(self):
@@ -67,7 +70,7 @@ class ConfigTest(unittest.TestCase):
         }, ensure_ascii=False)
         out = s.load_config(v1)
         doc = json.loads(out)
-        self.assertEqual(doc["版本"], 4)
+        self.assertEqual(doc["版本"], 5)
         self.assertEqual(doc["会话"], {"总数": 3, "每用户": 2, "空闲毫秒": 0, "租期毫秒": 7})
         self.assertEqual(len(doc["地址池"]), 1)
         self.assertEqual(doc["地址池"][0]["标识"], "default")
@@ -77,6 +80,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(doc["用户模板"], [])
         # v1 迁移：容量补默认 1024、0
         self.assertEqual(doc["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
+        # v1 迁移：认证补认证器当前两值
+        self.assertEqual(doc["认证"], {"最大失败": 3, "锁定毫秒": 1000})
         # 新租期作用于后续建立
         s._auth.add("alice", "pw")
         r = json.loads(s.do("k1", "建立", "s1", ("alice", "pw"), 0))
@@ -301,8 +306,8 @@ class QosTemplateTest(unittest.TestCase):
         s.load_config(make_v3(s))
         out = s.export_config()
         doc = json.loads(out)
-        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量"])
-        self.assertEqual(doc["版本"], 4)
+        self.assertEqual(list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"])
+        self.assertEqual(doc["版本"], 5)
         self.assertEqual([t["标识"] for t in doc["模板"]], ["basic", "gold"])
         t0 = doc["模板"][0]
         self.assertEqual(list(t0), ["标识", "限速", "突发", "配额", "超限"])
@@ -320,10 +325,11 @@ class QosTemplateTest(unittest.TestCase):
             "地址池": [],
         }, ensure_ascii=False)
         doc = json.loads(s.load_config(v2))
-        self.assertEqual(doc["版本"], 4)
+        self.assertEqual(doc["版本"], 5)
         self.assertEqual(doc["模板"], [])
         self.assertEqual(doc["用户模板"], [])
         self.assertEqual(doc["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
+        self.assertEqual(doc["认证"], {"最大失败": 3, "锁定毫秒": 1000})
 
     def test_load_template_value_errors(self):
         s = make()
@@ -440,6 +446,88 @@ class QosTemplateTest(unittest.TestCase):
         s.load_config(json.dumps(doc, ensure_ascii=False))
         with self.assertRaises(StateError):
             s.qos("s1")
+
+
+class AuthPolicyConfigTest(unittest.TestCase):
+    def _load_with_auth(self, s, auth_section):
+        doc = json.loads(s.export_config())
+        doc["认证"] = auth_section
+        return s.load_config(json.dumps(doc, ensure_ascii=False))
+
+    def test_load_applies_auth_policy_and_preserves_records(self):
+        s = make()
+        # 制造一条失败计数与未到期锁定之外的认证记录
+        self.assertEqual(s._auth.authenticate("alice", "bad", 0)[1], "denied")
+        out = self._load_with_auth(s, {"最大失败": 2, "锁定毫秒": 60000})
+        self.assertEqual(json.loads(out)["认证"], {"最大失败": 2, "锁定毫秒": 60000})
+        # 策略生效：失败计数保留，再错一次即按新策略锁定 60000ms
+        self.assertEqual(s._auth.authenticate("alice", "bad", 1)[1], "locked")
+        self.assertEqual(
+            s._auth.authenticate("alice", "pw", 2),
+            ("alice", "locked", 60001),
+        )
+        # 用户记录保留：锁到期后正确密码仍可通过
+        self.assertEqual(s._auth.authenticate("alice", "pw", 60001)[1], "ok")
+
+    def test_rollback_restores_auth_policy(self):
+        s = make()
+        self._load_with_auth(s, {"最大失败": 9, "锁定毫秒": 7})
+        self.assertEqual(s._auth.policy(), (9, 7))
+        out = s.rollback_config()
+        self.assertEqual(json.loads(out)["认证"], {"最大失败": 3, "锁定毫秒": 1000})
+        self.assertEqual(s._auth.policy(), (3, 1000))
+        with self.assertRaises(StateError):
+            s.rollback_config()
+
+    def test_failed_load_keeps_auth_policy(self):
+        s = make()
+        doc = json.loads(s.export_config())
+        doc["认证"] = {"最大失败": 0, "锁定毫秒": 7}
+        with self.assertRaises(ValueError):
+            s.load_config(json.dumps(doc, ensure_ascii=False))
+        self.assertEqual(s._auth.policy(), (3, 1000))
+        with self.assertRaises(StateError):
+            s.rollback_config()
+
+    def test_auth_value_errors(self):
+        s = make()
+        good = json.loads(s.export_config())
+
+        def bad(auth_section):
+            doc = json.loads(json.dumps(good, ensure_ascii=False))
+            doc["认证"] = auth_section
+            with self.assertRaises(ValueError, msg=repr(auth_section)):
+                s.load_config(json.dumps(doc, ensure_ascii=False))
+
+        # 缺键/多键/非对象
+        bad({"最大失败": 3})
+        bad({"最大失败": 3, "锁定毫秒": 1000, "多": 1})
+        bad(["最大失败", "锁定毫秒"])
+        # 类型错：非 int 或 bool
+        bad({"最大失败": True, "锁定毫秒": 1000})
+        bad({"最大失败": 3, "锁定毫秒": False})
+        bad({"最大失败": "3", "锁定毫秒": 1000})
+        bad({"最大失败": 3, "锁定毫秒": 1.5})
+        # 值域：最大失败须正数、锁定毫秒须非负
+        bad({"最大失败": 0, "锁定毫秒": 1000})
+        bad({"最大失败": -1, "锁定毫秒": 1000})
+        bad({"最大失败": 3, "锁定毫秒": -1})
+        # 全部失败：策略与回滚点不变
+        self.assertEqual(s._auth.policy(), (3, 1000))
+        with self.assertRaises(StateError):
+            s.rollback_config()
+
+    def test_v5_missing_auth_section_rejected(self):
+        s = make()
+        doc = json.loads(s.export_config())
+        del doc["认证"]
+        with self.assertRaises(ValueError):
+            s.load_config(json.dumps(doc, ensure_ascii=False))
+        # 版本 6 非法
+        doc = json.loads(s.export_config())
+        doc["版本"] = 6
+        with self.assertRaises(ValueError):
+            s.load_config(json.dumps(doc, ensure_ascii=False))
 
 
 if __name__ == "__main__":

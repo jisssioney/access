@@ -364,6 +364,30 @@ def _parse_config_capacity(doc):
     return queue_limit, max_wait
 
 
+def _parse_config_auth(doc):
+    """校验 v5 的认证节，返回 (最大失败, 锁定毫秒)。
+
+    认证须恰含“最大失败/锁定毫秒”，二者为非 bool int：最大失败 >= 1，
+    锁定毫秒 >= 0。结构、类型或值错均抛 ValueError。
+    """
+    raw = doc["认证"]
+    if not isinstance(raw, dict) or set(raw) != {"最大失败", "锁定毫秒"}:
+        raise ValueError("认证 keys must be exactly 最大失败/锁定毫秒")
+    max_fail = raw["最大失败"]
+    lock_ms = raw["锁定毫秒"]
+    if isinstance(max_fail, bool) or not isinstance(max_fail, int):
+        raise ValueError(
+            f"最大失败 must be an int, got {type(max_fail).__name__}"
+        )
+    if max_fail < 1:
+        raise ValueError(f"最大失败 must be >= 1, got {max_fail}")
+    if isinstance(lock_ms, bool) or not isinstance(lock_ms, int):
+        raise ValueError(f"锁定毫秒 must be an int, got {type(lock_ms).__name__}")
+    if lock_ms < 0:
+        raise ValueError(f"锁定毫秒 must be >= 0, got {lock_ms}")
+    return max_fail, lock_ms
+
+
 def _load_config_doc(text):
     """校验 text 为 str 并解析 JSON（拒重键），返回对象文档。
 
@@ -375,27 +399,36 @@ def _load_config_doc(text):
     return json.loads(text, object_pairs_hook=_unique_object)
 
 
-def _parse_config_doc(doc):
+def _parse_config_doc(doc, auth):
     """由已解析对象文档校验并迁移为规范化 spec；任何错均抛 ValueError。
 
     spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
-    capacity)，capacity 为 (队列上限, 最大等待毫秒)；pools 为按标识升序的
-    (标识, cidr, reserved, static) 元组，reserved/static 已规范化排序；
-    templates 为按标识升序的 (标识, 限速, 突发, 配额, 超限) 元组，
-    user_templates 为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为无
-    标识单池对象，迁移为 default 池；v2（版本=2）地址池为池对象列表；v3
-    （版本=3）增模板与用户模板；v4（版本=4）增容量背压（队列上限/最大等待
-    毫秒）。v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时容量补默认
-    (1024, 0)。重复/未知/缺失键、结构、值、引用或版本错均抛 ValueError。
+    capacity, auth)，capacity 为 (队列上限, 最大等待毫秒)，auth 为 (最大失败,
+    锁定毫秒)；pools 为按标识升序的 (标识, cidr, reserved, static) 元组，
+    reserved/static 已规范化排序；templates 为按标识升序的 (标识, 限速, 突发,
+    配额, 超限) 元组，user_templates 为按用户升序的 (user, 标识) 元组。v1
+    （版本=1）地址池为无标识单池对象，迁移为 default 池；v2（版本=2）地址池
+    为池对象列表；v3（版本=3）增模板与用户模板；v4（版本=4）增容量背压
+    （队列上限/最大等待毫秒）；v5（版本=5）增认证策略（最大失败/锁定毫秒）。
+    v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时容量补默认 (1024, 0)；v1-v4
+    迁移时认证补认证器当前两值 auth。重复/未知/缺失键、结构、值、引用或版本
+    错均抛 ValueError。
     """
     if not isinstance(doc, dict):
         raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3, 4):
-        raise ValueError(f"版本 must be 1, 2, 3 or 4, got {version}")
-    if version == 4:
+    if version not in (1, 2, 3, 4, 5):
+        raise ValueError(f"版本 must be 1, 2, 3, 4 or 5, got {version}")
+    if version == 5:
+        if set(doc) != {
+            "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"
+        }:
+            raise ValueError(
+                "config keys must be exactly 版本/会话/地址池/模板/用户模板/容量/认证"
+            )
+    elif version == 4:
         if set(doc) != {
             "版本", "会话", "地址池", "模板", "用户模板", "容量"
         }:
@@ -462,11 +495,14 @@ def _parse_config_doc(doc):
     else:
         # v1/v2 迁移：模板与用户模板均为空。
         templates, user_templates = (), ()
-    if version == 4:
+    if version >= 4:
         capacity = _parse_config_capacity(doc)
     else:
         # v1-v3 迁移：容量补默认 1024 项队列、不限等待。
         capacity = (_MAX_QUEUE, 0)
+    if version == 5:
+        auth = _parse_config_auth(doc)
+    # v1-v4 迁移：认证补认证器当前两值（形参 auth 即该默认值）。
     return (
         numbers["总数"],
         numbers["每用户"],
@@ -476,11 +512,12 @@ def _parse_config_doc(doc):
         templates,
         user_templates,
         capacity,
+        auth,
     )
 
 
 def _config_payload(spec):
-    """由规范化 spec 构建 export/升级共用的 v4 配置 payload（固定键序与排序）。"""
+    """由规范化 spec 构建 export/升级共用的 v5 配置 payload（固定键序与排序）。"""
     (
         total,
         per,
@@ -490,6 +527,7 @@ def _config_payload(spec):
         templates,
         user_templates,
         (queue_limit, max_wait_ms),
+        (max_fail, lock_ms),
     ) = spec
     pools = [
         {
@@ -526,11 +564,15 @@ def _config_payload(spec):
             "队列上限": queue_limit,
             "最大等待毫秒": max_wait_ms,
         },
+        "认证": {
+            "最大失败": max_fail,
+            "锁定毫秒": lock_ms,
+        },
     }
 
 
 def _compact_config(spec):
-    """spec 的 v4 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
+    """spec 的 v5 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
     return json.dumps(
         _config_payload(spec), ensure_ascii=False, separators=(",", ":")
     )
@@ -551,12 +593,12 @@ def _compact_envelope(source, target, changed, summary, config):
     )
 
 
-def _parse_upgrade_envelope(doc):
+def _parse_upgrade_envelope(doc, auth):
     """严格复核升级包对象，返回 (源版本, 目标版本, 改变, 摘要, spec)。
 
     文档须恰含“源版本/目标版本/改变/摘要/配置”五键（键序亦须如此），
-    源版本为 1..4 的非 bool int、目标版本恒为 4、改变为 bool 且等于
-    源版本 != 4、摘要为 str；配置须为能解析出 v4 spec 的对象，再将其
+    源版本为 1..5 的非 bool int、目标版本恒为 5、改变为 bool 且等于
+    源版本 != 5、摘要为 str；配置须为能解析出 v5 spec 的对象，再将其
     规范化重编码与文档原编码逐字节比对（拒键序/形态/值偏差），摘要须为
     规范配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写十六进制。任何不符
     均抛 ValueError。
@@ -581,8 +623,8 @@ def _parse_upgrade_envelope(doc):
     summary = doc["摘要"]
     if isinstance(source, bool) or not isinstance(source, int):
         raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
-    if source not in (1, 2, 3, 4):
-        raise ValueError(f"源版本 must be 1, 2, 3 or 4, got {source}")
+    if source not in (1, 2, 3, 4, 5):
+        raise ValueError(f"源版本 must be 1, 2, 3, 4 or 5, got {source}")
     if isinstance(target, bool) or not isinstance(target, int):
         raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
     if target != _CONFIG_VERSION:
@@ -599,12 +641,12 @@ def _parse_upgrade_envelope(doc):
     config = doc["配置"]
     if not isinstance(config, dict):
         raise ValueError(f"配置 must be a JSON object, got {type(config).__name__}")
-    spec = _parse_config_doc(config)
+    spec = _parse_config_doc(config, auth)
     canonical = _compact_config(spec)
     # 配置自 JSON 解析而来，再编码必成功；键序/排序/值偏差令两串不一致。
     original = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     if original != canonical:
-        raise ValueError("配置 must be a canonical v4 config object")
+        raise ValueError("配置 must be a canonical v5 config object")
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if summary != digest:
         raise ValueError("摘要 does not match the canonical config digest")
@@ -629,6 +671,15 @@ class Authenticator:
     def __contains__(self, user):
         """用户是否已注册（供配置引用校验）。"""
         return user in self._users
+
+    def policy(self):
+        """当前认证策略 (max_fail, lock_ms)，供配置导出与迁移默认值。"""
+        return (self._max_fail, self._lock_ms)
+
+    def set_policy(self, max_fail, lock_ms):
+        """替换认证策略数值；已注册用户的摘要、失败计数与锁定截止均保留。"""
+        self._max_fail = _check_int("max_fail", max_fail, 1)
+        self._lock_ms = _check_int("lock_ms", lock_ms, 0)
 
     def add(self, user, password):
         """注册新用户，返回 (user, "created", 0)。"""
@@ -742,7 +793,7 @@ _CAP_VERDICTS_WITH_ORDER = frozenset(
 )
 _MAX_QUEUE = 1024
 _MAX_QUEUE_LIMIT = 10000
-_CONFIG_VERSION = 4
+_CONFIG_VERSION = 5
 
 # fault 操作与后端状态。
 _OP_INJECT = "注入"
@@ -843,23 +894,26 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v4 配置 JSON（顶层键序
-    版本/会话/地址池/模板/用户模板/容量；会话与地址池沿用 v2，模板按标识升序、
-    用户模板按用户升序、容量为队列上限/最大等待毫秒）；upgrade_config(text,
-    target=4) 只读地把 v1..v4 配置升级为 v4 升级包 JSON（LF 尾紧凑；顶层序/型
-    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=4，
-    配置同 export_config 的 v4，摘要为配置紧凑编码 UTF-8 字节的 sha256
-    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 4，
-    源版本限 1..4，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
+    参数错与异参 key 重放不入链。export_config 导出 v5 配置 JSON（顶层键序
+    版本/会话/地址池/模板/用户模板/容量/认证；会话与地址池沿用 v2，模板按标识升序、
+    用户模板按用户升序、容量为队列上限/最大等待毫秒、认证为最大失败/锁定毫秒）；
+    upgrade_config(text,
+    target=5) 只读地把 v1..v5 配置升级为 v5 升级包 JSON（LF 尾紧凑；顶层序/型
+    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=5，
+    配置同 export_config 的 v5，摘要为配置紧凑编码 UTF-8 字节的 sha256
+    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 5，
+    源版本限 1..5，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
     迁移沿 load_config 既有规则（v1 单池改 default、v1/v2 补空模板与用户模板、
-    v1-v3 补容量 1024/0、v4 只规范化），升级不改任何实例状态；load_config
-    直载 v1..v4 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
+    v1-v3 补容量 1024/0、v1-v4 补认证器当前两值为认证、v5 只规范化），升级不改
+    任何实例状态；load_config
+    直载 v1..v5 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
     全验后原子替换并保存旧配置为唯一回滚点，升级包复核不符抛 ValueError，
     引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限、租约或
     队长承载不满足抛 ResourceError，失败不改配置、回滚点、会话、租约与运行态；
-    rollback_config 经同样校验恢复旧配置并清除回滚点，无回滚点抛 StateError。
-    export/load/rollback 成功均返回 v4 配置 JSON，会话状态、期限、地址、租期与
-    旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
+    rollback_config 经同样校验恢复旧配置（含认证策略）并清除回滚点，无回滚点抛 StateError。
+    export/load/rollback 成功均返回 v5 配置 JSON，会话状态、期限、地址、租期与
+    旧队项的等待/截止/入队序不受配置替换影响，认证器用户记录在配置提交与回滚中
+    保留，新配置仅作用于后续操作与查询。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
     会话用户所绑模板做令牌桶加配额计量，计量态为 (用户, 模板) 共享账本
@@ -4909,7 +4963,8 @@ class Sessions:
 
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
-        模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒)。"""
+        模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒)，
+        认证为认证器当前 (最大失败, 锁定毫秒)。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -4938,30 +4993,33 @@ class Sessions:
             templates,
             user_templates,
             (self._queue_limit, self._max_wait_ms),
+            self._auth.policy(),
         )
 
     def export_config(self):
-        """导出当前配置为 v4 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
+        """导出当前配置为 v5 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
 
-        顶层键序为“版本/会话/地址池/模板/用户模板/容量”；会话键序为“总数/
+        顶层键序为“版本/会话/地址池/模板/用户模板/容量/认证”；会话键序为“总数/
         每用户/空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为“标识/
         CIDR/保留/静态”，保留为按 IPv4 整数升序的串列表，静态为按用户再 IP
         升序的二元串列表；模板为按标识升序的列表，项键序为“标识/限速/突发/
         配额/超限”；用户模板为按用户升序的 [user, 标识] 二元串列表；容量键序
-        为“队列上限/最大等待毫秒”，0 分别表示不限队长与不限等待。
+        为“队列上限/最大等待毫秒”，0 分别表示不限队长与不限等待；认证键序为
+        “最大失败/锁定毫秒”，即认证器当前策略。
         """
         return _compact_config(self._current_spec()) + "\n"
 
-    def upgrade_config(self, text, target=4):
-        """只读地将 v1..v4 配置文本升级到 target（仅支持 4），返回升级包 JSON。
+    def upgrade_config(self, text, target=5):
+        """只读地将 v1..v5 配置文本升级到 target（仅支持 5），返回升级包 JSON。
 
         text 须为 str、target 须为非 bool int，否则抛 TypeError；源版本限
-        1..4 且 target 只许 4；JSON 解析、重复键、键缺失或未知、结构、值、
+        1..5 且 target 只许 5；JSON 解析、重复键、键缺失或未知、结构、值、
         引用或版本非法均抛 ValueError。迁移沿既有规则：v1 单池改 default，
-        v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0)，v4 只规范化。
+        v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0)，v1-v4 补认证器
+        当前两值为认证，v5 只规范化。
         返回基线格式的 LF 尾紧凑 JSON：顶层序/型为“源版本:int、目标版本:int、
-        改变:bool、摘要:str、配置:object”，改变 = 源版本 != 4；配置逐层键序、
-        类型与排序同 export_config() 的 v4；摘要为配置对象同法编码、去 LF 后
+        改变:bool、摘要:str、配置:object”，改变 = 源版本 != 5；配置逐层键序、
+        类型与排序同 export_config() 的 v5；摘要为配置对象同法编码、去 LF 后
         的 UTF-8 字节 sha256 小写值。升级只读，不触碰任何实例状态；时/空上界
         O(n log n)/O(n)。
         """
@@ -4974,7 +5032,7 @@ class Sessions:
         if target != _CONFIG_VERSION:
             raise ValueError(f"target must be {_CONFIG_VERSION}, got {target}")
         doc = _load_config_doc(text)
-        spec = _parse_config_doc(doc)
+        spec = _parse_config_doc(doc, self._auth.policy())
         source = doc["版本"]
         config_text = _compact_config(spec)
         summary = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
@@ -5003,6 +5061,7 @@ class Sessions:
             _templates,
             _user_templates,
             (queue_limit, _max_wait_ms),
+            _auth,
         ) = spec
         total_count = 0
         per_user = {}
@@ -5080,9 +5139,10 @@ class Sessions:
         return new_pools
 
     def _install_spec(self, spec, new_pools):
-        """原子替换配置数值、池表、QoS 模板与容量背压；会话状态、期限、地址、
-        租期及旧队项的等待、截止、入队序均不变。计量账本同标识保留 u/t 并
-        按新模板桶容截顶 c。"""
+        """原子替换配置数值、池表、QoS 模板、容量背压与认证策略；会话状态、期限、
+        地址、租期及旧队项的等待、截止、入队序均不变。计量账本同标识保留 u/t 并
+        按新模板桶容截顶 c。认证策略仅替换 max_fail/lock_ms 两值，认证器已注册
+        用户的摘要、失败计数与锁定截止全部保留。"""
         (
             total,
             per,
@@ -5092,6 +5152,7 @@ class Sessions:
             templates,
             user_templates,
             (queue_limit, max_wait_ms),
+            (max_fail, lock_ms),
         ) = spec
         self._total = total
         self._per = per
@@ -5105,6 +5166,7 @@ class Sessions:
         self._user_templates = dict(user_templates)
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
+        self._auth.set_policy(max_fail, lock_ms)
         # 计量账本：同标识保留 u/t 并按新模板桶容截顶 c；已删模板的账本原样
         # 保留（改绑后按新 (用户, 模板) 独立建账），加载/回滚失败不经过本方法。
         for (_ledger_user, ledger_template), ledger in self._meter_ledgers.items():
@@ -5120,23 +5182,25 @@ class Sessions:
         }
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v4 JSON。
+        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v5 JSON。
 
-        直载 v1..v4 配置，或加载 upgrade_config 产出的升级包；升级包须复核
+        直载 v1..v5 配置，或加载 upgrade_config 产出的升级包；升级包须复核
         键序、字段、配置规范形态与摘要，任一不符抛 ValueError。text 非 str
         抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、值、重复项或
         引用（用户模板引用未注册用户或未知模板标识）错抛 ValueError；上限、
         租约或队长承载不满足抛 ResourceError。全部校验通过后原子提交：失败
         不改配置、回滚点、会话、租约与运行态；成功不老化，会话与租约不变，
-        新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点。
+        认证器用户记录（摘要、失败计数、锁定截止）保留，仅认证策略两值随
+        配置替换，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点。
         """
         doc = _load_config_doc(text)
+        auth = self._auth.policy()
         if isinstance(doc, dict) and "源版本" in doc:
             _source, _target, _changed, _summary, spec = (
-                _parse_upgrade_envelope(doc)
+                _parse_upgrade_envelope(doc, auth)
             )
         else:
-            spec = _parse_config_doc(doc)
+            spec = _parse_config_doc(doc, auth)
         for user, _template_id in spec[6]:
             if user not in self._auth:
                 raise ValueError(
@@ -5148,10 +5212,11 @@ class Sessions:
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v4 JSON。
+        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v5 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点或
-        运行态，回滚点保留；成功清除回滚点，不老化。
+        运行态，回滚点保留；成功清除回滚点，不老化，认证策略一并恢复为回滚
+        点所存两值（认证器用户记录始终保留）。
         """
         spec = self._rollback
         if spec is None:
@@ -5163,7 +5228,7 @@ class Sessions:
 
     def config_change(self, key, op, text, now_ms):
         """配置加载/回滚的幂等事务入口，原样返回 load_config/rollback_config
-        的 v4、LF 尾紧凑 JSON。
+        的 v5、LF 尾紧凑 JSON。
 
         依次校验：key 沿用凭据约束；op 须为非 bool str 且仅“加载/回滚”；
         加载时 text 须为 str，回滚时 text 须为 None；now_ms 须为非 bool
