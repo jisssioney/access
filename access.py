@@ -745,6 +745,11 @@ _TIMEOUT_NORMAL = "正常"
 _TIMEOUT_OP_INJECT = "超时注入"
 _TIMEOUT_OP_RECOVER = "超时恢复"
 
+# timeout_storm 超时风暴多批清扫：每批固定取前 100 项，批数限 1..1000，
+# 类别码会话 0、排队 1（"会话"码点本就小于"排队"）。
+_STORM_BATCH_LIMIT = 100
+_TIMEOUT_STORM_OP = "超时风暴"
+
 # config_change 配置事务操作名与入防篡改审计链的操作名。
 _CONFIG_OP_LOAD = "加载"
 _CONFIG_OP_ROLLBACK = "回滚"
@@ -1074,6 +1079,11 @@ class Sessions:
         # timeout_sweep 超时清扫的重放缓存，与其余各域独立：
         # key -> (now_ms, limit, 结果 JSON)；仅首次成功缓存，失败不占 key。
         self._timeout_sweep_cache = {}
+        # timeout_storm 超时风暴多批清扫的重放缓存与原序号索引，与其余各域
+        # 独立：key -> (now_ms, batches, 结果 JSON)；仅首次成功缓存，失败
+        # （含参数错）不占 key。
+        self._timeout_storm_cache = {}
+        self._timeout_storm_chain_index = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -2548,6 +2558,173 @@ class Sessions:
         }
         output = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         self._timeout_sweep_cache[key] = (now_ms, limit, output)
+        return output
+
+    def timeout_storm(self, key, now_ms, batches=10):
+        """超时风暴多批清扫，返回 LF 结尾的基线 JSON。
+
+        key 沿用凭据约束；now_ms 为非 bool 非负 int，batches 为 1..1000 的
+        非 bool int：类型错 TypeError、取值错 ValueError。重放缓存与各域
+        独立：仅缓存首次成功，同 key 同型同参重放不清扫、不改态，直接返回
+        首次缓存原字节，异参抛 ValueError；任何失败（含参数错）不占 key。
+
+        不做普通老化。每批沿用 timeout_sweep 的候选与提交规则取前 100 项：
+        候选为期限非 0 且 <= now_ms 的在线会话（类别 0）与截止 <= now_ms
+        的排队项（类别 1），按（截止, 类别, 次序）升序取前 100，会话按
+        sid 升序、排队按入队序；会话挂起、期限清零并释放租约，排队项删除
+        并按处理序追加既有超时容量事件。无候选或已运行满 batches 批即停止，
+        故初始无候选时批次列表为空（允许 0 批），批次序号自 1 连续。各批
+        选定后即按上述规则提交；提交步骤皆不可失败且验参已毕，故逐批落库
+        对调用方仍为整次原子（无中途失败的部分提交），不晋升、不半释放。
+
+        顶层键序为“时刻/处理/剩余/完成/批次”：处理为各批处理项之和，剩余
+        取末批运行后仍候选的项数（无批为 0），完成当且仅当剩余为 0。批次
+        项键序为“序号/会话/排队/剩余/池”：会话/排队为本批两类项数，剩余为
+        该批后仍候选的项数；池按标识 Unicode 升序，项键序为“标识/占用/可用”，
+        占用取该批提交后租约数，可用取动态空闲加未租静态地址数。
+
+        首次成功写现有防篡改审计链：操作“超时风暴”、会话空串、结果
+        “完成/未完成”、原序号 0；同参重放写“重放”并指认首次序号，异常不记。
+        时间 O(B(S+Q+P))、空间 O(S+Q+BP)，B=batches。
+        """
+        _check_credential("key", key)
+
+        cached = self._timeout_storm_cache.get(key)
+        if cached is not None:
+            # 重放：不清扫、不改态，仅核对同型同参后返回首次缓存原字节。
+            c_now_ms, c_batches, result = cached
+            if not _strict_equal((now_ms, batches), (c_now_ms, c_batches)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 首次成功的同参重放入链记“重放”，原序号指认首次。
+            origin = self._timeout_storm_chain_index.get(key)
+            if origin is not None:
+                self._chain_append(
+                    key,
+                    _TIMEOUT_STORM_OP,
+                    "",
+                    "重放",
+                    now_ms,
+                    origin,
+                    self._timeout_storm_chain_index,
+                )
+            return result
+
+        _check_int("now_ms", now_ms, 0)
+        _check_int("batches", batches, 1)
+        if batches > 1000:
+            raise ValueError(f"batches must be <= 1000, got {batches}")
+
+        # 各池已租静态地址数，批后水位按 O(1)/池快照（未租静态数 = 静态
+        # 总数 - 已租静态数）；初始统计遍历静态址 O(S)，批内释址时维护。
+        rented_static = {}
+        for pool_id, pool in self._pools.items():
+            rented_static[pool_id] = sum(
+                1 for ip_int in pool.static_ips if ip_int in pool.leases
+            )
+        pool_ids = sorted(self._pools)
+
+        # 逐批：扫描当下候选（不老化）取前 100，随即按 timeout_sweep 规则
+        # 提交。提交步骤皆不可失败，且验参已全部完成，故逐批落库对调用方
+        # 仍为整次原子（无中途失败的部分提交）；不晋升、不半释放。
+        batch_rows = []
+        processed_total = 0
+        final_remaining = 0
+        for index in range(1, batches + 1):
+            # 键序沿用 timeout_sweep，类别码会话 0、排队 1（"会话"码点小于
+            # "排队"）：同类内次序互异，异类先比截止再比类别。
+            found = []
+            for sid, session in self._sessions.items():
+                if (
+                    session["state"] == _STATE_ONLINE
+                    and session["deadline"] != 0
+                    and session["deadline"] <= now_ms
+                ):
+                    found.append((session["deadline"], 0, sid))
+            for queued_sid in self._queue_order:
+                entry = self._capacity_queue[queued_sid]
+                if entry[3] <= now_ms:
+                    found.append((entry[3], 1, entry[4], queued_sid))
+            # 无候选即停，故初始无候选时批次列表为空；已运行批次必非空。
+            if not found:
+                break
+            # nsmallest 惰性取前 100（升序），空间 O(100)。
+            selected = heapq.nsmallest(_STORM_BATCH_LIMIT, found)
+            remaining = len(found) - len(selected)
+
+            session_hits = 0
+            queued_hits = 0
+            removed = set()
+            for entry in selected:
+                if entry[1] == 0:
+                    sid = entry[2]
+                    session = self._sessions[sid]
+                    is_static = (
+                        session["ip"] is not None
+                        and session["ip"]
+                        in self._pools[session["pool"]].static_ips
+                    )
+                    pool_id = session["pool"]
+                    self._release(session)
+                    session["state"] = _STATE_SUSPENDED
+                    session["deadline"] = 0
+                    if is_static:
+                        rented_static[pool_id] -= 1
+                    session_hits += 1
+                else:
+                    order = entry[2]
+                    sid = entry[3]
+                    del self._capacity_queue[sid]
+                    removed.add(sid)
+                    self._cap_event(now_ms, sid, _CAP_TIMEOUT, order)
+                    queued_hits += 1
+            if removed:
+                self._queue_order = [
+                    sid for sid in self._queue_order if sid not in removed
+                ]
+            processed_total += len(selected)
+            final_remaining = remaining
+
+            # 批后池水位：占用为现存租约数，可用为动态空闲加未租静态地址数。
+            pool_rows = []
+            for pool_id in pool_ids:
+                pool = self._pools[pool_id]
+                pool_rows.append(
+                    {
+                        "标识": pool_id,
+                        "占用": len(pool.leases),
+                        "可用": len(pool.free)
+                        + len(pool.static_ips)
+                        - rented_static[pool_id],
+                    }
+                )
+            batch_rows.append(
+                {
+                    "序号": index,
+                    "会话": session_hits,
+                    "排队": queued_hits,
+                    "剩余": remaining,
+                    "池": pool_rows,
+                }
+            )
+
+        completed = final_remaining == 0
+        payload = {
+            "时刻": now_ms,
+            "处理": processed_total,
+            "剩余": final_remaining,
+            "完成": completed,
+            "批次": batch_rows,
+        }
+        output = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._timeout_storm_cache[key] = (now_ms, batches, output)
+        self._chain_append(
+            key,
+            _TIMEOUT_STORM_OP,
+            "",
+            "完成" if completed else "未完成",
+            now_ms,
+            index=self._timeout_storm_chain_index,
+        )
         return output
 
     def batch_offline(self, key, sids, now_ms, atomic=False):
