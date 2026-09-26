@@ -32,6 +32,10 @@
 - Sessions.batch_offline 批量下线：按 key 独立重放缓存，首果（含参数异常）
   永久缓存；首次合法先老化，非原子逐项下线/未知、原子全存在才提交否则整批
   回滚（保留老化），不记审计或容量事件。
+- Sessions.batch_online 批量建立：按 key 独立重放缓存，首果（含参数异常）
+  永久缓存；首次合法先老化，逐项经后端、认证、容量、default 池与静态址
+  规则建立，业务异常不抛而记项结果类名；非原子逐项提交，原子演算全部、
+  任一失败整批回滚（保留老化、认证计数与退避），不记审计或容量事件。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -748,6 +752,8 @@ _BATCH_MAX_SIDS = 1000
 _BATCH_COMMIT = "提交"
 _BATCH_PARTIAL = "部分"
 _BATCH_ROLLBACK = "回滚"
+# batch_online 批量建立：成功项结果“上线”，区别于会话状态“在线”。
+_BATCH_ITEM_ONLINE = "上线"
 
 
 class _Pool:
@@ -916,6 +922,23 @@ class Sessions:
     时刻/原子/结果/项目的 LF 尾紧凑 JSON，结果仅提交/部分/回滚，项为
     会话/结果（下线/未知/回滚）。首次 O(S+B log A) 时间、O(B) 辅助空间，
     S/B/A 为会话/批项/池地址数。
+    batch_online(key, items, now_ms, atomic=False) 批量建立：key 及三项
+    串沿用凭据约束，items 为 1..1000 个 (sid, user, password) 三元组的
+    tuple，sid 互异；now_ms 为非 bool 非负 int，atomic 为 bool；类型错
+    TypeError，取值/长度/重复错 ValueError。验 key 后以独立域（与
+    do/meter/capacity/fault/pool_fault/timeout_fault/batch_offline 分域）
+    永久缓存首果（含参数异常），同型同参重放不老化、不改态，异参
+    ValueError。首次合法先老化；逐项依次经后端（故障期按用户指数退避
+    抛 BackendError，只改退避）、认证、全局与单用户容量、sid 唯一、
+    default 池与静态址规则建立，业务异常（AuthError/ResourceError/
+    StateError/BackendError/KeyError）不抛，项结果记其类名。非原子
+    逐项提交，失败不影响后项；原子演算全部项，任一失败则批内不建
+    会话/租约（已建者回滚释址），失败项记异常类名、余项记回滚；
+    老化、认证计数与退避保留。不记审计或容量事件，不计建立/失败/
+    后端故障统计。返回键序时刻/原子/结果/项目的 LF 尾紧凑 JSON，
+    结果仅提交（全上线）/部分（非原子有失败）/回滚（原子有失败），
+    项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务异常类名/
+    回滚。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1007,6 +1030,10 @@ class Sessions:
         # batch_offline 批量下线的重放缓存，与 do/meter/capacity/fault/
         # pool_fault/timeout_fault 分域：key -> (sids, now_ms, atomic, outcome)。
         self._batch_offline_cache = {}
+        # batch_online 批量建立的重放缓存，与 do/meter/capacity/fault/
+        # pool_fault/timeout_fault/batch_offline 分域：
+        # key -> (items, now_ms, atomic, outcome)。
+        self._batch_online_cache = {}
         # config_change 配置加载/回滚事务的重放缓存，与 do/meter/capacity/
         # fault/pool_fault/timeout_fault/batch_offline 分域：
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
@@ -1275,14 +1302,16 @@ class Sessions:
         session["lease"] = 0
         session["pool"] = None
 
-    def _backend_check(self, user, now_ms):
+    def _backend_check(self, user, now_ms, count_fault=True):
         """老化前的后端健康检查，O(1) 时空。
 
         截至与 retry_at 均到（含无故障）则清该用户退避并返回；故障中且
         retry_at 已到则 n 加一、retry_at = now_ms+min(100*2**(n-1), 1600)
         并抛 BackendError(retry_at)，计一次“故障”失败；retry_at 未到则
         n 不变，抛 BackendError(retry_at)，计一次“退避”失败。本方法仅由
-        新 key 首次路径调用，重放不到达，故每次抛错恰计一次。
+        新 key 首次路径调用，重放不到达，故每次抛错恰计一次。count_fault
+        为 False 时（batch_online 批内检查）只维护退避，不计 fault_stats
+        失败（其口径仅含 do 与 capacity）。
         """
         n, retry_at = self._backoff.get(user, (0, 0))
         if now_ms >= self._fault_until and now_ms >= retry_at:
@@ -1294,10 +1323,12 @@ class Sessions:
             n += 1
             retry_at = now_ms + min(100 * 2 ** (n - 1), 1600)
             self._backoff[user] = (n, retry_at)
-            self._fault_fail[0] += 1
+            if count_fault:
+                self._fault_fail[0] += 1
         else:
             # 退避未到期：n 不变。
-            self._fault_fail[1] += 1
+            if count_fault:
+                self._fault_fail[1] += 1
         raise BackendError(retry_at)
 
     def _capacity_counts(self, user=None):
@@ -2323,6 +2354,199 @@ class Sessions:
 
     @staticmethod
     def _render_batch_offline(now_ms, atomic, result, items):
+        # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
+        # 结果为 str，项目为项（会话/结果）列表，依输入顺序。
+        payload = {
+            "时刻": now_ms,
+            "原子": atomic,
+            "结果": result,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def batch_online(self, key, items, now_ms, atomic=False):
+        """批量建立一批会话，返回 LF 结尾的 JSON 字符串。
+
+        key 沿用凭据约束；items 为含 1..1000 个 (sid, user, password)
+        三元组 tuple 的 tuple，三个串均沿用凭据约束且 sid 互异；now_ms
+        为非 bool 非负 int，atomic 为 bool。依序校验：类型错 TypeError，
+        取值、长度、重复 sid 错 ValueError。key 有效后以独立域（与
+        do/meter/capacity/fault/pool_fault/timeout_fault/batch_offline
+        分域）永久缓存首果（含参数异常）：同型同参重放不老化、不改态，
+        直接返回或重抛；异参抛 ValueError。
+
+        首次合法调用先老化（在线期限到先挂起释址、租期到释址），随后依
+        输入顺序逐项处理：先查后端（故障期按用户指数退避抛 BackendError，
+        只改退避、不计故障统计），再沿用建立的认证、全局与单用户容量、
+        sid 唯一、default 池与静态址规则。业务异常（AuthError/
+        ResourceError/StateError/BackendError/KeyError）不抛，项结果记
+        其类名。非原子逐项提交，失败项不影响后项；原子演算全部项，任一
+        失败则批内不建会话/租约（已建者回滚、释放地址租约），失败项记
+        异常类名、余项记“回滚”；老化、认证计数与退避保留。不记审计或
+        容量事件，不计建立/失败统计。返回顶层键序“时刻/原子/结果/项目”：
+        结果仅提交（全部上线）、部分（非原子有失败）、回滚（原子有
+        失败）；项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务
+        异常类名/回滚。首次调用 O(S+B log A) 时间、O(B) 辅助空间，
+        重放 O(B)。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_online_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不建立、不记审计/事件，仅按缓存返回或重抛。
+            c_items, c_now_ms, c_atomic, outcome = cached
+            if not _strict_equal(
+                (items, now_ms, atomic), (c_items, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存；校验失败不老化、不改态。
+        try:
+            self._validate_batch_online_params(items, now_ms, atomic)
+        except (TypeError, ValueError) as exc:
+            self._batch_online_cache[key] = (
+                items,
+                now_ms,
+                atomic,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 首次合法调用：先老化（与其他写接口一致，老化先于业务处理）。
+        self._age(now_ms)
+
+        # 容量计数只扫一次会话表，随批内建立增量维护（同 _cap_advance）。
+        total_count, per_user = self._active_counts()
+        results = []
+        created = []
+        all_ok = True
+        for sid, user, password in items:
+            try:
+                self._backend_check(user, now_ms, count_fault=False)
+                self._batch_establish(
+                    sid, user, password, now_ms, total_count, per_user
+                )
+            except (AuthError, ResourceError, StateError, BackendError, KeyError) as exc:
+                # 业务异常不抛：项结果记异常类名，不影响后项。
+                results.append({"会话": sid, "结果": type(exc).__name__})
+                all_ok = False
+            else:
+                created.append(sid)
+                total_count += 1
+                per_user[user] = per_user.get(user, 0) + 1
+                results.append({"会话": sid, "结果": _BATCH_ITEM_ONLINE})
+
+        if atomic and not all_ok:
+            # 整批回滚：摘除批内所建会话并释放其地址租约（静态址仅退租）；
+            # 老化、认证计数与退避保留。
+            for sid in created:
+                self._release(self._sessions.pop(sid))
+            for entry in results:
+                if entry["结果"] == _BATCH_ITEM_ONLINE:
+                    entry["结果"] = _BATCH_ROLLBACK
+
+        if all_ok:
+            result = _BATCH_COMMIT
+        else:
+            result = _BATCH_ROLLBACK if atomic else _BATCH_PARTIAL
+        output = self._render_batch_online(now_ms, atomic, result, results)
+        self._batch_online_cache[key] = (items, now_ms, atomic, ("ok", output))
+        return output
+
+    @staticmethod
+    def _validate_batch_online_params(items, now_ms, atomic):
+        """校验 batch_online 三参数：类型错先于取值/长度/重复错。
+
+        items 须为 tuple，含 1..1000 个 (sid, user, password) 三元组
+        tuple，三个串均满足凭据约束且 sid 互异；now_ms 为非 bool 非负
+        int；atomic 为 bool。类型阶段先查容器/各项/各串/now_ms/atomic
+        的类型；取值阶段依序查各项长度与三串取值、now_ms 下界、项数
+        上下界、sid 重复。
+        """
+        # 类型阶段：任一类型错先于任何取值错抛出。
+        if not isinstance(items, tuple):
+            raise TypeError(f"items must be a tuple, got {type(items).__name__}")
+        for item in items:
+            if not isinstance(item, tuple):
+                raise TypeError(
+                    f"item must be a tuple, got {type(item).__name__}"
+                )
+            for field in item:
+                if not isinstance(field, str):
+                    raise TypeError(
+                        f"item field must be a str, got {type(field).__name__}"
+                    )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
+
+        # 取值阶段：项长度、凭据值、下界、项数、重复。
+        for item in items:
+            if len(item) != 3:
+                raise ValueError(
+                    "item must be a 3-tuple (sid, user, password), "
+                    f"got {len(item)} items"
+                )
+            _check_credential("sid", item[0])
+            _check_credential("user", item[1])
+            _check_credential("password", item[2])
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(items) <= _BATCH_MAX_SIDS):
+            raise ValueError(
+                f"items must contain 1..{_BATCH_MAX_SIDS} items, got {len(items)}"
+            )
+        sids = [item[0] for item in items]
+        if len(set(sids)) != len(sids):
+            raise ValueError("items must not contain duplicate sid")
+
+    def _batch_establish(self, sid, user, password, now_ms, total_count, per_user):
+        """批内单项建立：规则与 _establish 相同（认证→容量→sid 唯一→
+        default 池→静态址），但容量计数由调用方按批增量维护，故批处理
+        整体为 O(S+B log A) 而非 O(B*S)。
+
+        成功原子落库在线会话；失败抛既有业务异常，不留会话与租约残留。
+        """
+        # 先认证。
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+        # 后查 total 及用户 per，均计非下线会话（计数由调用方增量维护）。
+        if total_count >= self._total:
+            raise ResourceError(f"total session limit {self._total} reached")
+        if per_user.get(user, 0) >= self._per:
+            raise ResourceError(
+                f"per-user session limit {self._per} reached for {user!r}"
+            )
+        if sid in self._sessions:
+            raise StateError(f"duplicate sid: {sid!r}")
+
+        # 建立须经 default 池分配地址；缺 default 池为 StateError。
+        pool_id, ip_int = self._default_candidate(user, now_ms)
+        if pool_id is None:
+            raise StateError("no default pool: cannot establish session")
+        if ip_int is None:
+            pool = self._pools[pool_id]
+            if self._pool_is_exhausted(pool_id, now_ms):
+                raise ResourceError("address pool exhausted")
+            static_ip = pool.static.get(user)
+            if static_ip is not None:
+                raise ResourceError(
+                    f"static address {ipaddress.IPv4Address(static_ip)} for {user!r} "
+                    "already in use"
+                )
+            raise ResourceError("address pool exhausted")
+
+        # 全部校验通过后再落库，杜绝失败残留。
+        self._commit_session(sid, user, pool_id, ip_int, now_ms)
+
+    @staticmethod
+    def _render_batch_online(now_ms, atomic, result, items):
         # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
         # 结果为 str，项目为项（会话/结果）列表，依输入顺序。
         payload = {
