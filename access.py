@@ -6,7 +6,9 @@
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/升级/加载/回滚
   export_config/upgrade_config/load_config/rollback_config、QoS 模板查询 qos、按
-  (用户,模板) 共享账本计量的 meter、配额只读快照 quota_stats、按用户/模板分组的
+  (用户,模板) 共享账本计量的 meter、配额只读快照 quota_stats、共享 QoS 账本
+  检查点 quota_checkpoint 与按 key 幂等原子恢复 quota_restore（独立分域、
+  仅缓存首次成功，已删模板历史账本保留）、按用户/模板分组的
   计量统计 meter_stats、容量申请
   capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按入队序晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
@@ -59,6 +61,10 @@ _MAX_USERS = 10000
 _MIN_CRED_BYTES = 1
 _MAX_CRED_BYTES = 256
 _MIN_PREFIX = 16
+
+# 共享 QoS 账本检查点版本：顶层依次为 [版本, 账本]，账本项依次为
+# [用户, 模板, 累计, 上次, 令牌]。
+_QUOTA_CHECKPOINT_VERSION = 1
 
 
 class AuthError(Exception):
@@ -826,7 +832,16 @@ class Sessions:
     下线原子清场且不改账），重放缓存与 do 分域；下线、新建、接管不清账，
     配置提交后同标识保留 u/t 并截顶 c，改绑用独立账本，加载或回滚失败
     不改账。quota_stats(user, now_ms) 以 O(1) 只读返回用户所绑模板的
-    配额快照（不老化、不建账；无账本按累计 0、满桶）。meter 新 key 首次
+    配额快照（不老化、不建账；无账本按累计 0、满桶）。quota_checkpoint()
+    导出模板仍存在的全部账本为版本 1 的 [版本, 账本] 紧凑 JSON（项为
+    [用户,模板,累计,上次,令牌]，按用户/模板码点升序，LF 结尾），不老化、
+    不审计，O(LlogL)/O(L)。quota_restore(key, text) 经独立分域按 key 幂等
+    （仅缓存首次成功、失败不占 key、同 text 重放、异参 ValueError），全量
+    校验（解析/重键/键序键集/结构/类型/数值/版本/排序/重复/资源/令牌上限，
+    类型错 TypeError、值错 ValueError、用户或模板不存在 ResourceError，
+    令牌不超模板 (限速+突发)*1000）后原子替换模板仍存在的账本并返回检查点，
+    已删模板历史账本原样保留，失败不改实例；恢复后 meter 沿用三值、
+    quota_stats 按当前绑定取账，用户可未绑定该模板；不老化、不审计。meter 新 key 首次
     结果为通过/拒绝/下线时按当时会话用户与当次模板标识各记一次统计
     （通过另计字节），配置热加载或回滚不迁移历史计数；meter_stats
     (now_ms, group) 老化后按用户或查询时生效绑定（未绑定归空串）汇总
@@ -976,6 +991,9 @@ class Sessions:
         self._cache = {}
         # meter 的重放缓存，与 do 分域：key -> (sid, size, now_ms, outcome)
         self._meter_cache = {}
+        # quota_restore 的重放缓存，与各域分域且仅缓存首次成功：
+        # key -> (text, checkpoint)；失败（含验参、解析、资源、越界）不占 key。
+        self._quota_restore_cache = {}
         # QoS 计量账本：(用户, 模板标识) -> [累计 u, 上次通过时刻 t, 千分字节
         # 令牌 c]；同用户同模板的并发会话共享一本账，仅“通过”原子更新，拒绝、
         # 下线、异常与重放不改账，会话下线/新建/接管不清账；配置提交后同标识
@@ -1900,6 +1918,154 @@ class Sessions:
             "令牌": tokens,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def quota_checkpoint(self):
+        """导出模板仍存在的全部共享 QoS 账本，返回 LF 结尾的紧凑 JSON 字符串。
+
+        顶层依次为 [版本, 账本]，版本为 1；账本项依次为
+        [用户, 模板, 累计, 上次, 令牌]，累计/上次/令牌为非 bool 非负 int
+        （上次为账本上次通过时刻，令牌为千分字节令牌原值、不补充不截顶）。
+        仅导出模板标识仍存在于当前配置的账本，已删模板的历史账本不导出；
+        项按 (用户, 模板) 的 Unicode 码点升序。JSON 用
+        ensure_ascii=False、separators=(',', ':')，LF 结尾。查询不认证、
+        不老化、不建账、不改账、不审计；O(L log L) 时间、O(L) 空间，
+        L 为模板仍存在的账本数。
+        """
+        items = []
+        for (user, template_id), ledger in self._meter_ledgers.items():
+            if template_id not in self._templates:
+                continue
+            used, last, tokens = ledger
+            items.append([user, template_id, used, last, tokens])
+        items.sort(key=lambda item: (item[0], item[1]))
+        payload = [_QUOTA_CHECKPOINT_VERSION, items]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def quota_restore(self, key, text):
+        """按检查点原子恢复模板仍存在的共享 QoS 账本，返回恢复后的检查点。
+
+        key 沿用凭据约束；text 须为 str，类型错抛 TypeError，取值错抛
+        ValueError。key 以独立域（与 do/meter/capacity 及各演练域分域）
+        重放，且仅缓存首次成功：同型同 text 重放直接返回首次检查点，
+        异参（含异型）抛 ValueError；任何失败都不占用 key。
+
+        检查点须为 quota_checkpoint 的规范形态：JSON 解析失败、重键、
+        顶层/项非定长数组等结构错、版本非 1、字段类型错（bool 不充 int）、
+        数值为负或不满足凭据约束、项未按 (用户, 模板) 码点升序或存在重复
+        对，均抛 ValueError。全部结构校验后再做资源与取值校验：项引未注册
+        用户或已删（不存在）模板抛 ResourceError；令牌超过该模板
+        (限速+突发)*1000 抛 ValueError。用户当前可未绑定该模板。
+
+        全部校验通过后原子替换：模板仍存在的账本整体替换为检查点所列
+        （未列及现存的同域账本删除，检查点项照三值原样落账），已删模板的
+        历史账本原样保留；不改配置、绑定、会话、统计与各域缓存，恢复后
+        meter 沿用三值（仍守 now_ms 不得早于上次），quota_stats 按当前
+        绑定取账。任一校验失败实例不变。不老化、不审计；O(L) 时间、
+        O(L) 辅助空间。
+        """
+        _check_credential("key", key)
+
+        cached = self._quota_restore_cache.get(key)
+        if cached is not None:
+            c_text, checkpoint = cached
+            if not _strict_equal(text, c_text):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return checkpoint
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        items = self._parse_quota_checkpoint(text)
+
+        # 资源校验先于令牌取值校验：用户须已注册、模板须仍存在。
+        for user, template_id, _used, _last, _tokens in items:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"checkpoint references unregistered user: {user!r}"
+                )
+            if template_id not in self._templates:
+                raise ResourceError(
+                    f"checkpoint references missing template: {template_id!r}"
+                )
+        for _user, template_id, _used, _last, tokens in items:
+            rate, burst, _quota, _exceed = self._templates[template_id]
+            capacity = (rate + burst) * 1000
+            if tokens > capacity:
+                raise ValueError(
+                    f"tokens {tokens} exceed bucket capacity {capacity} "
+                    f"of template {template_id!r}"
+                )
+
+        # 全验通过后原子替换：保留已删模板的历史账本，模板仍存在的账本
+        # 整体改为检查点所列（未列即删除）。
+        new_ledgers = {
+            ledger_key: list(ledger)
+            for ledger_key, ledger in self._meter_ledgers.items()
+            if ledger_key[1] not in self._templates
+        }
+        for user, template_id, used, last, tokens in items:
+            new_ledgers[(user, template_id)] = [used, last, tokens]
+        self._meter_ledgers = new_ledgers
+        # items 已校验为按 (用户, 模板) 升序且其模板全部现存，故现存账本恰为
+        # 所列各行，直接规范化即与 quota_checkpoint() 逐字节一致，无需再排序。
+        payload = [
+            _QUOTA_CHECKPOINT_VERSION,
+            [[user, template_id, used, last, tokens]
+             for user, template_id, used, last, tokens in items],
+        ]
+        checkpoint = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        self._quota_restore_cache[key] = (text, checkpoint)
+        return checkpoint
+
+    def _parse_quota_checkpoint(self, text):
+        """解析并全量校验共享 QoS 账本检查点文本，返回按序的
+        (用户, 模板, 累计, 上次, 令牌) 五元组列表；任何结构/类型/取值/版本/
+        排序/重复/重键非法均抛 ValueError，且不改实例。"""
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"quota checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, list) or len(doc) != 2:
+            raise ValueError("quota checkpoint top level must be [版本, 账本]")
+        version, raw_items = doc
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(
+                f"版本 must be an int, got {type(version).__name__}"
+            )
+        if version != _QUOTA_CHECKPOINT_VERSION:
+            raise ValueError(
+                f"unsupported quota checkpoint version: {version}"
+            )
+        if not isinstance(raw_items, list):
+            raise ValueError(f"账本 must be a list, got {type(raw_items).__name__}")
+
+        items = []
+        last_pair = None
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, list) or len(item) != 5:
+                raise ValueError(
+                    f"ledger {index} must be [用户, 模板, 累计, 上次, 令牌]"
+                )
+            user = self._cp_str(item[0], "账本.用户")
+            template_id = self._cp_str(item[1], "账本.模板")
+            used = self._cp_int(item[2], "账本.累计", 0)
+            last = self._cp_int(item[3], "账本.上次", 0)
+            tokens = self._cp_int(item[4], "账本.令牌", 0)
+            pair = (user, template_id)
+            if last_pair is not None:
+                if pair == last_pair:
+                    raise ValueError(
+                        f"duplicate ledger in checkpoint: {user!r}/{template_id!r}"
+                    )
+                if pair < last_pair:
+                    raise ValueError(
+                        "ledger rows must be sorted by 用户, 模板 ascending"
+                    )
+            last_pair = pair
+            items.append((user, template_id, used, last, tokens))
+        return items
 
     def fault(self, key, op, ms, now_ms):
         """注入或恢复后端故障，返回 LF 结尾的 JSON 字符串。
