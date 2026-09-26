@@ -89,6 +89,16 @@
   域/目标/左/右/增减，左/右均为 生效/在线/挂起/排队/租约，增减键序
   在线/挂起/排队/租约、值为右减左。顶层时刻/域/合计/摘要，合计为各行增减
   逐项和，摘要为前三键紧凑 JSON UTF-8 字节的 sha256 小写值；LF 尾紧凑。
+- Sessions.fault_matrix 只读多场景影响矩阵：scenarios 为 1..100 项
+  (标识, steps) tuple，标识为互异凭据串，steps 沿用 fault_plan 契约，now_ms
+  为非 bool 非负 int；型/结构长度值/重复/未知池分别抛
+  TypeError/ValueError/KeyError。不老化、不缓存、不审计、不改状态。基准
+  （不施加步骤）与各场景均从同一当前故障态演算，视图与计数沿用 fault_impact；
+  域取基准与各场景池标识并集，按后端、池 Unicode 升序、超时排列，缺侧池行
+  按不生效、四项 0，场景按输入序。顶层时刻/基准/场景/摘要：基准行为
+  域/目标/生效/在线/挂起/排队/租约，场景项标识/域/合计，域行追加增减，
+  增减与合计键序在线/挂起/排队/租约，增减为场景减基准、合计为逐行增减
+  之和；摘要为前三键紧凑 JSON UTF-8 字节的 sha256 小写值；LF 尾紧凑。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -888,6 +898,9 @@ _FAULT_PLAN_DOMAIN_POOL = "池"
 _FAULT_PLAN_DOMAIN_TIMEOUT = "超时"
 _FAULT_PLAN_OP = "故障计划"
 _FAULT_PLAN_MAX_STEPS = 1000
+
+# fault_matrix 多场景矩阵：场景 (标识, steps) 项数上限。
+_FAULT_MATRIX_MAX_SCENARIOS = 100
 
 # pool_fault 池演练状态：仅耗尽/正常。
 _POOL_EXHAUSTED = "耗尽"
@@ -3970,6 +3983,201 @@ class Sessions:
             )
 
         doc = {"时刻": now_ms, "域": rows, "合计": totals}
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    @staticmethod
+    def _fault_matrix_check_types(scenarios, now_ms):
+        """fault_matrix 校验的类型阶段：now_ms/容器/各场景/标识/steps 及其
+        各步的任一类型错均在此阶段抛出，先于任何长度、取值、重复等结构/值
+        错（沿 fault_diff 约定）。steps 内部类型沿用 fault_plan 类型阶段。
+        """
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(scenarios, tuple):
+            raise TypeError(
+                f"scenarios must be a tuple, got {type(scenarios).__name__}"
+            )
+        for scenario in scenarios:
+            if not isinstance(scenario, tuple):
+                raise TypeError(
+                    f"scenario must be a tuple, got {type(scenario).__name__}"
+                )
+            # 长度未定前仅查存在的字段：标识须为 str（bool 非 str）；长度属
+            # 结构错，留待取值阶段。
+            if len(scenario) >= 1 and not isinstance(scenario[0], str):
+                raise TypeError(
+                    "scenario label must be a str, got "
+                    f"{type(scenario[0]).__name__}"
+                )
+            if len(scenario) >= 2:
+                # steps 类型阶段沿用 fault_plan（其内部复校 now_ms，已先行通过）。
+                Sessions._fault_plan_check_types(
+                    _FAULT_PLAN_MODE_PRECHECK,
+                    scenario[1],
+                    now_ms,
+                    check_mode=False,
+                )
+
+    @staticmethod
+    def _fault_matrix_check_values(scenarios, now_ms):
+        """fault_matrix 校验的取值/结构阶段：时钟下界、场景数、逐项长度、
+        标识凭据约束与互异、steps 取值/结构/重复。须在
+        _fault_matrix_check_types 之后调用；池存在与否不在本结构校验内
+        （演算阶段查，未知池抛 KeyError）。
+        """
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(scenarios) <= _FAULT_MATRIX_MAX_SCENARIOS):
+            raise ValueError(
+                f"scenarios must contain 1..{_FAULT_MATRIX_MAX_SCENARIOS} "
+                f"items, got {len(scenarios)}"
+            )
+        labels = set()
+        for scenario in scenarios:
+            if len(scenario) != 2:
+                raise ValueError(
+                    "scenario must be a 2-tuple (label, steps), got "
+                    f"{len(scenario)} items"
+                )
+            label = scenario[0]
+            _check_credential("scenario label", label)
+            if label in labels:
+                raise ValueError(
+                    f"scenario label must be unique, got duplicate {label!r}"
+                )
+            labels.add(label)
+            # steps 取值/结构阶段沿用 fault_plan（步数、域/op/target/唯一
+            # 性/value 取值），未知池留待演算阶段。
+            Sessions._fault_plan_check_values(
+                _FAULT_PLAN_MODE_PRECHECK,
+                scenario[1],
+                now_ms,
+                check_mode=False,
+            )
+
+    def fault_matrix(self, scenarios, now_ms):
+        """只读演算多场景故障计划相对基准的影响矩阵，返回 LF 结尾紧凑 JSON。
+
+        scenarios 为 1..100 项 (标识, steps) tuple：标识为互异凭据串（非 bool
+        str，UTF-8 编码 1..256 字节、不含 U+0000），steps 沿用 fault_plan 的
+        1..1000 项 (domain, target, op, value) tuple 契约；now_ms 为非 bool
+        非负 int。类型错 TypeError，结构/长度/取值/重复错 ValueError，场景
+        steps 引用未知池 KeyError（全量校验后按场景输入序演算时抛）。不老化、
+        不缓存、不审计、不改任何实例状态（演算仅在副本上进行）。
+
+        基准与各场景均从实例当前同一故障态出发：基准不施加任何步骤，各场景
+        施加各自 steps；视图与四类计数口径沿用 fault_impact（会话表/队列表
+        只扫一遍）。域取基准与各场景池标识并集，行按后端、池标识 Unicode
+        升序、超时排列，后端/超时目标恒空串；某侧演算后不在册的池按不生效、
+        四项 0 计，场景项按 scenarios 输入序。
+        基准行键序“域/目标/生效/在线/挂起/排队/租约”；场景项键序
+        “标识/域/合计”，域行为基准行追加“增减”对象，增减与合计键序均为
+        “在线/挂起/排队/租约”：增减逐项为场景值减基准值（按两侧生效后的
+        计入值），合计为该场景逐行增减之和。
+        顶层键序“时刻/基准/场景/摘要”：摘要为前三键紧凑 JSON（无 LF）
+        UTF-8 字节的 sha256 小写值。同态同参逐字节相同。
+        时间 O(S+Q+K+CP+P log P)、辅助空间 O(CP+K)，S/Q/C/P/K 为会话数、
+        队项数、场景数、并集池数、各场景步骤总数。
+        """
+        # 类型阶段先全部通过，再进入取值/结构阶段；全量校验后再演算，未知池
+        # 在演算阶段按场景输入序抛 KeyError。
+        self._fault_matrix_check_types(scenarios, now_ms)
+        self._fault_matrix_check_values(scenarios, now_ms)
+
+        # 基准：实例当前故障态、不施加任何步骤（与 _fault_plan_simulate 的
+        # 初值同口径：待触发态由 _timeout_at 是否为 None 决定）。
+        baseline_sim = (
+            self._fault_until,
+            dict(self._pool_fault),
+            self._timeout_at is not None,
+            self._timeout_at if self._timeout_at is not None else 0,
+        )
+        labels = [label for label, _steps in scenarios]
+        sims = [
+            self._fault_plan_simulate(steps, now_ms)
+            for _label, steps in scenarios
+        ]
+
+        # 所有侧共享同一 now_ms 视图，会话/队列表只扫一遍。
+        view = self._fault_view_counts(now_ms)
+
+        def row_map(sim):
+            return {
+                (domain, target): (active, online, suspended, queued, leased)
+                for domain, target, active, online, suspended, queued, leased
+                in self._fault_domain_rows(now_ms, sim, view)
+            }
+
+        baseline_map = row_map(baseline_sim)
+        scenario_maps = [row_map(sim) for sim in sims]
+
+        # 域键取基准与各场景池标识并集，按（后端/池 Unicode 升序/超时）排列。
+        pool_ids = set(baseline_sim[1])
+        for sim in sims:
+            pool_ids.update(sim[1])
+        keys = [(_FAULT_PLAN_DOMAIN_BACKEND, "")]
+        keys.extend((_FAULT_PLAN_DOMAIN_POOL, pid) for pid in sorted(pool_ids))
+        keys.append((_FAULT_PLAN_DOMAIN_TIMEOUT, ""))
+
+        zero = (False, 0, 0, 0, 0)
+        metric_names = ("在线", "挂起", "排队", "租约")
+
+        baseline_rows = []
+        for domain, target in keys:
+            active, online, suspended, queued, leased = baseline_map.get(
+                (domain, target), zero
+            )
+            baseline_rows.append(
+                {
+                    "域": domain,
+                    "目标": target,
+                    "生效": active,
+                    "在线": online if active else 0,
+                    "挂起": suspended if active else 0,
+                    "排队": queued if active else 0,
+                    "租约": leased if active else 0,
+                }
+            )
+
+        scenario_docs = []
+        for label, scenario_map in zip(labels, scenario_maps):
+            rows = []
+            totals = {name: 0 for name in metric_names}
+            for index, (domain, target) in enumerate(keys):
+                base_row = baseline_rows[index]
+                active, online, suspended, queued, leased = scenario_map.get(
+                    (domain, target), zero
+                )
+                values = {
+                    "在线": online if active else 0,
+                    "挂起": suspended if active else 0,
+                    "排队": queued if active else 0,
+                    "租约": leased if active else 0,
+                }
+                delta = {
+                    name: values[name] - base_row[name] for name in metric_names
+                }
+                for name in metric_names:
+                    totals[name] += delta[name]
+                rows.append(
+                    {
+                        "域": domain,
+                        "目标": target,
+                        "生效": active,
+                        "在线": values["在线"],
+                        "挂起": values["挂起"],
+                        "排队": values["排队"],
+                        "租约": values["租约"],
+                        "增减": delta,
+                    }
+                )
+            scenario_docs.append(
+                {"标识": label, "域": rows, "合计": totals}
+            )
+
+        doc = {"时刻": now_ms, "基准": baseline_rows, "场景": scenario_docs}
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
