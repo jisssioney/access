@@ -756,6 +756,9 @@ _CONFIG_OP_ROLLBACK = "回滚"
 _CONFIG_CHAIN_LOAD = "配置加载"
 _CONFIG_CHAIN_ROLLBACK = "配置回滚"
 
+# credential_change 凭据轮换入防篡改审计链的操作名。
+_CREDENTIAL_CHAIN_OP = "凭据轮换"
+
 # batch_offline 批量下线：单批 sid 数上界。
 _BATCH_MAX_SIDS = 1000
 # 顶层结果仅 提交/部分/回滚；项结果沿用 "下线"（_STATE_OFFLINE）、
@@ -1070,6 +1073,11 @@ class Sessions:
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
         self._config_change_cache = {}
         self._config_change_chain_index = {}
+        # credential_change 凭据轮换的重放缓存，与其余各域独立：
+        # key -> (user, old_password, new_password, now_ms, outcome)；
+        # 原序号索引亦独立分域。
+        self._credential_change_cache = {}
+        self._credential_change_chain_index = {}
         # quota_restore 共享 QoS 账本恢复的重放缓存，与其余各域独立：
         # key -> (text, outcome)；仅首次成功缓存，失败（含参数错）不占 key。
         self._quota_restore_cache = {}
@@ -5091,6 +5099,143 @@ class Sessions:
             raise ValueError(f"text must be None for 回滚, got {text!r}")
         if now_ms < 0:
             raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+
+    def credential_change(self, key, user, old_password, new_password, now_ms):
+        """凭据轮换的幂等入口，成功返回 LF 尾紧凑 JSON。
+
+        依次校验：key、user、old_password、new_password 沿用凭据约束；
+        now_ms 须为非 bool 非负 int。类型错抛 TypeError，值错（含旧新相同）
+        抛 ValueError。key 有效后以独立域永久缓存余参与首果（含参数异常）：
+        严格同型同参重放不认证、不换密，直接返回或重抛首果；异参抛
+        ValueError 且不审计。
+
+        首次合法调用用 Authenticator 校验旧密码：未知用户抛 KeyError；
+        denied/locked 抛 AuthError，失败计数与锁定沿用认证副作用；成功按
+        摘要规则换密并清零失败计数与锁定。除缓存、审计与认证副作用外，失败
+        不改其他状态；成功保留会话与已认证队项，此后仅新密码可认证。
+
+        首次业务结果（成功/AuthError/KeyError）与同参重放均向既有防篡改
+        审计哈希链追加一项：操作为“凭据轮换”，会话记 user；首次原序号 0，
+        结果为“成功”或异常类名；重放原序号指认首次事件，结果加“重放”
+        前缀。参数错与异参不审计。操作 O(1) 时空。
+        """
+        _check_credential("key", key)
+
+        cached = self._credential_change_cache.get(key)
+        if cached is not None:
+            # 重放：不认证、不换密、不改任何状态，仅按缓存返回或重抛。
+            c_user, c_old, c_new, c_now_ms, outcome = cached
+            if not _strict_equal(
+                (user, old_password, new_password, now_ms),
+                (c_user, c_old, c_new, c_now_ms),
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 业务结果（成功/AuthError/KeyError）的同参重放入链，结果加
+            # “重放”前缀，原序号指认首次事件；参数错不在本域链索引中，
+            # 自然跳过。
+            origin = self._credential_change_chain_index.get(key)
+            if origin is not None:
+                if outcome[0] == "ok":
+                    chain_result = "重放成功"
+                else:
+                    chain_result = "重放" + outcome[1][0].__name__
+                self._chain_append(
+                    key,
+                    _CREDENTIAL_CHAIN_OP,
+                    c_user,
+                    chain_result,
+                    now_ms,
+                    origin,
+                    self._credential_change_chain_index,
+                )
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise _replay_exception(exc_class, exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存但不审计；校验失败不改任何状态。
+        try:
+            self._validate_credential_change_params(
+                user, old_password, new_password, now_ms
+            )
+        except (TypeError, ValueError) as exc:
+            self._credential_change_cache[key] = (
+                user,
+                old_password,
+                new_password,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 首次合法调用：以 Authenticator 校验旧密码（未知用户 KeyError；
+        # denied/locked AuthError，失败计数与锁定为认证副作用），成功按摘要
+        # 规则换密并清零失败计数与锁定；业务异常缓存类型与 args 并入链。
+        try:
+            _, status, _ = self._auth.authenticate(user, old_password, now_ms)
+            if status != "ok":
+                raise AuthError(
+                    f"authentication not ok for user {user!r}: {status}"
+                )
+            record = self._auth._users[user]
+            record[0] = _digest(user, new_password)
+            record[1] = 0
+            record[2] = None
+        except (AuthError, KeyError) as exc:
+            self._credential_change_cache[key] = (
+                user,
+                old_password,
+                new_password,
+                now_ms,
+                ("err", (type(exc), exc.args)),
+            )
+            self._chain_append(
+                key,
+                _CREDENTIAL_CHAIN_OP,
+                user,
+                type(exc).__name__,
+                now_ms,
+                index=self._credential_change_chain_index,
+            )
+            raise
+        result = self._render_credential_change(user, now_ms)
+        self._credential_change_cache[key] = (
+            user,
+            old_password,
+            new_password,
+            now_ms,
+            ("ok", result),
+        )
+        self._chain_append(
+            key,
+            _CREDENTIAL_CHAIN_OP,
+            user,
+            "成功",
+            now_ms,
+            index=self._credential_change_chain_index,
+        )
+        return result
+
+    @staticmethod
+    def _validate_credential_change_params(
+        user, old_password, new_password, now_ms
+    ):
+        """校验 credential_change 四参数（key 已由调用方校验）。
+
+        三串沿用凭据约束，now_ms 为非 bool 非负 int，旧新须不同。
+        """
+        _check_credential("user", user)
+        _check_credential("old_password", old_password)
+        _check_credential("new_password", new_password)
+        _check_int("now_ms", now_ms, 0)
+        if old_password == new_password:
+            raise ValueError("new_password must differ from old_password")
+
+    @staticmethod
+    def _render_credential_change(user, now_ms):
+        # 键序：用户、时刻、结果；用户/结果为 str，时刻为 int。
+        payload = {"用户": user, "时刻": now_ms, "结果": "已轮换"}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _audit_append(self, key, old, sid, result, now_ms, origin=0):
         """追加一条接管审计事件，O(1) 时空。
