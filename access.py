@@ -1332,6 +1332,9 @@ class Sessions:
         self._chain_tail = "0" * 64
         # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None。
         self._rollback = None
+        # 配置修订号：初值 0，load_config/rollback_config 成功（含经
+        # config_change/config_cas 提交）加 1；失败、导出与升级不变。
+        self._revision = 0
 
         # capacity 等待队列：sid -> [user, 申请时刻, 等待, 截止, 入队序]，
         # _queue_order 为按入队序的 sid 列表，_queue_seq 为下一入队序。
@@ -1386,6 +1389,10 @@ class Sessions:
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
         self._config_change_cache = {}
         self._config_change_chain_index = {}
+        # config_cas 配置比较并提交的重放缓存，与其余各域独立：
+        # key -> (text, expected, now_ms, 结果)；仅首次成功缓存，失败
+        # （含参数错与修订不符）不占 key。本接口不审计，无原序号索引。
+        self._config_cas_cache = {}
         # credential_change 凭据轮换的重放缓存，与其余各域独立：
         # key -> (user, old_password, new_password, now_ms, outcome)；原序号
         # 索引亦独立分域。
@@ -6748,7 +6755,8 @@ class Sessions:
         补认证器当前两值，v1-v5 迁移时模板会话上限补 0。全部校验通过后原子
         提交：失败不改配置、回滚点、会话、租约与运行态；成功不老化，会话与
         租约不变，认证策略随配置替换但认证记录（凭据、失败计数、锁定）保留，
-        新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点。
+        新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点并将配置修订号
+        加 1；失败修订号不变。
         """
         doc = _load_config_doc(text)
         if isinstance(doc, dict) and "源版本" in doc:
@@ -6765,14 +6773,15 @@ class Sessions:
         new_pools = self._build_pools(spec)
         self._rollback = self._current_spec()
         self._install_spec(spec, new_pools)
+        self._revision += 1
         return self.export_config()
 
     def rollback_config(self):
         """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v6 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点或
-        运行态，回滚点保留；成功清除回滚点，认证策略一并恢复（认证记录
-        保留），不老化。
+        运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，认证策略一并
+        恢复（认证记录保留），不老化。
         """
         spec = self._rollback
         if spec is None:
@@ -6780,7 +6789,85 @@ class Sessions:
         new_pools = self._build_pools(spec)
         self._rollback = None
         self._install_spec(spec, new_pools)
+        self._revision += 1
         return self.export_config()
+
+    def _config_summary(self):
+        """当前配置摘要：export_config 去尾 LF 的 UTF-8 字节 sha256 小写值。"""
+        return hashlib.sha256(
+            self.export_config()[:-1].encode("utf-8")
+        ).hexdigest()
+
+    def config_revision(self):
+        """只读返回当前配置修订号与摘要的 LF 尾紧凑 JSON。
+
+        键序/型为“修订:int、摘要:str”；修订号初值 0，load_config/
+        rollback_config 成功加 1，失败、导出与升级不变；摘要为
+        export_config 去尾 LF 的 UTF-8 字节 sha256 小写值。不审计、不改
+        任何状态；O(n log n) 时间、O(n) 空间（导出需排序）。
+        """
+        payload = {"修订": self._revision, "摘要": self._config_summary()}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def config_cas(self, key, text, expected, now_ms):
+        """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
+
+        key 沿用凭据约束；text 须为 str，expected/now_ms 须为非 bool 非负
+        int；类型错抛 TypeError，取值错抛 ValueError。验参后先比较
+        expected 与当前修订号：不等抛 StateError(expected, current)，不解析
+        text；相等时按 load_config 规则加载，文档非法抛 ValueError、承载
+        冲突抛 ResourceError。成功原子提交、覆盖回滚点、修订号加 1，返回
+        键序/型“修订:int、前摘要:str、后摘要:str”的 JSON，两摘要同
+        config_revision 定义（分别为提交前、后的配置摘要）。
+
+        重放缓存与各域独立且仅缓存首次成功：同型同参重放不再比较修订号、
+        不加载，原样返回首次字节；异参抛 ValueError；任何失败（含参数错与
+        修订不符）不占 key 且不改实例。本接口不审计。首次 O(n log n + S + Q)
+        时间、O(n) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._config_cas_cache.get(key)
+        if cached is not None:
+            # 重放：不比较修订号、不解析、不加载，仅核对同型同参后返回原字节。
+            c_text, c_expected, c_now_ms, result = cached
+            if not _strict_equal(
+                (text, expected, now_ms), (c_text, c_expected, c_now_ms)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        # 类型阶段：任一类型错先于任何值错抛出。
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise TypeError(
+                f"expected must be an int, got {type(expected).__name__}"
+            )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值阶段。
+        if expected < 0:
+            raise ValueError(f"expected must be >= 0, got {expected}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+
+        # 先比修订号，不符不得解析 text；失败不占 key、不改实例。
+        if expected != self._revision:
+            raise StateError(expected, self._revision)
+
+        before = self._config_summary()
+        # 按 load_config 规则加载：文档错 ValueError、承载冲突 ResourceError，
+        # 成功原子提交、覆盖回滚点并将修订号加 1；失败实例不变。
+        loaded = self.load_config(text)
+        after = hashlib.sha256(loaded[:-1].encode("utf-8")).hexdigest()
+        payload = {"修订": self._revision, "前摘要": before, "后摘要": after}
+        result = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        self._config_cas_cache[key] = (text, expected, now_ms, result)
+        return result
 
     def config_change(self, key, op, text, now_ms):
         """配置加载/回滚/升级的幂等事务入口，原样返回各业务接口的 LF 尾 JSON。
