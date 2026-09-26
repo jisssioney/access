@@ -19,6 +19,10 @@
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
+  backend_checkpoint/backend_restore 提供后端故障态（故障截至、按用户
+  退避、失败计数）检查点（版本 1，摘要覆盖前五键）与按 key 原子恢复：
+  检查点只读、不清到期退避，恢复全验后原子替换，仅缓存首次成功、同参
+  重放原字节，首次成功与重放写防篡改审计链（后端恢复，会话空串）。
   pool_fault 注入/恢复指定地址池的可恢复耗尽演练（不改真实租约及配置）：
   注入期该池视为无可分配地址，建立、迁入、无址接管在既有认证与老化后抛
   ResourceError，capacity 申请排队、推进跳过，到刻自动正常；首果独立域
@@ -844,6 +848,8 @@ _OP_INJECT = "注入"
 _OP_RECOVER = "恢复"
 _BACKEND_FAULT = "故障"
 _BACKEND_NORMAL = "正常"
+# backend_restore 入防篡改审计链的操作名。
+_BACKEND_RESTORE_OP = "后端恢复"
 
 # pool_fault 池演练状态：仅耗尽/正常。
 _POOL_EXHAUSTED = "耗尽"
@@ -1025,6 +1031,19 @@ class Sessions:
     后端检查抛 BackendError 时计数（now_ms<retry_at 归退避，否则归
     故障），注入/恢复/配置变更不清零；查询不认证、不老化、不改退避、
     不审计、不记事件、不动缓存，O(U) 时间、O(1) 辅助空间。
+    backend_checkpoint(now_ms) 只读输出后端故障态检查点基线 JSON（LF 尾），
+    不清到期退避：顶层依次版本:int/时刻:int/截至:int/退避:list/失败:object/
+    摘要:str，版本 1；退避按用户 Unicode 升序，项键序用户:str/次数:int/
+    下次:int，次数 >0、下次 >=0；失败键序故障:int/退避:int，值 >=0；摘要
+    为前五键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值；O(U log U) 时间、
+    O(U) 空间。backend_restore(key, text) 校验并原子替换截至、退避与失败
+    计数，返回规范包：key 沿凭据约束，text 非 str 抛 TypeError；解析、重键、
+    键集/键序、结构、类型、范围、退避排序/重复、版本或摘要错抛 ValueError，
+    退避引用未注册用户抛 ResourceError；全验后原子替换，失败不改实例、不
+    老化、不审计。仅缓存首次成功，同 key 同型同 text 重放原字节且不重验，
+    异参 ValueError，失败不占 key；首次成功与成功重放写现有防篡改审计链：
+    操作“后端恢复”、会话空串、结果“成功/重放”、重放原序号指认首次，审计
+    时刻取检查点时刻。
     pool_fault(key, op, pool, ms, now_ms) 对指定地址池做可恢复耗尽演练，
     不改真实租约及配置：key/pool 沿用凭据约束，op 仅注入/恢复，注入 ms
     为非 bool 正 int、置截至 now_ms+ms，恢复 ms 须为 None 并清零，
@@ -1276,6 +1295,11 @@ class Sessions:
         # runtime_restore 运行态检查点恢复的重放缓存，与其余各域独立：
         # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）不占 key。
         self._runtime_restore_cache = {}
+        # backend_restore 后端故障态检查点恢复的重放缓存与原序号索引，与其余
+        # 各域独立：key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）
+        # 不占 key。
+        self._backend_restore_cache = {}
+        self._backend_restore_chain_index = {}
         # timeout_sweep 超时清扫的重放缓存，与其余各域独立：
         # key -> (now_ms, limit, 结果 JSON)；仅首次成功缓存，失败不占 key。
         self._timeout_sweep_cache = {}
@@ -2496,6 +2520,199 @@ class Sessions:
         # 键序：状态、时刻、截至；状态为 str，余为 int。
         payload = {"状态": state, "时刻": now_ms, "截至": until}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _backend_payload(self, now_ms):
+        """组装后端故障态检查点文档 dict（顶层键序：
+        版本/时刻/截至/退避/失败/摘要）。
+
+        退避按用户 Unicode 码点升序，项键序“用户/次数/下次”；失败键序
+        “故障/退避”；摘要为前五键紧凑 JSON（无 LF）UTF-8 字节的 sha256
+        小写十六进制串。纯渲染：不老化、不清到期退避、不改态。
+        """
+        backoff = [
+            {"用户": user, "次数": n, "下次": retry_at}
+            for user, (n, retry_at) in sorted(self._backoff.items())
+        ]
+        doc = {
+            "版本": 1,
+            "时刻": now_ms,
+            "截至": self._fault_until,
+            "退避": backoff,
+            "失败": {"故障": self._fault_fail[0], "退避": self._fault_fail[1]},
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return doc
+
+    def _backend_checkpoint_text(self, now_ms):
+        """后端故障态检查点的 LF 结尾紧凑 JSON（基线序列化，不老化、不改态）。"""
+        return json.dumps(
+            self._backend_payload(now_ms), ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def backend_checkpoint(self, now_ms):
+        """只读输出后端故障态检查点的 LF 结尾基线 JSON，O(U log U) 时间、
+        O(U) 空间；不认证、不老化、不清到期退避、不审计、不动各域缓存。
+
+        now_ms 限非 bool 非负 int：类型错 TypeError、取值错 ValueError。
+        顶层依次为“版本/时刻/截至/退避/失败/摘要”：版本恒为 1，时刻为
+        now_ms，截至为当前故障截至（0 为无故障）；退避为按用户 Unicode
+        码点升序的列表，项键序“用户/次数/下次”，次数为 >0 的非 bool int、
+        下次为 >=0 的非 bool int；失败为对象，键序“故障/退避”，值均为
+        >=0 的非 bool int；摘要为前五键紧凑 JSON（无 LF）UTF-8 字节的
+        sha256 小写值。同态同时刻查询逐字节相同。
+        """
+        _check_int("now_ms", now_ms, 0)
+        return self._backend_checkpoint_text(now_ms)
+
+    def backend_restore(self, key, text):
+        """按后端故障态检查点原子替换故障截至、按用户退避与失败计数，返回
+        替换后检查点（规范包）的 LF 结尾基线 JSON。
+
+        key 沿用凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
+        text 非 str 抛 TypeError。JSON 解析、重键、键集/键序、结构、类型、
+        取值范围、退避排序或重复用户、版本或摘要错均抛 ValueError；退避项
+        引用未注册用户抛 ResourceError。全部校验通过后原子替换截至、退避与
+        失败计数（二者之外的认证器、会话、租约、队列及各域缓存均不变）；
+        任何失败不改实例、不审计。不老化。
+
+        重放缓存与各域独立：仅缓存首次成功，同 key 同型同 text 重放不解析、
+        不重验、不替换，直接返回首次规范包原字节，异参抛 ValueError；失败
+        （含参数错）不占 key。首次成功及成功的同参重放写现有防篡改审计链：
+        操作“后端恢复”、会话记空串，首次结果“成功”、原序号 0，重放结果
+        “重放”、原序号指认首次；事件时刻取检查点“时刻”（接口无时钟参数）；
+        参数与文本异常不记。首次 O(U log U) 时间、O(U) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._backend_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text，追加重放审计后
+            # 返回缓存规范包原字节；时刻随缓存保存，重放 O(1)。
+            c_text, result, c_now_ms = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            self._chain_append(
+                key,
+                _BACKEND_RESTORE_OP,
+                "",
+                "重放",
+                c_now_ms,
+                self._backend_restore_chain_index[key],
+                self._backend_restore_chain_index,
+            )
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        now_ms, until, backoff_rows, fail = self._parse_backend_checkpoint(text)
+        for user, _n, _retry_at in backoff_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"backend checkpoint references unregistered user: {user!r}"
+                )
+
+        # 全验后原子替换截至、退避与失败计数；退避存活储为 (n, retry_at) 元组。
+        self._fault_until = until
+        self._backoff = {
+            user: (n, retry_at) for user, n, retry_at in backoff_rows
+        }
+        self._fault_fail = [fail[0], fail[1]]
+
+        result = self._backend_checkpoint_text(now_ms)
+        self._backend_restore_cache[key] = (text, result, now_ms)
+        self._chain_append(
+            key,
+            _BACKEND_RESTORE_OP,
+            "",
+            "成功",
+            now_ms,
+            index=self._backend_restore_chain_index,
+        )
+        return result
+
+    def _parse_backend_checkpoint(self, text):
+        """解析并全量校验后端故障态检查点文本，返回
+        (时刻, 截至, 退避行三元组列表 (用户,次数,下次), (失败故障,失败退避))；
+        任何文本非法均抛 ValueError。
+
+        顶层须恰含“版本/时刻/截至/退避/失败/摘要”且键序如此；版本为 1，
+        时刻/截至为非 bool 非负 int；退避项键序“用户/次数/下次”，用户为
+        凭据约束串，次数为非 bool 正 int、下次为非 bool 非负 int，行按用户
+        Unicode 码点严格升序、无重复；失败键序“故障/退避”，均为非 bool
+        非负 int；摘要须为规范化前五键紧凑 JSON（无 LF）UTF-8 字节的 sha256
+        小写值（与原文排版无关）。仅做结构自洽校验；用户注册由调用方判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"backend checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("backend checkpoint top level must be an object")
+        if list(doc) != ["版本", "时刻", "截至", "退避", "失败", "摘要"]:
+            raise ValueError(
+                "backend checkpoint top-level keys must be "
+                "版本/时刻/截至/退避/失败/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+        until = self._cp_int(doc["截至"], "截至", 0)
+
+        backoff_raw = doc["退避"]
+        if not isinstance(backoff_raw, list):
+            raise ValueError("退避 must be a list")
+        backoff_rows = []
+        last_user = None
+        for index, item in enumerate(backoff_raw, start=1):
+            if not isinstance(item, dict) or list(item) != ["用户", "次数", "下次"]:
+                raise ValueError(
+                    f"backoff {index} keys must be 用户/次数/下次 in order"
+                )
+            user = self._cp_str(item["用户"], "退避.用户")
+            n = item["次数"]
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise ValueError(
+                    f"退避.次数 must be an int, got {type(n).__name__}"
+                )
+            if n <= 0:
+                raise ValueError(f"退避.次数 must be > 0, got {n}")
+            retry_at = self._cp_int(item["下次"], "退避.下次", 0)
+            if last_user is not None and user <= last_user:
+                raise ValueError(
+                    "backoff rows must be strictly sorted by 用户 ascending "
+                    "with no duplicates"
+                )
+            last_user = user
+            backoff_rows.append((user, n, retry_at))
+
+        fail_raw = doc["失败"]
+        if not isinstance(fail_raw, dict) or list(fail_raw) != ["故障", "退避"]:
+            raise ValueError("失败 keys must be 故障/退避 in order")
+        fault_fail = self._cp_int(fail_raw["故障"], "失败.故障", 0)
+        backoff_fail = self._cp_int(fail_raw["退避"], "失败.退避", 0)
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        # 摘要：用规范化值重建前五键（数值相等即与生成方基线逐字节一致）。
+        canonical_head = {
+            "版本": 1,
+            "时刻": now_ms,
+            "截至": until,
+            "退避": [
+                {"用户": user, "次数": n, "下次": retry_at}
+                for user, n, retry_at in backoff_rows
+            ],
+            "失败": {"故障": fault_fail, "退避": backoff_fail},
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical backend checkpoint")
+        return now_ms, until, backoff_rows, (fault_fail, backoff_fail)
 
     def pool_fault(self, key, op, pool, ms, now_ms):
         """对指定地址池注入可恢复耗尽演练或恢复，返回 LF 结尾 JSON。
