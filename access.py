@@ -7021,6 +7021,162 @@ class Sessions:
         payload = {"下个修订": next_revision, "项目": items}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_history_verify(self, after=-1, limit=100):
+        """只读验证防篡改配置历史窗口，返回 LF 尾紧凑 JSON；首错即停且不抛
+        业务异常（参数/取窗异常同 config_history 照常抛出）。
+
+        参数、取值与取窗规则同 config_history：after/limit 须为非 bool 的
+        int，after < -1 或 limit ∉ [1,1000] 抛 ValueError，after != -1 且
+        该修订未保留抛 KeyError(after)。验证不老化、不改任何状态。
+
+        可信锚：after != -1 时取该在册项的修订与哈希；after == -1 且修订 0
+        在册时取 (-1, 64 个 0)，否则取（最老在册修订 - 1，最老在册项的前哈希）。
+        空窗口仅报告锚，检查为 0 且视为完整。
+
+        自锚之后逐项检查：修订连续（恰为锚修订 + 已通过数 + 1）；父修订等于
+        前项修订（首项即锚修订）；操作限构造/加载/回滚/CAS/回退，构造仅允许
+        修订 0 且目标 -1，回退目标须非负且小于父修订，其余操作目标须为 -1；
+        摘要等于对应保留快照按 config_revision 口径（_compact_config(spec)
+        的 UTF-8 字节 sha256 小写值）重算的值；前哈希衔接前项哈希（首项衔接
+        锚哈希）；哈希可由前六键重算。任一项首次出错即停：完整为 false，断点
+        取首错项修订、无可读修订取 -1，原因仅取
+        “修订/父修订/操作/目标/快照/摘要/前哈希/哈希”；检查只计通过项，末哈希
+        取末个通过项的哈希、无通过项取锚哈希。顶层键序/型为
+        “锚修订:int、锚哈希:str、检查:int、完整:bool、断点:int、原因:str、
+        末哈希:str”，成功时断点 -1、原因为空串。时间 O(limit·C)、辅助空间
+        O(C)，C 为单份配置编码成本。
+        """
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise TypeError(f"after must be an int, got {type(after).__name__}")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+        if after < -1:
+            raise ValueError(f"after must be >= -1, got {after}")
+        if limit < 1 or limit > 1000:
+            raise ValueError(f"limit must be in 1..1000, got {limit}")
+
+        log = self._config_history_log
+        history = self._config_history
+        oldest = log[0][0]
+        current = log[-1][0]
+        zero_hash = "0" * 64
+        if after == -1:
+            start = 0
+            if 0 in history:
+                anchor_revision = -1
+                anchor_hash = zero_hash
+            else:
+                # 修订 0 已随窗口淘汰：锚退到最老在册项之前，其哈希即最老项
+                # 未被缝合的前哈希。
+                anchor_revision = oldest - 1
+                anchor_hash = log[0][5]
+        else:
+            if after < oldest or after > current:
+                raise KeyError(after)
+            start = after - oldest + 1
+            anchor_revision = after
+            anchor_hash = log[start - 1][6]
+
+        # 按索引窗口逐项读取，不复制记录，辅助空间仅 O(C)（单份配置编码）。
+        end = min(len(log), start + limit)
+
+        allowed_ops = (
+            _CONFIG_HISTORY_OP_INIT,
+            _CONFIG_HISTORY_OP_LOAD,
+            _CONFIG_HISTORY_OP_ROLLBACK,
+            _CONFIG_HISTORY_OP_CAS,
+            _CONFIG_HISTORY_OP_REVERT,
+        )
+        expected_revision = anchor_revision
+        prev_revision = anchor_revision
+        prev_hash = anchor_hash
+        checked = 0
+        complete = True
+        breakpoint_revision = -1
+        reason = ""
+        for index in range(start, end):
+            revision, parent, op, target, summary, rec_prev_hash, digest = log[index]
+            expected_revision += 1
+            # 修订须可读（非 bool 的 int）且连续；不可读时断点取 -1。
+            revision_ok = (
+                isinstance(revision, int)
+                and not isinstance(revision, bool)
+                and revision == expected_revision
+            )
+            broken = None
+            if not revision_ok:
+                broken = (revision if isinstance(revision, int)
+                          and not isinstance(revision, bool) else -1, "修订")
+            if broken is None and parent != prev_revision:
+                broken = (revision, "父修订")
+            if broken is None:
+                if op not in allowed_ops:
+                    broken = (revision, "操作")
+                elif op == _CONFIG_HISTORY_OP_INIT:
+                    if revision != 0 or target != -1:
+                        broken = (revision, "目标")
+                elif op == _CONFIG_HISTORY_OP_REVERT:
+                    # 回退目标须为非 bool 非负 int 且小于父修订。
+                    if (
+                        not isinstance(target, int)
+                        or isinstance(target, bool)
+                        or target < 0
+                        or target >= parent
+                    ):
+                        broken = (revision, "目标")
+                elif target != -1:
+                    broken = (revision, "目标")
+            if broken is None:
+                # 记录在册而对应快照缺失或已损坏（二者应同寿命、同形态）：
+                # 无法按 config_revision 口径重算摘要，记“快照”。
+                spec = history.get(revision)
+                recomputed_summary = None
+                if spec is not None:
+                    try:
+                        recomputed_summary = hashlib.sha256(
+                            _compact_config(spec).encode("utf-8")
+                        ).hexdigest()
+                    except Exception:
+                        recomputed_summary = None
+                if spec is None:
+                    broken = (revision, "快照")
+                elif recomputed_summary is None:
+                    broken = (revision, "快照")
+                elif summary != recomputed_summary:
+                    broken = (revision, "摘要")
+            if broken is None and rec_prev_hash != prev_hash:
+                broken = (revision, "前哈希")
+            if broken is None:
+                try:
+                    recomputed_hash = self._config_history_hash(
+                        revision, parent, op, target, summary, rec_prev_hash
+                    )
+                except Exception:
+                    recomputed_hash = None
+                if recomputed_hash is None or digest != recomputed_hash:
+                    broken = (revision, "哈希")
+
+            if broken is not None:
+                breakpoint_revision, reason = broken
+                complete = False
+                break
+
+            checked += 1
+            prev_revision = revision
+            prev_hash = digest
+
+        tail_hash = prev_hash
+        payload = {
+            "锚修订": anchor_revision,
+            "锚哈希": anchor_hash,
+            "检查": checked,
+            "完整": complete,
+            "断点": breakpoint_revision,
+            "原因": reason,
+            "末哈希": tail_hash,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def config_cas(self, key, text, expected, now_ms):
         """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
 
