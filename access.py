@@ -5,7 +5,9 @@
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/升级/加载/回滚
-  export_config/upgrade_config/load_config/rollback_config、QoS 模板查询 qos、按
+  export_config/upgrade_config/load_config/rollback_config、修订查询/CAS 提交/
+  历史回退 config_revision/config_cas/config_revert（构造态为修订 0，保留最近
+  256 个配置修订供回退）、QoS 模板查询 qos、按
   (用户,模板) 共享账本计量的 meter、配额只读快照 quota_stats、共享账本检查点
   quota_checkpoint 与按 key 原子恢复 quota_restore、按用户/模板分组的
   计量统计 meter_stats、容量申请
@@ -881,6 +883,9 @@ _MAX_QUEUE_LIMIT = 10000
 # QoS 模板并发会话上限：0..10000，0 表示不限。
 _MAX_TEMPLATE_SESSIONS = 10000
 _CONFIG_VERSION = 6
+# 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
+# 最旧项，当前修订永不淘汰。
+_CONFIG_HISTORY_LIMIT = 256
 
 # fault 操作与后端状态。
 _OP_INJECT = "注入"
@@ -1027,6 +1032,19 @@ class Sessions:
     提交替换认证策略但保留认证记录（凭据、失败计数、锁定）；
     rollback_config 经同样校验恢复旧配置（含认证策略）并清除回滚点，无回滚点
     抛 StateError。
+    配置修订历史保留最近 256 个修订：构造态为修订 0，load_config/
+    rollback_config/config_cas 及历史回退首次成功后生成并保存提交态新修订，
+    修订沿既有规则递增，失败、只读升级与同参重放不保存，超限淘汰最旧项且
+    不淘汰当前项。config_revision() 只读返回“修订:int、摘要:str”。
+    config_cas(key, text, expected, now_ms) 比较修订并原子加载，返回
+    “修订/前摘要/后摘要”，同 key 同型同参重放原字节且不再比较修订，异参
+    ValueError，仅缓存成功。config_revert(key, target, expected, now_ms)
+    原子回退到历史保留修订：参数须为非 bool 非负 int，先比较 expected
+    （不符 StateError(expected, current) 且不查目标），target>=expected
+    抛 ValueError，目标未保留抛 KeyError(target)，目标快照按 load_config
+    承载规则加载（冲突 ResourceError），成功覆盖回滚点、保存新修订并返回
+    “修订:int、目标:int、前摘要:str、后摘要:str”；同 key 同型同参重放
+    原字节且不再比较修订，异参 ValueError，仅缓存成功，不审计。
     export/load/rollback 成功均返回 v6 配置 JSON，会话状态、期限、地址、租期与
     旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
     qos(sid) 以 O(1) 返回
@@ -1332,9 +1350,16 @@ class Sessions:
         self._chain_tail = "0" * 64
         # 配置回滚点：最近一次成功 load_config 前的规范化 spec，无则 None。
         self._rollback = None
-        # 配置修订号：初值 0，load_config/rollback_config 成功（含经
-        # config_change/config_cas 提交）加 1；失败、导出与升级不变。
+        # 配置修订号：初值 0，load_config/rollback_config/config_revert
+        # 成功（含经 config_change/config_cas 提交）加 1；失败、导出与升级
+        # 不变。
         self._revision = 0
+        # 配置修订历史：修订号 -> 该修订提交后的规范化 spec，构造态修订 0
+        # 初始在册；仅 load_config/rollback_config/config_revert 首次成功后
+        # 追加当前修订，失败、只读升级与同参重放不写入。保留最近
+        # _CONFIG_HISTORY_LIMIT 项：超限时淘汰最小修订号，当前修订不淘汰
+        # （故修订 0 亦可在窗口满后被淘汰）。
+        self._config_history = {0: self._current_spec()}
 
         # capacity 等待队列：sid -> [user, 申请时刻, 等待, 截止, 入队序]，
         # _queue_order 为按入队序的 sid 列表，_queue_seq 为下一入队序。
@@ -1393,6 +1418,10 @@ class Sessions:
         # key -> (text, expected, now_ms, 结果)；仅首次成功缓存，失败
         # （含参数错与修订不符）不占 key。本接口不审计，无原序号索引。
         self._config_cas_cache = {}
+        # config_revert 历史回退的重放缓存，与其余各域独立：
+        # key -> (target, expected, now_ms, 结果)；仅首次成功缓存，失败
+        # （含参数错、修订不符与目标未保留）不占 key。本接口不审计。
+        self._config_revert_cache = {}
         # credential_change 凭据轮换的重放缓存，与其余各域独立：
         # key -> (user, old_password, new_password, now_ms, outcome)；原序号
         # 索引亦独立分域。
@@ -6744,6 +6773,23 @@ class Sessions:
             if pool_id in new_pools
         }
 
+    def _commit_config(self, spec, new_pools, rollback_spec):
+        """校验通过后原子提交配置：覆盖回滚点、安装 spec、修订号加 1，并把
+        新修订的 spec 写入历史后按 _CONFIG_HISTORY_LIMIT 淘汰最旧项。
+
+        仅在 _build_pools 成功后调用；调用方负责先解析/承载校验，任何失败
+        都不进入本方法，故本方法不改变“失败不改状态”的既有语义。修订号
+        单调递增，新写入项恒为最大键、永不被淘汰；窗口溢出时仅淘汰最小
+        修订号（构造态修订 0 亦可在窗口满后被淘汰）。
+        """
+        self._rollback = rollback_spec
+        self._install_spec(spec, new_pools)
+        self._revision += 1
+        history = self._config_history
+        history[self._revision] = self._current_spec()
+        if len(history) > _CONFIG_HISTORY_LIMIT:
+            del history[min(history)]
+
     def load_config(self, text):
         """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v6 JSON。
 
@@ -6753,10 +6799,11 @@ class Sessions:
         引用（用户模板引用未注册用户或未知模板标识）错抛 ValueError；上限、
         模板占用、租约或队长承载不满足抛 ResourceError。v1-v4 迁移时认证节
         补认证器当前两值，v1-v5 迁移时模板会话上限补 0。全部校验通过后原子
-        提交：失败不改配置、回滚点、会话、租约与运行态；成功不老化，会话与
-        租约不变，认证策略随配置替换但认证记录（凭据、失败计数、锁定）保留，
-        新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点并将配置修订号
-        加 1；失败修订号不变。
+        提交：失败不改配置、历史、回滚点、会话、租约与运行态；成功不老化，
+        会话与租约不变，认证策略随配置替换但认证记录（凭据、失败计数、锁定）
+        保留，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点并将配置
+        修订号加 1，新修订（连同构造态修订 0）保留在最近 256 项修订历史中，
+        超限淘汰最旧项且不淘汰当前项；失败修订号与历史不变。
         """
         doc = _load_config_doc(text)
         if isinstance(doc, dict) and "源版本" in doc:
@@ -6771,25 +6818,22 @@ class Sessions:
                     f"user template user not in authenticator: {user!r}"
                 )
         new_pools = self._build_pools(spec)
-        self._rollback = self._current_spec()
-        self._install_spec(spec, new_pools)
-        self._revision += 1
+        self._commit_config(spec, new_pools, self._current_spec())
         return self.export_config()
 
     def rollback_config(self):
         """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v6 JSON。
 
-        无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点或
-        运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，认证策略一并
-        恢复（认证记录保留），不老化。
+        无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点、
+        历史或运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，生成
+        并保留新修订历史项（最近 256 项，超限淘汰最旧项且不淘汰当前项），
+        认证策略一并恢复（认证记录保留），不老化。
         """
         spec = self._rollback
         if spec is None:
             raise StateError("no config rollback point")
         new_pools = self._build_pools(spec)
-        self._rollback = None
-        self._install_spec(spec, new_pools)
-        self._revision += 1
+        self._commit_config(spec, new_pools, None)
         return self.export_config()
 
     def _config_summary(self):
@@ -6802,7 +6846,10 @@ class Sessions:
         """只读返回当前配置修订号与摘要的 LF 尾紧凑 JSON。
 
         键序/型为“修订:int、摘要:str”；修订号初值 0，load_config/
-        rollback_config 成功加 1，失败、导出与升级不变；摘要为
+        rollback_config/config_cas/config_revert 首次成功加 1，失败、导出、
+        升级与同参重放不变；每次成功提交的配置按修订号保留在最近 256 项
+        历史中（构造态为修订 0），供 config_revert 回退，超限淘汰最旧项且
+        不淘汰当前项；摘要为
         export_config 去尾 LF 的 UTF-8 字节 sha256 小写值。不审计、不改
         任何状态；O(n log n) 时间、O(n) 空间（导出需排序）。
         """
@@ -6816,7 +6863,8 @@ class Sessions:
         int；类型错抛 TypeError，取值错抛 ValueError。验参后先比较
         expected 与当前修订号：不等抛 StateError(expected, current)，不解析
         text；相等时按 load_config 规则加载，文档非法抛 ValueError、承载
-        冲突抛 ResourceError。成功原子提交、覆盖回滚点、修订号加 1，返回
+        冲突抛 ResourceError。成功原子提交、覆盖回滚点、修订号加 1 并保存
+        新修订历史项（最近 256 项，超限淘汰最旧项且不淘汰当前项），返回
         键序/型“修订:int、前摘要:str、后摘要:str”的 JSON，两摘要同
         config_revision 定义（分别为提交前、后的配置摘要）。
 
@@ -6867,6 +6915,90 @@ class Sessions:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
         self._config_cas_cache[key] = (text, expected, now_ms, result)
+        return result
+
+    def config_revert(self, key, target, expected, now_ms):
+        """原子回退到历史保留的配置修订，返回 LF 尾紧凑 JSON。
+
+        key 沿用凭据约束；target/expected/now_ms 须为非 bool 非负 int，类型
+        错抛 TypeError，负值抛 ValueError。验参后先比较 expected 与当前修订
+        号：不等抛 StateError(expected, current)，不查目标；target >= expected
+        抛 ValueError；目标修订未保留（构造态修订 0 初始在册，窗口满后亦可
+        被淘汰；在册的为最近 256 项）抛 KeyError(target)。目标快照按 load_config 的承载规则原子
+        加载：承载冲突抛 ResourceError。成功后覆盖唯一回滚点（记回退前配置）、
+        生成并保存新修订（修订号在当前值上加 1，沿用既有递增规则；历史保留
+        最近 256 项，超限淘汰最旧项且不淘汰当前项），返回键序/型
+        “修订:int、目标:int、前摘要:str、后摘要:str”的 JSON，两摘要同
+        config_revision 定义（分别为提交前、后的配置摘要）。失败不改配置、
+        历史、回滚点与运行态。
+
+        重放缓存与各域独立且仅缓存首次成功：同型同参重放不再比较修订号、
+        不查目标、不加载，原样返回首次字节；异参抛 ValueError；任何失败
+        （含参数错、修订不符、目标未保留与承载冲突）不占 key 且不改实例。
+        本接口不审计。首次 O(n log n + S + Q) 时间、O(n) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._config_revert_cache.get(key)
+        if cached is not None:
+            # 重放：不比较修订号、不查目标、不加载，仅核对同型同参后返回
+            # 原字节。
+            c_target, c_expected, c_now_ms, result = cached
+            if not _strict_equal(
+                (target, expected, now_ms),
+                (c_target, c_expected, c_now_ms),
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        # 类型阶段：按 target、expected、now_ms 声明顺序，任一类型错先于
+        # 任何值错抛出。
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise TypeError(
+                f"target must be an int, got {type(target).__name__}"
+            )
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise TypeError(
+                f"expected must be an int, got {type(expected).__name__}"
+            )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+        # 取值阶段：三个参数均非负，按同一声明顺序。
+        if target < 0:
+            raise ValueError(f"target must be >= 0, got {target}")
+        if expected < 0:
+            raise ValueError(f"expected must be >= 0, got {expected}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+
+        # 先比修订号，不符不得查目标；失败不占 key、不改实例。
+        if expected != self._revision:
+            raise StateError(expected, self._revision)
+        if target >= expected:
+            raise ValueError(
+                f"target must be < expected {expected}, got {target}"
+            )
+        spec = self._config_history.get(target)
+        if spec is None:
+            raise KeyError(target)
+
+        # 按 load_config 承载规则原子加载目标快照：承载冲突 ResourceError，
+        # _build_pools 不改状态，故失败配置、历史、回滚点与运行态均不变。
+        before = self._config_summary()
+        new_pools = self._build_pools(spec)
+        self._commit_config(spec, new_pools, self._current_spec())
+        after = self._config_summary()
+        payload = {
+            "修订": self._revision,
+            "目标": target,
+            "前摘要": before,
+            "后摘要": after,
+        }
+        result = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        self._config_revert_cache[key] = (target, expected, now_ms, result)
         return result
 
     def config_change(self, key, op, text, now_ms):
