@@ -7443,6 +7443,127 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_history_diff(self, left, right):
+        """只读比较两个仍保留的配置快照，返回 LF 尾紧凑 JSON。
+
+        left/right 须为非 bool 非负 int：类型错抛 TypeError，负值抛
+        ValueError（按 left、right 声明顺序，类型阶段先于取值阶段）；校验
+        通过后依 left、right 在保留的配置历史（最近 256 项）中查找，任一
+        修订未保留抛 KeyError(修订)（先 left 后 right）。
+
+        比较两份快照的规范 v6 配置（同 export_config 的规范化负载）：对象
+        取两侧键并集逐键递归，数组按索引逐位递归；一侧缺失或两侧节点类型
+        不同（对象/数组/叶值互异）就在当前路径记一项，两侧同为叶值时仅当
+        值不同记一项。路径用 JSON Pointer：根为空串，键段前缀“/”，“~”
+        转义为“~0”、“/”转义为“~1”（先转 ~ 再转 /），数组索引段为十进制
+        下标；项目按路径 Unicode 码点升序。每项的左值/右值均为 str：存在
+        值用基线紧凑 JSON 编码（ensure_ascii=False、无空白），缺失为空串。
+
+        顶层键序/型为“左修订:int、右修订:int、改变:bool、变更:list、
+        摘要:str”；变更项键序/型为“路径:str、左值:str、右值:str”；改变
+        恒等于变更非空。摘要为前四键（左修订/右修订/改变/变更）同法紧凑
+        编码的 UTF-8 字节 sha256 小写十六进制。不老化、不缓存、不审计、不
+        改任何状态；同态同参逐字节相同。时间 O(C+D·log D)、辅助空间 O(D)，
+        C 为两份规范配置的编码成本、D 为变更项数。
+        """
+        # 类型阶段：按 left、right 声明顺序。
+        if isinstance(left, bool) or not isinstance(left, int):
+            raise TypeError(f"left must be an int, got {type(left).__name__}")
+        if isinstance(right, bool) or not isinstance(right, int):
+            raise TypeError(f"right must be an int, got {type(right).__name__}")
+
+        # 取值阶段。
+        if left < 0:
+            raise ValueError(f"left must be >= 0, got {left}")
+        if right < 0:
+            raise ValueError(f"right must be >= 0, got {right}")
+
+        # 查找：先 left 后 right；未保留抛 KeyError(修订)。
+        left_spec = self._config_history.get(left)
+        if left_spec is None:
+            raise KeyError(left)
+        right_spec = self._config_history.get(right)
+        if right_spec is None:
+            raise KeyError(right)
+
+        left_doc = _config_payload(left_spec)
+        right_doc = _config_payload(right_spec)
+        missing = object()
+        changes = []
+
+        def encode(value):
+            if value is missing:
+                return ""
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            )
+
+        def type_kind(value):
+            if isinstance(value, dict):
+                return "object"
+            if isinstance(value, list):
+                return "array"
+            return "leaf"
+
+        def walk(a, b, pointer):
+            a_missing = a is missing
+            b_missing = b is missing
+            if a_missing or b_missing:
+                # 一侧缺失：当前路径记一项，存在值紧凑编码、缺失为空串。
+                changes.append((pointer, encode(a), encode(b)))
+                return
+            a_kind = type_kind(a)
+            b_kind = type_kind(b)
+            if a_kind != b_kind:
+                # 节点类型不同（对象/数组/叶值互异）：当前路径记一项。
+                changes.append((pointer, encode(a), encode(b)))
+                return
+            if a_kind == "object":
+                # 对象取键并集；仅一侧存在的键由下一层记为缺失。
+                for key in a.keys() | b.keys():
+                    token = str(key).replace("~", "~0").replace("/", "~1")
+                    walk(
+                        a.get(key, missing),
+                        b.get(key, missing),
+                        pointer + "/" + token,
+                    )
+            elif a_kind == "array":
+                # 数组按索引递归；越界侧记为缺失。
+                for index in range(max(len(a), len(b))):
+                    child = pointer + "/" + str(index)
+                    if index < len(a) and index < len(b):
+                        walk(a[index], b[index], child)
+                    elif index < len(a):
+                        walk(a[index], missing, child)
+                    else:
+                        walk(missing, b[index], child)
+            elif a != b:
+                # 两侧同为叶值：仅记不同值。
+                changes.append((pointer, encode(a), encode(b)))
+
+        walk(left_doc, right_doc, "")
+        # 路径按 Unicode 码点升序（Python 默认 str 序即码点序）。
+        changes.sort(key=lambda item: item[0])
+
+        head = {
+            "左修订": left,
+            "右修订": right,
+            "改变": bool(changes),
+            "变更": [
+                {"路径": path, "左值": lv, "右值": rv}
+                for path, lv, rv in changes
+            ],
+        }
+        head_blob = json.dumps(
+            head, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        payload = dict(head)
+        payload["摘要"] = hashlib.sha256(head_blob).hexdigest()
+        return (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        )
+
     def config_audit_reconcile(self):
         """
         只读对账……规则与输出契约见下；本公开方法为不抛异常的总入口：
@@ -7707,11 +7828,26 @@ class Sessions:
                     else anchor_revision
                 )
             else:
-                # 候选无对应在册记录（缺失/多余）：断点修订 -1，此前在册记录
-                # 均已通过，检查计全部在册扫描项。
+                # 多余候选（其后再无在册“加载/回滚”记录可配）：断点修订
+                # -1、断点审计取候选事件序号；检查与末修订仅保留此前已通过
+                # 修订——即正向配对游标之前已消费的末个在册记录（其前在册
+                # 项含交错的构造/直接记录均已通过），无已配对记录时检查为
+                # 0、末修订取锚修订。
                 revision_bp = -1
-                passed = len(log) - start
-                last_rev = log[-1][0] if len(log) > start else anchor_revision
+                if conflict_record_index > 0:
+                    passed_log_index = load_rollback_records[
+                        conflict_record_index - 1
+                    ][0]
+                    passed = passed_log_index - start + 1
+                    last_rev = log[passed_log_index][0]
+                    if not (
+                        isinstance(last_rev, int)
+                        and not isinstance(last_rev, bool)
+                    ):
+                        last_rev = anchor_revision
+                else:
+                    passed = 0
+                    last_rev = anchor_revision
             return render(
                 passed, False, revision_bp, audit_bp, "来源",
                 last_rev, total_audit,
