@@ -7468,22 +7468,30 @@ class Sessions:
         已淘汰时最老在册项作为可信锚不重验、不计），再做索引与链级复核。
         config_change 域的“键 → 首次事件序号”索引为权威指认：构造与直接项
         无关联；事务项（加载/回滚）由其键缓存原调操作与首果配置摘要
-        (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。配对采用
-        保序最晚贪心：成功加载/回滚首调事件按序号倒序，逐个匹配最后一个仍
-        空闲的同 (操作, 摘要) 在册记录——回滚/回退常重建早前配置摘要，最晚
-        同摘要记录才是该事务真正产生的修订；早于在册窗口的候选无匹配时落入
-        可信边界，直接记录恒不被占用。配对项的指认事件须为同键、原序号 0
-        的首事件，操作须为“配置加载/配置回滚”且与缓存原调及历史操作一致
-        （违例归“操作”），缓存首果与事件结果须同为“成功”（违例归“结果”），
-        键、时刻取原调用且会话为空串（时刻须等于缓存首调时刻，违例归“关联”）；
-        配对事件序号须随修订升序单调（违例归“来源”）。修订无配对候选即为
-        直接来源，合法。索引复核（断点修订 -1、断点审计取首次事件序号；
-        已与在册修订配对的首事件不重验）：每个键指认的首事件须存在、原序号
-        0、同键、同操作、同时刻、结果名与缓存首果相符（成功或业务异常类名）、
-        会话为空串，缓存缺失或指认失效归“关联”。链级复核（按事件序号升序，
-        不关联修订）：config_change 三操作的原序号 0 事件须恰为其键索引指认
-        事件（重复或未指认归“关联”，自报重放归“重放”）；原序号非 0 的
-        重放事件须指向其前同键同操作、原序号 0 的首次事件，结果须为
+        (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。候选按审
+        计序号升序收集：仅 config_change 首次“加载/回滚”成功事件——原序
+        号 0、由同键索引指认（索引[事件键] == 序号）且缓存首果成功，失败、
+        升级与重放不入候选；由缓存返回的 v6 配置 JSON 按既有口径（去尾 LF
+        的 UTF-8 字节 sha256）求摘要。再按修订升序扫描在册“加载/回滚”记录。
+        候选只允许丢弃一个连续前缀作为已淘汰边界（其数量连同更早已在窗口外
+        的候选不超过锚前在册外修订容量），剩余候选必须在记录中形成保序一一
+        映射：操作与摘要逐项相同、占用修订随审计序号严格递增，未被映射的在
+        册记录才可判为直接来源。回滚/回退常重建早前配置摘要，同摘要直接记录
+        不得用于跨序换配：禁止分组贪心换配、跳过候选或逆序配对。缺失（事务
+        修订无对应候选）、多余（候选无对应修订）或失序（操作/摘要相同但占
+        用越序）时在首个分歧即归“来源”：断点修订取冲突记录修订（无对应记
+        录取 -1）、断点审计取冲突事件序号（无对应事件取 -1），检查只计此
+        前已通过修订。配对项的指认事件须为同键、原序号 0 的首事件，操作须
+        为“配置加载/配置回滚”且与缓存原调及历史操作一致（违例归“操作”），
+        缓存首果与事件结果须同为“成功”（违例归“结果”），键、时刻取原调
+        用且会话为空串（时刻须等于缓存首调时刻，违例归“关联”）。修订无
+        配对候选即为直接来源，合法。索引复核（断点修订 -1、断点审计取首次
+        事件序号；已与在册修订配对的首事件不重验）：每个键指认的首事件须存在、
+        原序号 0、同键、同操作、同时刻、结果名与缓存首果相符（成功或业务异常
+        类名）、会话为空串，缓存缺失或指认失效归“关联”。链级复核（按事件序
+        号升序，不关联修订）：config_change 三操作的原序号 0 事件须恰为其键
+        索引指认事件（重复或未指认归“关联”，自报重放归“重放”）；原序号
+        非 0 的重放事件须指向其前同键同操作、原序号 0 的首次事件，结果须为
         “重放成功”或“重放”加首果名（违例归“重放”）。配置升级及其余域
         事件不关联修订。
 
@@ -7604,20 +7612,41 @@ class Sessions:
         cindex = self._config_change_chain_index
         ccache = self._config_change_cache
 
-        # 候选选取：在册修订是修订序列的连续后缀，故事务首调事件与在册
-        # load/rollback 修订的配对整体构成候选事件序列的一个后缀（更早的
-        # 成功首调皆对应已淘汰修订）。自链尾反向取至多 H 个由域索引指认
-        # （cindex[事件键] == 序号）、缓存原调为成功加载/回滚的原序号 0
-        # 事件；识别仅用 O(1) 字段与缓存判定，配置摘要只对这至多 H 个
-        # 候选计算（O(H·C)），不哈希全链。事件字段本身仍是被验对象，篡改
-        # 致错配时由 3.1/3.2/3.3 捕获。
-        retained_count = len(log)
-        selected = []
-        for index in range(total_audit - 1, -1, -1):
-            event = chain[index]
+        # 候选选取（按审计序号升序收集）：仅 config_change 首次“加载/回滚”
+        # 成功事件——原序号 0、由同键域索引指认（cindex[事件键] == 序号）、
+        # 缓存原调为成功加载/回滚；失败与升级不产生修订，不入候选。候选事件
+        # 即全部事务修订的提交序（记录先提交、事件后入链），识别只用 O(1)
+        # 字段与缓存判定。在册修订是修订序列的连续后缀：仅历史扫描范围内的
+        # 在册“加载/回滚”记录（可信锚记录除外）参与配对。尾部保留“在
+        # 册记录位 + 锚前边界容量 + 1”个合格事件（定长环，O(H) 空间）：
+        # 多留的边界容量用于容纳可能落在已淘汰窗口的同摘要候选，末位 +1
+        # 用于定位首个越界的多余候选；更早的成功首调对应已淘汰事务修订
+        # （可信边界，不计配置摘要）。摘要只对尾部候选按既有口径（缓存返回
+        # 的 v6 配置 JSON 去尾 LF 的 UTF-8 字节 sha256）计算，O(H·C)，不
+        # 哈希全链。全链 O(1) 扫描为 O(A)。
+        match_records = [
+            record for record in log[scan["start"]:]
+            if record[2] in (
+                _CONFIG_HISTORY_OP_LOAD,
+                _CONFIG_HISTORY_OP_ROLLBACK,
+            )
+        ]
+        n_rec = len(match_records)
+        # 扫描范围之前可容纳的事务修订上界：修订 0 在册时为 0；修订 0 已
+        # 淘汰时为锚修订（修订 1..锚修订，锚记录本身可信不重验）。
+        boundary_max = anchor_revision if anchor_revision >= 0 else 0
+        # 尾部保留宽度：在册记录位 + 边界容量 + 1（多出的一个用于定位首个
+        # 无对应项的多余候选序号），恒为 O(H) 辅助空间。
+        width = n_rec + boundary_max + 1
+        trail = [None] * width
+        trail_pos = 0
+        qualifier_total = 0
+        # 仅一个标量：候选总数越过“边界容量 + 在册记录位”时，第
+        # boundary_max+1 个候选（审计升序）即首个无对应项的多余事件，记录
+        # 其序号以供断点审计（保持 O(H) 辅助空间）。
+        first_excess_seq = -1
+        for event in chain:
             seq, _ev_now, ev_key, _ev_op, _sid, _result, origin = event[:7]
-            if len(selected) >= retained_count:
-                break
             # 键须为 str 才能查域索引；非 str 键的链项不入候选（由 3.3 归
             # “关联”），亦保证不抛异常。
             if (
@@ -7638,125 +7667,211 @@ class Sessions:
                 or not isinstance(outcome[1], str)
             ):
                 continue
+            qualifier_total += 1
+            if qualifier_total == boundary_max + 1:
+                first_excess_seq = seq
+            trail[trail_pos % width] = (seq, ev_key, cache)
+            trail_pos += 1
+        kept = min(qualifier_total, width)
+        trail_base = trail_pos - kept
+        trail_window = [
+            trail[(trail_base + i) % width] for i in range(kept)
+        ]
+        candidates = []
+        for fseq, ckey, cache in trail_window:
             try:
                 config_digest = hashlib.sha256(
-                    outcome[1][:-1].encode("utf-8")
+                    cache[3][1][:-1].encode("utf-8")
                 ).hexdigest()
             except Exception:
                 config_digest = None
-            selected.append((seq, ev_key, cache, config_digest))
-        selected.reverse()  # 回到事件序号升序（反向配对时倒序迭代）。
+            candidates.append((fseq, ckey, cache, config_digest))
+        # 早于尾部窗口的合格候选数（对应已淘汰事务修订，必为可信边界）。
+        boundary_used = qualifier_total - kept
 
-        # 保序配对（O(H) 摊还）：成功加载/回滚首调事件序列即全部事务修订
-        # 的提交序，在册事务修订是其连续后缀（直接修订在记录侧交错、已淘汰
-        # 事务修订的候选在事件侧为前缀）。每个 (操作, 摘要) 组维护在册记录
-        # 下标升序栈；自链尾向首处理候选，弹出大于全局游标的下标（游标只减，
-        # 这些下标再无可用之时），取栈顶即“最后一个仍空闲且同组”的记录
-        # （最晚匹配贪心）：回滚/回退常重建早前配置摘要，最晚同摘要记录才是
-        # 该事务真正产生的修订；组栈空的前缀候选对应已淘汰修订，落入可信
-        # 边界，直接记录虽可同摘要但配对恒保序且可由 3.1/3.3 复核。
-        load_rollback_records = [
-            record for record in log
-            if record[2] in (
-                _CONFIG_HISTORY_OP_LOAD,
-                _CONFIG_HISTORY_OP_ROLLBACK,
-            )
-        ]
-        stacks_by_group = {}
-        for j, group_record in enumerate(load_rollback_records):
-            stacks_by_group.setdefault(
-                (group_record[2], group_record[4]), []
-            ).append(j)
-        paired = {}
-        record_cursor = len(load_rollback_records) - 1
-        for fseq, ckey, cache, config_digest in reversed(selected):
+        # 保序一一配对（禁止分组贪心换配、跳过候选或逆序）：自候选末与在
+        # 册记录末共用单一游标反向扫描（不按 (操作, 摘要) 分组）——每个候
+        # 选取游标前最后一个同 (操作, 摘要) 的在册记录并占用、游标只减，
+        # 全部记录至多扫描一遍，O(H)；游标前无同组记录的候选无配对。这给
+        # 出唯一的最大保序后缀嵌入：回滚/回退常重建早前配置摘要，最晚同摘
+        # 要记录才是该事务真正产生的修订，直接记录可同摘要但不被占用。占
+        # 用下标随候选升序严格递增（剩余候选与在册记录保序一一映射），未
+        # 占用记录才判为直接来源。无配对候选必须整体构成候选的连续前缀
+        # （首个占用位置之前），其连同窗口前候选按连续前缀丢弃为已淘汰边
+        # 界且总数不越 boundary_max——旧实现按分组栈丢弃而无此连续前缀与
+        # 容量约束，互换首事件并同步索引时在窗候选被伪装成已淘汰而漏检。
+        claim_record = [-1] * kept
+        record_cursor = n_rec - 1
+        for ci in range(kept - 1, -1, -1):
+            _fseq, _ckey, cache, config_digest = candidates[ci]
             if config_digest is None:
                 continue
-            stack = stacks_by_group.get((cache[0], config_digest))
-            if not stack:
-                # 早于在册窗口（或无空闲同组记录）：前缀候选为可信边界，
-                # 游标不动。
+            group = (cache[0], config_digest)
+            scan_index = record_cursor
+            while scan_index >= 0:
+                group_record = match_records[scan_index]
+                if (group_record[2], group_record[4]) == group:
+                    break
+                scan_index -= 1
+            if scan_index < 0:
                 continue
-            while stack and stack[-1] > record_cursor:
-                stack.pop()
-            if not stack:
-                continue
-            found_index = stack.pop()
-            pair_record = load_rollback_records[found_index]
-            paired[pair_record[0]] = (fseq, ckey, cache, config_digest)
-            record_cursor = found_index - 1
+            claim_record[ci] = scan_index
+            record_cursor = scan_index - 1
+        first_claimed = kept
+        for ci in range(kept):
+            if claim_record[ci] >= 0:
+                first_claimed = ci
+                break
 
         # 3.1 按修订升序验在册项（可信锚记录不重验、不计；构造/CAS/回退恒
-        # 为无关联来源；加载/回滚无配对候选即为直接来源）。检查逐项计，
-        # 末修订取前一通过项（无通过项取锚修订）。
+        # 为无关联来源；加载/回滚未被候选占用即为直接来源）。配对占用按候
+        # 选升序逐记录消费：遇记录先放行其前的连续前缀丢弃候选（须整体在
+        # 首个占用之前、且连同窗口前候选不越 boundary_max——违例即缺失/
+        # 多余/失序的首个分歧，归“来源”，断点修订取当前记录、断点审计取
+        # 冲突事件序号），当前候选占用下标越过本记录则本记录为直接来源，
+        # 相等则校验指认事件的关联/操作/结果字段。检查逐项计，末修订取前
+        # 一通过项（无通过项取锚修订）。
         checked = 0
         last_good_revision = anchor_revision
         last_paired_seq = 0
+        candidate_pos = 0
+        record_pos = 0
+        paired_keys = set()
         for record in log[scan["start"]:]:
             revision, _parent, hist_op, _target, _summary, _ph, _h = record
-            candidate = paired.get(revision)
-            if candidate is not None:
-                fseq, ckey, cache, config_digest = candidate
-                # 索引指认须可读且落在链内；事件须为同键的原序号 0 首事件。
-                fseq_ok = (
-                    isinstance(fseq, int)
-                    and not isinstance(fseq, bool)
-                    and 1 <= fseq <= total_audit
-                )
-                first_event = chain[fseq - 1] if fseq_ok else None
-                if (
-                    not fseq_ok
-                    or first_event is None
-                    or first_event[6] != 0
-                    or first_event[2] != ckey
+            if hist_op in (
+                _CONFIG_HISTORY_OP_LOAD,
+                _CONFIG_HISTORY_OP_ROLLBACK,
+            ):
+                # 放行该记录之前的连续前缀丢弃候选（首个占用之前、边界容
+                # 量之内）。
+                while (
+                    candidate_pos < kept
+                    and claim_record[candidate_pos] < 0
                 ):
-                    return render(
-                        checked, False, revision,
-                        fseq if fseq_ok else -1, "关联",
-                        last_good_revision, total_audit,
-                    )
-                (_ev_seq, ev_now, _ev_key, ev_op, ev_sid,
-                 ev_result, ev_origin) = first_event[:7]
-                # 配对事件序号须随修订升序单调（记录先提交、事件后入链）。
-                if fseq <= last_paired_seq:
-                    return render(
-                        checked, False, revision, fseq, "来源",
-                        last_good_revision, total_audit,
-                    )
-                c_op, _c_text, c_now_ms, outcome = cache
-                # 操作匹配历史：缓存原调操作映射的链操作须等于事件操作，且
-                # 原调操作须等于历史记录操作（加载↔配置加载、回滚↔配置回滚）。
-                if _CONFIG_CHAIN_OP.get(c_op) != ev_op or c_op != hist_op:
-                    return render(
-                        checked, False, revision, fseq, "操作",
-                        last_good_revision, total_audit,
-                    )
-                # 事务首事件结果须为“成功”，缓存首果须同为成功。
-                if outcome[0] != "ok" or ev_result != "成功":
-                    return render(
-                        checked, False, revision, fseq, "结果",
-                        last_good_revision, total_audit,
-                    )
-                # 键、时刻取原调用：事件键须为缓存键（上方已验同源），时刻
-                # 须等于首调时刻；config_change 事件会话恒为空串。
-                if ev_now != c_now_ms or ev_sid != "":
-                    return render(
-                        checked, False, revision, fseq, "关联",
-                        last_good_revision, total_audit,
-                    )
-                last_paired_seq = fseq
+                    if (
+                        candidate_pos >= first_claimed
+                        or boundary_used >= boundary_max
+                    ):
+                        if candidate_pos >= first_claimed:
+                            conflict_seq = candidates[candidate_pos][0]
+                        elif boundary_used > boundary_max:
+                            conflict_seq = first_excess_seq
+                        else:
+                            conflict_seq = candidates[candidate_pos][0]
+                        return render(
+                            checked, False, revision, conflict_seq, "来源",
+                            last_good_revision, total_audit,
+                        )
+                    boundary_used += 1
+                    candidate_pos += 1
+                if candidate_pos < kept:
+                    claimed_index = claim_record[candidate_pos]
+                    if claimed_index == record_pos:
+                        fseq, ckey, cache, _digest = candidates[
+                            candidate_pos
+                        ]
+                        candidate_pos += 1
+                        # 索引指认须可读且落在链内；事件须为同键的原序号
+                        # 0 首事件。
+                        fseq_ok = (
+                            isinstance(fseq, int)
+                            and not isinstance(fseq, bool)
+                            and 1 <= fseq <= total_audit
+                        )
+                        first_event = chain[fseq - 1] if fseq_ok else None
+                        if (
+                            not fseq_ok
+                            or first_event is None
+                            or first_event[6] != 0
+                            or first_event[2] != ckey
+                        ):
+                            return render(
+                                checked, False, revision,
+                                fseq if fseq_ok else -1, "关联",
+                                last_good_revision, total_audit,
+                            )
+                        (_ev_seq, ev_now, _ev_key, ev_op, ev_sid,
+                         ev_result, ev_origin) = first_event[:7]
+                        # 配对事件序号须随修订升序单调（记录先提交、事件后
+                        # 入链）；保序配对恒成立，被篡改的失序配对在此暴
+                        # 露。
+                        if fseq <= last_paired_seq:
+                            return render(
+                                checked, False, revision, fseq, "来源",
+                                last_good_revision, total_audit,
+                            )
+                        c_op, _c_text, c_now_ms, outcome = cache
+                        # 操作匹配历史：缓存原调操作映射的链操作须等于事件
+                        # 操作，且原调操作须等于历史记录操作（加载↔配置加
+                        # 载、回滚↔配置回滚）。
+                        if _CONFIG_CHAIN_OP.get(c_op) != ev_op or (
+                            c_op != hist_op
+                        ):
+                            return render(
+                                checked, False, revision, fseq, "操作",
+                                last_good_revision, total_audit,
+                            )
+                        # 事务首事件结果须为“成功”，缓存首果须同为成功。
+                        if outcome[0] != "ok" or ev_result != "成功":
+                            return render(
+                                checked, False, revision, fseq, "结果",
+                                last_good_revision, total_audit,
+                            )
+                        # 键、时刻取原调用：事件键须为缓存键（上方已验同
+                        # 源），时刻须等于首调时刻；config_change 事件会话
+                        # 恒为空串。
+                        if ev_now != c_now_ms or ev_sid != "":
+                            return render(
+                                checked, False, revision, fseq, "关联",
+                                last_good_revision, total_audit,
+                            )
+                        paired_keys.add((ckey, fseq))
+                        last_paired_seq = fseq
+                    # claimed_index > record_pos 时本记录未被占用，为直接
+                    # 来源，候选不动；claim 严格递增，claimed_index <
+                    # record_pos 不出现。
+                record_pos += 1
             checked += 1
             last_good_revision = revision
+
+        # 在册记录全部通过后仍有候选：占用候选无对应记录、前缀候选晚于首
+        # 个占用（失序）或越过边界容量，皆“多余/失序”首个分歧；无对应在
+        # 册记录，断点修订 -1。
+        while candidate_pos < kept:
+            if (
+                claim_record[candidate_pos] >= 0
+                or candidate_pos >= first_claimed
+                or boundary_used >= boundary_max
+            ):
+                if (
+                    claim_record[candidate_pos] < 0
+                    and candidate_pos < first_claimed
+                    and boundary_used > boundary_max
+                ):
+                    conflict_seq = first_excess_seq
+                else:
+                    conflict_seq = candidates[candidate_pos][0]
+                return render(
+                    checked, False, -1, conflict_seq, "来源",
+                    last_good_revision, total_audit,
+                )
+            boundary_used += 1
+            candidate_pos += 1
+        # 尾部窗口之前的合格候选本身已越边界容量（仅内部损坏可致）：第
+        # boundary_max+1 个候选为首个无对应修订的事件。
+        if boundary_used > boundary_max:
+            return render(
+                checked, False, -1, first_excess_seq, "来源",
+                last_good_revision, total_audit,
+            )
 
         # 3.2 索引全量复核（不关联修订，断点修订取 -1）：已与在册修订配对
         # 的首事件在 3.1 验过，此处跳过；其余键指认的首次事件（成功加载/
         # 回滚对应已淘汰修订——可信边界但缓存与事件仍须自洽；失败与升级不
         # 产生修订）须存在、原序号 0、同键，且与缓存原调同操作、同时刻、
         # 结果名相符（成功或业务异常类名）、会话为空串；缓存缺失归“关联”。
-        paired_pairs = {
-            (candidate[1], candidate[0])
-            for candidate in paired.values()
-        }
+        paired_pairs = paired_keys
         for ckey, fseq in cindex.items():
             if (ckey, fseq) in paired_pairs:
                 continue
