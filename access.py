@@ -7021,6 +7021,176 @@ class Sessions:
         payload = {"下个修订": next_revision, "项目": items}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_history_verify(self, after=-1, limit=100):
+        """只读校验防篡改配置历史窗口，查询不老化、不改任何状态，首错即停，
+        返回失败而不抛校验异常（仅参数/取窗异常同 config_history 照抛）。
+
+        参数、异常、取窗规则与 config_history 完全一致：after/limit 须为非
+        bool 的 int，after < -1 或 limit ∉ [1,1000] 抛 ValueError，类型不符抛
+        TypeError，after != -1 且该修订未保留抛 KeyError(after)。
+
+        校验自可信锚起逐项进行，锚不在检查计数内：after != -1 时锚取该在册
+        修订的记录与哈希（其记录本身不复核）；after == -1 且修订 0 在册时锚
+        取修订 -1、哈希 64 个 0；after == -1 而修订 0 已淘汰时锚取最老在册
+        修订减 1 与最老在册项的前哈希（被淘汰前项之哈希，链不缝合）。空窗口
+        仅报告锚。自锚后逐项检查：修订连续且父修订等于前项修订；操作限构造/
+        加载/回滚/CAS/回退，构造仅可出现在修订 0 且目标 -1，回退目标须非负
+        且小于父修订，其余操作目标 -1；摘要等于对应保留快照按 config_revision
+        口径重算的值；前哈希衔前项哈希；哈希可由前六键重算。检查顺序即上述
+        顺序，首错即停。
+
+        返回 LF 尾紧凑 JSON，顶层键序/型为“锚修订:int、锚哈希:str、检查:
+        int、完整:bool、断点:int、原因:str、末哈希:str”。成功完整=true、
+        断点=-1、原因=""；失败完整=false，断点取首错项修订（无可读修订取
+        -1），原因仅取“修订/父修订/操作/目标/快照/摘要/前哈希/哈希”；检查
+        只计完整通过项，末哈希取末个通过项哈希、无通过项取锚哈希。
+        O(limit·C) 时间、O(C) 辅助空间，C 为单份配置编码成本（仅逐份编码不
+        留存）。
+        """
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise TypeError(f"after must be an int, got {type(after).__name__}")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+        if after < -1:
+            raise ValueError(f"after must be >= -1, got {after}")
+        if limit < 1 or limit > 1000:
+            raise ValueError(f"limit must be in 1..1000, got {limit}")
+
+        log = self._config_history_log
+        oldest = log[0][0]
+        current = log[-1][0]
+        if after == -1:
+            start = 0
+        else:
+            if after < oldest or after > current:
+                raise KeyError(after)
+            start = after - oldest + 1
+        # 下标计算取窗，不切片留存：辅助空间仅逐份配置编码 O(C)。
+        end = min(len(log), start + limit)
+
+        zero = "0" * 64
+        if after != -1:
+            # 可信锚取该在册修订项：其记录不复核，哈希直接取自记录。
+            anchor_record = log[after - oldest]
+            anchor_revision = after
+            anchor_hash = anchor_record[6]
+        elif oldest == 0:
+            # 自首项起且构造态修订 0 在册：虚拟锚为修订 -1、64 个 0。
+            anchor_revision = -1
+            anchor_hash = zero
+        else:
+            # 修订 0 已淘汰：锚取最老在册修订减 1 与最老项前哈希。
+            anchor_revision = oldest - 1
+            anchor_hash = log[0][5]
+
+        if start >= end:
+            # 空窗口仅报告锚：无检查项，完整为真。
+            payload = {
+                "锚修订": anchor_revision,
+                "锚哈希": anchor_hash,
+                "检查": 0,
+                "完整": True,
+                "断点": -1,
+                "原因": "",
+                "末哈希": anchor_hash,
+            }
+            return (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+
+        history = self._config_history
+        checked = 0
+        prev_revision = anchor_revision
+        prev_hash = anchor_hash
+        tail_hash = anchor_hash
+        # 断点初值 -1：循环中修订不可读时亦有安全兜底。
+        revision = -1
+        reason = ""
+
+        for i in range(start, end):
+            (
+                revision,
+                parent,
+                op,
+                target,
+                summary,
+                prev_record_hash,
+                digest,
+            ) = log[i]
+            # 1) 修订连续：紧接前项修订。
+            if revision != prev_revision + 1:
+                reason = "修订"
+                break
+            # 2) 父修订等于前项修订。
+            if parent != prev_revision:
+                reason = "父修订"
+                break
+            # 3) 操作合法；构造仅修订 0 且目标 -1，回退目标非负且小于父修订，
+            # 其余操作目标 -1。
+            if op not in (
+                _CONFIG_HISTORY_OP_INIT,
+                _CONFIG_HISTORY_OP_LOAD,
+                _CONFIG_HISTORY_OP_ROLLBACK,
+                _CONFIG_HISTORY_OP_CAS,
+                _CONFIG_HISTORY_OP_REVERT,
+            ):
+                reason = "操作"
+                break
+            if op == _CONFIG_HISTORY_OP_INIT:
+                if revision != 0:
+                    reason = "操作"
+                    break
+                if target != -1:
+                    reason = "目标"
+                    break
+            elif op == _CONFIG_HISTORY_OP_REVERT:
+                if target < 0 or target >= parent:
+                    reason = "目标"
+                    break
+            elif target != -1:
+                reason = "目标"
+                break
+            # 4) 对应修订快照须保留。
+            spec = history.get(revision)
+            if spec is None:
+                reason = "快照"
+                break
+            # 5) 摘要等于保留快照按 config_revision 口径重算的值。
+            expect_summary = hashlib.sha256(
+                _compact_config(spec).encode("utf-8")
+            ).hexdigest()
+            if summary != expect_summary:
+                reason = "摘要"
+                break
+            # 6) 前哈希衔前项哈希（虚拟锚为 64 个 0）。
+            if prev_record_hash != prev_hash:
+                reason = "前哈希"
+                break
+            # 7) 哈希可由前六键重算。
+            if digest != self._config_history_hash(
+                revision, parent, op, target, summary, prev_record_hash
+            ):
+                reason = "哈希"
+                break
+
+            checked += 1
+            tail_hash = digest
+            prev_revision = revision
+            prev_hash = digest
+
+        complete = reason == ""
+        payload = {
+            "锚修订": anchor_revision,
+            "锚哈希": anchor_hash,
+            "检查": checked,
+            "完整": complete,
+            "断点": -1 if complete else revision,
+            "原因": reason,
+            "末哈希": tail_hash,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def config_cas(self, key, text, expected, now_ms):
         """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
 
