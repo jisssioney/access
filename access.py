@@ -7177,6 +7177,184 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_history_replay(self):
+        """只读重放全部在册的防篡改配置历史，返回 LF 尾紧凑 JSON；首错即停
+        且不抛异常。重放不老化、不改任何状态。
+
+        可信锚：修订 0 在册时锚为 (-1, 64 个 0)、当前态为空、回滚点未知；
+        否则锚为（最老在册修订 - 1，最老在册项未被缝合的前哈希），信任最老
+        在册快照为当前态（最老项只校验、不演算），回滚点未知。
+
+        锚后逐项先按 config_history_verify 契约校验字段、修订链、操作/目标、
+        快照摘要与哈希链（快照/哈希编码失败各归同名原因），再演算状态迁移：
+        构造仅生成修订 0（当前态取本项快照）；加载/CAS 取本项快照为新态；
+        回退须目标快照在册（已被淘汰归“边界”）且本项快照与目标快照的规范
+        v6 JSON 逐字节相同（不符归“回退”）；回滚须回滚点已知且本项快照与
+        回滚点逐字节相同（不符归“回滚”），随后清除回滚点；加载/CAS/回退
+        三者均以本项前态覆盖回滚点。
+
+        任一项首次出错即停：完整为 false，断点取首错项修订（修订不可读取
+        -1），原因限“修订/父修订/操作/目标/快照/摘要/前哈希/哈希/回退/
+        回滚/边界”；检查只计通过项，末修订/末摘要取最后通过项的修订与
+        摘要，无通过项取锚修订与锚哈希。顶层键序/型为“锚修订:int、
+        锚哈希:str、检查:int、完整:bool、断点:int、原因:str、末修订:int、
+        末摘要:str”，成功时断点 -1、原因为空串，且末修订/末摘要等于
+        config_revision 的修订/摘要。时间 O(H·C)、辅助空间 O(C)，H 为在册
+        记录数（≤256），C 为单份配置编码成本。
+        """
+        log = self._config_history_log
+        history = self._config_history
+        zero_hash = "0" * 64
+        if 0 in history:
+            anchor_revision = -1
+            anchor_hash = zero_hash
+            trusted_head = False
+        else:
+            # 修订 0 已随窗口淘汰：锚退到最老在册项之前，其哈希即最老项
+            # 未被缝合的前哈希；最老项只校验，其提交后快照被信任为当前态。
+            anchor_revision = log[0][0] - 1
+            anchor_hash = log[0][5]
+            trusted_head = True
+
+        allowed_ops = (
+            _CONFIG_HISTORY_OP_INIT,
+            _CONFIG_HISTORY_OP_LOAD,
+            _CONFIG_HISTORY_OP_ROLLBACK,
+            _CONFIG_HISTORY_OP_CAS,
+            _CONFIG_HISTORY_OP_REVERT,
+        )
+        expected_revision = anchor_revision
+        prev_revision = anchor_revision
+        prev_hash = anchor_hash
+        # 演算态：当前态与回滚点的规范 v6 编码；None 分别为空与未知。
+        current_canonical = None
+        rollback_canonical = None
+        checked = 0
+        complete = True
+        breakpoint_revision = -1
+        reason = ""
+        last_revision = anchor_revision
+        last_summary = anchor_hash
+        for index in range(len(log)):
+            revision, parent, op, target, summary, rec_prev_hash, digest = log[index]
+            expected_revision += 1
+            # 修订须可读（非 bool 的 int）且连续；不可读时断点取 -1。
+            revision_ok = (
+                isinstance(revision, int)
+                and not isinstance(revision, bool)
+                and revision == expected_revision
+            )
+            broken = None
+            if not revision_ok:
+                broken = (revision if isinstance(revision, int)
+                          and not isinstance(revision, bool) else -1, "修订")
+            if broken is None and parent != prev_revision:
+                broken = (revision, "父修订")
+            if broken is None:
+                if op not in allowed_ops:
+                    broken = (revision, "操作")
+                elif op == _CONFIG_HISTORY_OP_INIT:
+                    if revision != 0 or target != -1:
+                        broken = (revision, "目标")
+                elif op == _CONFIG_HISTORY_OP_REVERT:
+                    # 回退目标须为非 bool 非负 int 且小于父修订。
+                    if (
+                        not isinstance(target, int)
+                        or isinstance(target, bool)
+                        or target < 0
+                        or target >= parent
+                    ):
+                        broken = (revision, "目标")
+                elif target != -1:
+                    broken = (revision, "目标")
+            canonical = None
+            if broken is None:
+                # 记录在册而对应快照缺失或编码失败：无法按 config_revision
+                # 口径重算摘要，记“快照”。规范编码留作演算逐字节比对复用。
+                spec = history.get(revision)
+                if spec is None:
+                    broken = (revision, "快照")
+                else:
+                    try:
+                        canonical = _compact_config(spec)
+                    except Exception:
+                        canonical = None
+                    if canonical is None:
+                        broken = (revision, "快照")
+                    elif summary != hashlib.sha256(
+                        canonical.encode("utf-8")
+                    ).hexdigest():
+                        broken = (revision, "摘要")
+            if broken is None and rec_prev_hash != prev_hash:
+                broken = (revision, "前哈希")
+            if broken is None:
+                try:
+                    recomputed_hash = self._config_history_hash(
+                        revision, parent, op, target, summary, rec_prev_hash
+                    )
+                except Exception:
+                    recomputed_hash = None
+                if recomputed_hash is None or digest != recomputed_hash:
+                    broken = (revision, "哈希")
+
+            if broken is None:
+                # 演算：按操作重放状态迁移；迁移失败归“回退/回滚/边界”。
+                if trusted_head and index == 0:
+                    # 最老在册项的迁移不可重演（前态已淘汰）：信任其快照。
+                    current_canonical = canonical
+                    rollback_canonical = None
+                elif op == _CONFIG_HISTORY_OP_INIT:
+                    current_canonical = canonical
+                elif op in (_CONFIG_HISTORY_OP_LOAD, _CONFIG_HISTORY_OP_CAS):
+                    rollback_canonical = current_canonical
+                    current_canonical = canonical
+                elif op == _CONFIG_HISTORY_OP_REVERT:
+                    target_spec = history.get(target)
+                    if target_spec is None:
+                        # 目标快照已随窗口淘汰：依赖不可得，记“边界”。
+                        broken = (revision, "边界")
+                    else:
+                        try:
+                            target_canonical = _compact_config(target_spec)
+                        except Exception:
+                            target_canonical = None
+                        if target_canonical is None:
+                            broken = (revision, "快照")
+                        elif canonical != target_canonical:
+                            broken = (revision, "回退")
+                        else:
+                            rollback_canonical = current_canonical
+                            current_canonical = canonical
+                elif op == _CONFIG_HISTORY_OP_ROLLBACK:
+                    if rollback_canonical is None or canonical != rollback_canonical:
+                        broken = (revision, "回滚")
+                    else:
+                        current_canonical = canonical
+                        rollback_canonical = None
+
+            if broken is not None:
+                breakpoint_revision, reason = broken
+                complete = False
+                break
+
+            checked += 1
+            prev_revision = revision
+            prev_hash = digest
+            last_revision = revision
+            last_summary = summary
+
+        payload = {
+            "锚修订": anchor_revision,
+            "锚哈希": anchor_hash,
+            "检查": checked,
+            "完整": complete,
+            "断点": breakpoint_revision,
+            "原因": reason,
+            "末修订": last_revision,
+            "末摘要": last_summary,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def config_cas(self, key, text, expected, now_ms):
         """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
 
