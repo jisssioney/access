@@ -7373,6 +7373,257 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_audit_reconcile(self):
+        """只读对账在册配置历史与全量防篡改审计链，返回 LF 尾紧凑 JSON；
+        不老化、不改任何状态，首错即停且不抛异常。
+
+        修订来源仅三类：修订 0 为构造；非 config_change 提交（直接
+        load_config/rollback_config/config_cas/config_revert）为直接；
+        config_change 首次加载/回滚成功为事务并记首次审计序号。失败、
+        升级与重放均不产生修订。
+
+        先按 config_history_replay 规则验历史（失败原因“历史”），再验
+        audit 全链的连续序号、前哈希与哈希（失败原因“审计”），最后按
+        修订升序验来源：构造、直接项无关联；事务项须唯一关联操作
+        “配置加载/配置回滚”、结果“成功”、原序号 0 的事件，其键、时刻
+        取原调用且操作匹配历史；重放事件须指向首次事件且不关联修订。
+        淘汰修订为可信边界：其事务首事件留存链上但不追对。
+
+        顶层键序/型为“锚修订:int、检查:int、完整:bool、断点修订:int、
+        断点审计:int、原因:str、末修订:int、末审计:int”。检查仅计通过
+        修订；成功时断点均 -1、原因为空串；失败原因仅“历史/审计/来源/
+        关联/操作/结果/重放”，不可读断点为 -1。末修订/末审计取最后通过
+        的修订与审计序号（无通过项分别取锚修订与 0）。时间 O(A+H·C)、
+        辅助空间 O(H)，A/H/C 为审计数/在册修订数/单配置编码成本。
+        """
+
+        def render(anchor, checked, complete, bp_revision, bp_audit, reason,
+                   last_revision, last_audit):
+            payload = {
+                "锚修订": anchor,
+                "检查": checked,
+                "完整": complete,
+                "断点修订": bp_revision,
+                "断点审计": bp_audit,
+                "原因": reason,
+                "末修订": last_revision,
+                "末审计": last_audit,
+            }
+            return json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            ) + "\n"
+
+        def cache_outcome(entry):
+            """config_change 缓存项 -> (op, now_ms, 是否成功, 首果串, 重放串,
+            成功结果文本)；参数错（本就不审计）或结构损坏返回 None。"""
+            try:
+                c_op, c_text, c_now_ms, outcome = entry
+                self._validate_config_change_params(c_op, c_text, c_now_ms)
+                if outcome[0] == "ok":
+                    return c_op, c_now_ms, True, "成功", "重放成功", outcome[1]
+                exc_name = outcome[1][0].__name__
+                return c_op, c_now_ms, False, exc_name, "重放" + exc_name, None
+            except Exception:
+                return None
+
+        # 第一段：按 config_history_replay 规则验历史。
+        try:
+            replay = json.loads(self.config_history_replay())
+        except Exception:
+            replay = None
+        if replay is None:
+            return render(-1, 0, False, -1, -1, "历史", -1, 0)
+        anchor_revision = replay["锚修订"]
+        checked = replay["检查"]
+        last_revision = replay["末修订"]
+        if not replay["完整"]:
+            return render(anchor_revision, checked, False, replay["断点"],
+                          -1, "历史", last_revision, 0)
+
+        # 第二段：验 audit 全链的连续序号、前哈希与哈希。
+        chain = self._chain_events
+        audit_total = len(chain)
+        prev_hash = "0" * 64
+        last_audit = 0
+        for position in range(audit_total):
+            try:
+                (seq, now_ms, key, op, sid, result, origin, stored_prev,
+                 digest) = chain[position]
+                recomputed = self._chain_hash(
+                    seq, now_ms, key, op, sid, result, origin, stored_prev
+                )
+            except Exception:
+                seq, stored_prev, recomputed = None, None, None
+            readable = isinstance(seq, int) and not isinstance(seq, bool)
+            if (not readable or seq != position + 1
+                    or stored_prev != prev_hash
+                    or recomputed is None or digest != recomputed):
+                return render(anchor_revision, checked, False, -1,
+                              seq if readable else -1, "审计",
+                              last_revision, last_audit)
+            prev_hash = digest
+            last_audit = seq
+
+        # 第三段：按修订升序验来源。
+        log = self._config_history_log
+        history = self._config_history
+        cache = self._config_change_cache
+        index_map = self._config_change_chain_index
+        config_ops = (
+            _CONFIG_CHAIN_LOAD,
+            _CONFIG_CHAIN_ROLLBACK,
+            _CONFIG_CHAIN_UPGRADE,
+        )
+        transaction_ops = (_CONFIG_OP_LOAD, _CONFIG_OP_ROLLBACK)
+
+        # 缓存 -> 链：每个已审计首果（业务结果）须记首次审计序号且指到
+        # 本键原序号 0 的事件；参数错缓存不审计，不得登记首次序号。
+        for c_key, entry in cache.items():
+            info = cache_outcome(entry)
+            try:
+                first_seq = index_map.get(c_key)
+            except Exception:
+                first_seq = None
+            if info is None:
+                if first_seq is not None:
+                    readable = (isinstance(first_seq, int)
+                                and not isinstance(first_seq, bool))
+                    return render(anchor_revision, checked, False, -1,
+                                  first_seq if readable else -1, "关联",
+                                  last_revision, last_audit)
+                continue
+            c_op = info[0]
+            ok = info[2]
+            readable = (isinstance(first_seq, int)
+                        and not isinstance(first_seq, bool))
+            if not readable or not 1 <= first_seq <= audit_total:
+                # 事务（首次加载/回滚成功）必须记首次审计序号，缺失归
+                # “来源”；升级/失败不产生修订，其首事件缺失归“关联”。
+                reason = ("来源"
+                          if ok and c_op in transaction_ops else "关联")
+                return render(anchor_revision, checked, False, -1,
+                              first_seq if readable else -1, reason,
+                              last_revision, last_audit)
+            event = chain[first_seq - 1]
+            if event[2] != c_key or event[6] != 0:
+                return render(anchor_revision, checked, False, -1,
+                              first_seq, "关联", last_revision, last_audit)
+
+        # 事务候选事件：链上操作“配置加载/配置回滚”、结果“成功”、原序号
+        # 0 且缓存为首次加载/回滚成功的事件，按序号序（即提交序）产出
+        # (序号, 事件, 缓存 op, 缓存时刻, 首果文本)。
+        def candidates():
+            for position in range(audit_total):
+                event = chain[position]
+                if event[3] not in (_CONFIG_CHAIN_LOAD, _CONFIG_CHAIN_ROLLBACK):
+                    continue
+                if event[5] != "成功" or event[6] != 0:
+                    continue
+                try:
+                    entry = cache.get(event[2])
+                except Exception:
+                    entry = None
+                if entry is None:
+                    continue
+                info = cache_outcome(entry)
+                if info is None:
+                    continue
+                c_op, c_now_ms, ok, _, _, result_text = info
+                if not ok or c_op not in transaction_ops:
+                    continue
+                yield position + 1, event, c_op, c_now_ms, result_text
+
+        # 锚后逐项验来源（淘汰修订与锚为可信边界：修订 0 在册时自 0 起，
+        # 否则自最老在册项的次项起）。构造、直接项无关联；事务项唯一关联
+        # 候选事件：首果即提交后导出，与本项快照规范编码逐字节相同且缓存
+        # 操作匹配历史操作。
+        start = 0 if 0 in history else 1
+        gen = candidates()
+        candidate = next(gen, None)
+        passed = 0
+        last_passed_revision = anchor_revision
+        for index in range(start, len(log)):
+            revision, _parent, h_op, _target, _summary, _prev, _hash = log[
+                index
+            ]
+            if h_op in (
+                _CONFIG_HISTORY_OP_LOAD,
+                _CONFIG_HISTORY_OP_ROLLBACK,
+            ) and candidate is not None:
+                c_seq, c_event, c_op, c_now_ms, result_text = candidate
+                matched = False
+                if (c_op == h_op and isinstance(result_text, str)
+                        and result_text.endswith("\n")):
+                    spec = history.get(revision)
+                    try:
+                        encoded = (
+                            None if spec is None else _compact_config(spec)
+                        )
+                    except Exception:
+                        encoded = None
+                    if encoded is not None and result_text[:-1] == encoded:
+                        matched = True
+                if matched:
+                    # 事务项：事件操作须匹配历史，键、时刻取原调用。
+                    if c_event[3] != _CONFIG_CHAIN_OP[c_op]:
+                        return render(anchor_revision, passed, False,
+                                      revision, c_seq, "操作",
+                                      last_passed_revision, last_audit)
+                    if c_event[1] != c_now_ms:
+                        return render(anchor_revision, passed, False,
+                                      revision, c_seq, "关联",
+                                      last_passed_revision, last_audit)
+                    candidate = next(gen, None)
+            passed += 1
+            last_passed_revision = revision
+        # 未消费的候选事件对应已淘汰修订（可信边界），不追对。
+        checked = passed
+        last_revision = last_passed_revision
+
+        # 事件侧核验：配置域每个事件须登记在缓存且字段与原调用一致；
+        # 重放须指向首次事件且不关联修订。
+        for position in range(audit_total):
+            event = chain[position]
+            if event[3] not in config_ops:
+                continue
+            seq = position + 1
+            try:
+                entry = cache.get(event[2])
+            except Exception:
+                entry = None
+            info = cache_outcome(entry) if entry is not None else None
+            if info is None:
+                return render(anchor_revision, checked, False, -1, seq,
+                              "关联", last_revision, last_audit)
+            c_op, c_now_ms, _ok, first_result, replay_result, _ = info
+            if event[3] != _CONFIG_CHAIN_OP[c_op]:
+                return render(anchor_revision, checked, False, -1, seq,
+                              "操作", last_revision, last_audit)
+            origin = event[6]
+            if origin == 0:
+                if event[1] != c_now_ms or index_map.get(event[2]) != seq:
+                    return render(anchor_revision, checked, False, -1, seq,
+                                  "关联", last_revision, last_audit)
+                if event[5] != first_result:
+                    return render(anchor_revision, checked, False, -1, seq,
+                                  "结果", last_revision, last_audit)
+            else:
+                if (event[1] != c_now_ms
+                        or index_map.get(event[2]) != origin
+                        or not 1 <= origin <= audit_total):
+                    return render(anchor_revision, checked, False, -1, seq,
+                                  "重放", last_revision, last_audit)
+                target = chain[origin - 1]
+                if target[2] != event[2] or target[6] != 0:
+                    return render(anchor_revision, checked, False, -1, seq,
+                                  "重放", last_revision, last_audit)
+                if event[5] != replay_result:
+                    return render(anchor_revision, checked, False, -1, seq,
+                                  "结果", last_revision, last_audit)
+
+        return render(anchor_revision, checked, True, -1, -1, "",
+                      last_revision, last_audit)
+
     def config_cas(self, key, text, expected, now_ms):
         """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
 
