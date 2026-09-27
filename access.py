@@ -7,7 +7,8 @@
   takeover_audit、防篡改审计链 audit/verify_audit、配置导出/升级/加载/回滚
   export_config/upgrade_config/load_config/rollback_config、修订查询/CAS 提交/
   历史回退 config_revision/config_cas/config_revert（构造态为修订 0，保留最近
-  256 个配置修订供回退）、QoS 模板查询 qos、按
+  256 个配置修订供回退；load_config/rollback_config/config_cas/config_revert
+  首次成功另追加防篡改配置历史记录，config_history 只读查询）、QoS 模板查询 qos、按
   (用户,模板) 共享账本计量的 meter、配额只读快照 quota_stats、共享账本检查点
   quota_checkpoint 与按 key 原子恢复 quota_restore、按用户/模板分组的
   计量统计 meter_stats、容量申请
@@ -887,6 +888,15 @@ _CONFIG_VERSION = 6
 # 最旧项，当前修订永不淘汰。
 _CONFIG_HISTORY_LIMIT = 256
 
+# 防篡改配置历史记录的操作名：构造态修订 0 为“构造”；仅 load_config/
+# rollback_config/config_cas/config_revert 首次成功提交依次追加
+# “加载/回滚/CAS/回退”，失败、只读升级与同参重放不追加。
+_CONFIG_HISTORY_OP_INIT = "构造"
+_CONFIG_HISTORY_OP_LOAD = "加载"
+_CONFIG_HISTORY_OP_ROLLBACK = "回滚"
+_CONFIG_HISTORY_OP_CAS = "CAS"
+_CONFIG_HISTORY_OP_REVERT = "回退"
+
 # fault 操作与后端状态。
 _OP_INJECT = "注入"
 _OP_RECOVER = "恢复"
@@ -1036,6 +1046,18 @@ class Sessions:
     rollback_config/config_cas 及历史回退首次成功后生成并保存提交态新修订，
     修订沿既有规则递增，失败、只读升级与同参重放不保存，超限淘汰最旧项且
     不淘汰当前项。config_revision() 只读返回“修订:int、摘要:str”。
+    四类提交首次成功另向防篡改配置历史追加一条七元组记录
+    （修订:int、父修订:int、操作:str、目标:int、摘要:str、前哈希:str、
+    哈希:str）：构造记录修订 0、父修订/目标 -1、前哈希 64 个 0；后项
+    父修订与前哈希取追加前末项，操作依次为加载/回滚/CAS/回退，回退目标
+    取 target、余为 -1；摘要同 config_revision 口径，哈希为前六键基线
+    紧凑 JSON 的 UTF-8 字节 sha256 小写值；失败与同参重放不追加，快照
+    淘汰时同步淘汰记录但前哈希不改写、当前项不淘汰。
+    config_history(after=-1, limit=100) 只读返回修订 > after 的升序前
+    limit 项：两参须非 bool int，型错 TypeError，after<-1 或
+    limit ∉ [1,1000] 抛 ValueError，after!=-1 且未保留抛 KeyError(after)；
+    顶层为“下个修订:int、项目:list”，无项时下个修订=after；查询 O(limit)
+    时空，沿基线紧凑 JSON 并以 LF 结尾。
     config_cas(key, text, expected, now_ms) 比较修订并原子加载，返回
     “修订/前摘要/后摘要”，同 key 同型同参重放原字节且不再比较修订，异参
     ValueError，仅缓存成功。config_revert(key, target, expected, now_ms)
@@ -1355,11 +1377,30 @@ class Sessions:
         # 不变。
         self._revision = 0
         # 配置修订历史：修订号 -> 该修订提交后的规范化 spec，构造态修订 0
-        # 初始在册；仅 load_config/rollback_config/config_revert 首次成功后
-        # 追加当前修订，失败、只读升级与同参重放不写入。保留最近
+        # 初始在册；仅 load_config/rollback_config/config_cas/config_revert
+        # 首次成功后追加当前修订，失败、只读升级与同参重放不写入。保留最近
         # _CONFIG_HISTORY_LIMIT 项：超限时淘汰最小修订号，当前修订不淘汰
         # （故修订 0 亦可在窗口满后被淘汰）。
         self._config_history = {0: self._current_spec()}
+        # 防篡改配置历史记录：与 _config_history 同步增删的七元组序列
+        # （修订, 父修订, 操作, 目标, 摘要, 前哈希, 哈希），按修订升序。
+        # 首项为构造态修订 0：父修订/目标为 -1、前哈希为 64 个 0；后项
+        # 父修订与前哈希取前一记录，回退目标取 target、余为 -1。快照淘汰
+        # 时同步淘汰对应记录（恒为序列首项），但剩余记录的前哈希不改写。
+        genesis_prev = "0" * 64
+        genesis_summary = self._config_summary()
+        genesis_hash = self._config_record_hash(
+            0,
+            -1,
+            _CONFIG_HISTORY_OP_INIT,
+            -1,
+            genesis_summary,
+            genesis_prev,
+        )
+        self._config_history_records = [
+            (0, -1, _CONFIG_HISTORY_OP_INIT, -1, genesis_summary,
+             genesis_prev, genesis_hash)
+        ]
 
         # capacity 等待队列：sid -> [user, 申请时刻, 等待, 截止, 入队序]，
         # _queue_order 为按入队序的 sid 列表，_queue_seq 为下一入队序。
@@ -6773,22 +6814,69 @@ class Sessions:
             if pool_id in new_pools
         }
 
-    def _commit_config(self, spec, new_pools, rollback_spec):
+    def _commit_config(self, spec, new_pools, rollback_spec, op, target=-1):
         """校验通过后原子提交配置：覆盖回滚点、安装 spec、修订号加 1，并把
-        新修订的 spec 写入历史后按 _CONFIG_HISTORY_LIMIT 淘汰最旧项。
+        新修订的 spec 写入历史后按 _CONFIG_HISTORY_LIMIT 淘汰最旧项，返回
+        提交后的 v6 配置 JSON（LF 尾）。
 
         仅在 _build_pools 成功后调用；调用方负责先解析/承载校验，任何失败
         都不进入本方法，故本方法不改变“失败不改状态”的既有语义。修订号
         单调递增，新写入项恒为最大键、永不被淘汰；窗口溢出时仅淘汰最小
         修订号（构造态修订 0 亦可在窗口满后被淘汰）。
+
+        同步追加一条防篡改配置历史记录（op 取加载/回滚/CAS/回退，回退
+        target 传目标修订、余传 -1）：父修订与前哈希取追加前的末项记录，
+        摘要按 config_revision 口径，哈希为前六键基线紧凑 JSON 的 UTF-8
+        字节 sha256 小写值。快照淘汰时同步淘汰序列首项记录，但剩余记录的
+        前哈希一律不改写。
         """
         self._rollback = rollback_spec
         self._install_spec(spec, new_pools)
         self._revision += 1
         history = self._config_history
         history[self._revision] = self._current_spec()
+        evicted = False
         if len(history) > _CONFIG_HISTORY_LIMIT:
             del history[min(history)]
+            evicted = True
+
+        records = self._config_history_records
+        revision = self._revision
+        parent = records[-1][0]
+        prev_hash = records[-1][6]
+        exported = self.export_config()
+        summary = hashlib.sha256(exported[:-1].encode("utf-8")).hexdigest()
+        digest = self._config_record_hash(
+            revision, parent, op, target, summary, prev_hash
+        )
+        records.append(
+            (revision, parent, op, target, summary, prev_hash, digest)
+        )
+        # 快照与记录恒为同一连续修订窗口，淘汰项恒为序列首项；只删记录、
+        # 不改写新首项的父修订与前哈希。
+        if evicted:
+            records.pop(0)
+        return exported
+
+    def _prepare_config_load(self, text):
+        """按 load_config 规则解析并承载校验 text，返回 (spec, new_pools)。
+
+        直载 v1..v6 配置或经严格复核的升级包；只读不改状态，文档非法抛
+        ValueError、引用错抛 ValueError、承载冲突抛 ResourceError。
+        """
+        doc = _load_config_doc(text)
+        if isinstance(doc, dict) and "源版本" in doc:
+            _source, _target, _changed, _summary, spec = (
+                _parse_upgrade_envelope(doc)
+            )
+        else:
+            spec = _parse_config_doc(doc, self._auth.policy())
+        for user, _template_id in spec[6]:
+            if user not in self._auth:
+                raise ValueError(
+                    f"user template user not in authenticator: {user!r}"
+                )
+        return spec, self._build_pools(spec)
 
     def load_config(self, text):
         """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v6 JSON。
@@ -6803,23 +6891,13 @@ class Sessions:
         会话与租约不变，认证策略随配置替换但认证记录（凭据、失败计数、锁定）
         保留，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点并将配置
         修订号加 1，新修订（连同构造态修订 0）保留在最近 256 项修订历史中，
-        超限淘汰最旧项且不淘汰当前项；失败修订号与历史不变。
+        超限淘汰最旧项且不淘汰当前项；失败修订号与历史不变。首次成功向
+        防篡改配置历史追加操作“加载”记录，失败不追加。
         """
-        doc = _load_config_doc(text)
-        if isinstance(doc, dict) and "源版本" in doc:
-            _source, _target, _changed, _summary, spec = (
-                _parse_upgrade_envelope(doc)
-            )
-        else:
-            spec = _parse_config_doc(doc, self._auth.policy())
-        for user, _template_id in spec[6]:
-            if user not in self._auth:
-                raise ValueError(
-                    f"user template user not in authenticator: {user!r}"
-                )
-        new_pools = self._build_pools(spec)
-        self._commit_config(spec, new_pools, self._current_spec())
-        return self.export_config()
+        spec, new_pools = self._prepare_config_load(text)
+        return self._commit_config(
+            spec, new_pools, self._current_spec(), _CONFIG_HISTORY_OP_LOAD
+        )
 
     def rollback_config(self):
         """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v6 JSON。
@@ -6833,14 +6911,30 @@ class Sessions:
         if spec is None:
             raise StateError("no config rollback point")
         new_pools = self._build_pools(spec)
-        self._commit_config(spec, new_pools, None)
-        return self.export_config()
+        return self._commit_config(
+            spec, new_pools, None, _CONFIG_HISTORY_OP_ROLLBACK
+        )
 
     def _config_summary(self):
         """当前配置摘要：export_config 去尾 LF 的 UTF-8 字节 sha256 小写值。"""
         return hashlib.sha256(
             self.export_config()[:-1].encode("utf-8")
         ).hexdigest()
+
+    @staticmethod
+    def _config_record_hash(revision, parent, op, target, summary, prev_hash):
+        """防篡改配置历史记录哈希：前六键（修订/父修订/操作/目标/摘要/
+        前哈希）基线紧凑 JSON 的 UTF-8 字节 sha256 小写值。"""
+        head = {
+            "修订": revision,
+            "父修订": parent,
+            "操作": op,
+            "目标": target,
+            "摘要": summary,
+            "前哈希": prev_hash,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def config_revision(self):
         """只读返回当前配置修订号与摘要的 LF 尾紧凑 JSON。
@@ -6854,6 +6948,60 @@ class Sessions:
         任何状态；O(n log n) 时间、O(n) 空间（导出需排序）。
         """
         payload = {"修订": self._revision, "摘要": self._config_summary()}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def config_history(self, after=-1, limit=100):
+        """只读返回防篡改配置历史记录的 LF 尾紧凑 JSON；查询不老化、不改态。
+
+        取修订 > after 的前 limit 项，按修订升序。after/limit 须为非 bool 的
+        int：类型不符 TypeError，after < -1 或 limit ∉ [1,1000] 抛
+        ValueError；after != -1 且该修订未保留（已被淘汰或从未存在）抛
+        KeyError(after)，after=-1 为构造前游标、恒合法。顶层键序为
+        “下个修订/项目”：下个修订为末项修订、无项为 after；项目键序为
+        “修订/父修订/操作/目标/摘要/前哈希/哈希”，操作/摘要/前哈希/哈希
+        为 str，余为 int。首项（构造态修订 0）父修订/目标为 -1、前哈希为
+        64 个 0；后项父修订与前哈希取前一记录（淘汰不改写），回退目标为
+        target、余为 -1。历史限 256 项，快照淘汰时同步淘汰记录。O(limit)
+        时空。
+        """
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise TypeError(f"after must be an int, got {type(after).__name__}")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+        if after < -1:
+            raise ValueError(f"after must be >= -1, got {after}")
+        if limit < 1 or limit > 1000:
+            raise ValueError(f"limit must be in 1..1000, got {limit}")
+
+        records = self._config_history_records
+        if after != -1 and (not records or records[0][0] > after or records[-1][0] < after):
+            raise KeyError(after)
+
+        # 记录即按修订升序的连续窗口：二分定位首个修订 > after 的位置，
+        # 再顺序取 limit 项，O(limit) 时空。
+        lo, hi = 0, len(records)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if records[mid][0] <= after:
+                lo = mid + 1
+            else:
+                hi = mid
+        window = records[lo : lo + limit]
+        items = [
+            {
+                "修订": revision,
+                "父修订": parent,
+                "操作": op,
+                "目标": target,
+                "摘要": summary,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for revision, parent, op, target, summary, prev_hash, digest in window
+        ]
+        # 有项取下个修订为末项修订，无项取 after。
+        next_revision = window[-1][0] if window else after
+        payload = {"下个修订": next_revision, "项目": items}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def config_cas(self, key, text, expected, now_ms):
@@ -6907,8 +7055,12 @@ class Sessions:
 
         before = self._config_summary()
         # 按 load_config 规则加载：文档错 ValueError、承载冲突 ResourceError，
-        # 成功原子提交、覆盖回滚点并将修订号加 1；失败实例不变。
-        loaded = self.load_config(text)
+        # 成功原子提交、覆盖回滚点并将修订号加 1；失败实例不变。提交走
+        # _commit_config 以便历史记录操作记为“CAS”而非“加载”。
+        spec, new_pools = self._prepare_config_load(text)
+        loaded = self._commit_config(
+            spec, new_pools, self._current_spec(), _CONFIG_HISTORY_OP_CAS
+        )
         after = hashlib.sha256(loaded[:-1].encode("utf-8")).hexdigest()
         payload = {"修订": self._revision, "前摘要": before, "后摘要": after}
         result = (
@@ -6987,8 +7139,14 @@ class Sessions:
         # _build_pools 不改状态，故失败配置、历史、回滚点与运行态均不变。
         before = self._config_summary()
         new_pools = self._build_pools(spec)
-        self._commit_config(spec, new_pools, self._current_spec())
-        after = self._config_summary()
+        loaded = self._commit_config(
+            spec,
+            new_pools,
+            self._current_spec(),
+            _CONFIG_HISTORY_OP_REVERT,
+            target,
+        )
+        after = hashlib.sha256(loaded[:-1].encode("utf-8")).hexdigest()
         payload = {
             "修订": self._revision,
             "目标": target,
