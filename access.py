@@ -7468,16 +7468,23 @@ class Sessions:
         已淘汰时最老在册项作为可信锚不重验、不计），再做索引与链级复核。
         config_change 域的“键 → 首次事件序号”索引为权威指认：构造与直接项
         无关联；事务项（加载/回滚）由其键缓存原调操作与首果配置摘要
-        (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。配对采用
-        保序最晚贪心：成功加载/回滚首调事件按序号倒序，逐个匹配最后一个仍
-        空闲的同 (操作, 摘要) 在册记录——回滚/回退常重建早前配置摘要，最晚
-        同摘要记录才是该事务真正产生的修订；早于在册窗口的候选无匹配时落入
-        可信边界，直接记录恒不被占用。配对项的指认事件须为同键、原序号 0
+        (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。候选按审计
+        序号升序收集：仅取由同键索引指认的原序号 0 首次事件，且缓存原调为
+        成功的加载/回滚（失败、升级、重放与未指认事件不入候选）；其首果配置
+        为缓存返回的 v6 JSON，摘要按 config_revision 既有口径（去尾 LF 的
+        UTF-8 字节 sha256）求。再按修订升序扫描在册“加载/回滚”记录做配对：
+        候选仅允许丢弃一段连续前缀作为已淘汰边界（其数量不得超过已淘汰修订
+        数，且由反向就近同 (操作, 摘要) 对齐定切点）；其余候选必须与记录形成
+        保序一一映射——候选按序各取其后首个 (操作, 摘要) 相同且未消费的记录，
+        配出事件序号随修订严格升序，两候选间被越过的异组记录判为直接来源。
+        禁止分组贪心换配、禁止跳过候选或逆序；候选缺失、多余或失序即在首个
+        分歧归“来源”（断点修订取冲突记录修订、断点审计取冲突事件序号，无
+        对应项取 -1，检查只计此前通过修订）；加载/回滚记录无候选配对即为直接
+        来源，合法。配对项的指认事件须为同键、原序号 0
         的首事件，操作须为“配置加载/配置回滚”且与缓存原调及历史操作一致
         （违例归“操作”），缓存首果与事件结果须同为“成功”（违例归“结果”），
-        键、时刻取原调用且会话为空串（时刻须等于缓存首调时刻，违例归“关联”）；
-        配对事件序号须随修订升序单调（违例归“来源”）。修订无配对候选即为
-        直接来源，合法。索引复核（断点修订 -1、断点审计取首次事件序号；
+        键、时刻取原调用且会话为空串（时刻须等于缓存首调时刻，违例归“关联”）。
+        索引复核（断点修订 -1、断点审计取首次事件序号；
         已与在册修订配对的首事件不重验）：每个键指认的首事件须存在、原序号
         0、同键、同操作、同时刻、结果名与缓存首果相符（成功或业务异常类名）、
         会话为空串，缓存缺失或指认失效归“关联”。链级复核（按事件序号升序，
@@ -7604,20 +7611,37 @@ class Sessions:
         cindex = self._config_change_chain_index
         ccache = self._config_change_cache
 
-        # 候选选取：在册修订是修订序列的连续后缀，故事务首调事件与在册
-        # load/rollback 修订的配对整体构成候选事件序列的一个后缀（更早的
-        # 成功首调皆对应已淘汰修订）。自链尾反向取至多 H 个由域索引指认
-        # （cindex[事件键] == 序号）、缓存原调为成功加载/回滚的原序号 0
-        # 事件；识别仅用 O(1) 字段与缓存判定，配置摘要只对这至多 H 个
-        # 候选计算（O(H·C)），不哈希全链。事件字段本身仍是被验对象，篡改
-        # 致错配时由 3.1/3.2/3.3 捕获。
-        retained_count = len(log)
-        selected = []
+        # 候选选取（审计序号升序；时间 O(A)、不在此步算配置摘要）：事务候选
+        # 仅取 config_change 域“键 → 首次事件序号”索引指认
+        # （cindex[事件键] == 序号）的原序号 0 事件，且该键缓存原调为成功的
+        # 加载/回滚（首果 ("ok", v6 JSON 文本)）；失败、升级、重放与未被同键
+        # 索引指认的事件一律不是候选。每个在册修订至多消费一个候选，故事务候
+        # 选与在册 load/rollback 记录的保序配对所用候选必为候选序列的一个后缀
+        # （更早的成功首调皆对应已淘汰修订，为可信边界前缀）：自链尾反向仅收
+        # 集至多 R 个（R 为在册“加载/回滚”记录数），再翻回升序，识别只用
+        # O(1) 字段与缓存判定；配置摘要只对这至多 R 个候选计算（O(H·C)），
+        # 不哈希全链，辅助空间 O(H)。事件字段本身仍是被验对象，篡改致错配时
+        # 由下述配对及 3.1/3.2/3.3 捕获。
+        start = scan["start"]
+        load_rollback_records = [
+            (li, record)
+            for li, record in enumerate(log)
+            if li >= start
+            and record[2] in (
+                _CONFIG_HISTORY_OP_LOAD,
+                _CONFIG_HISTORY_OP_ROLLBACK,
+            )
+        ]
+        pair_cap = len(load_rollback_records)
+        # 已淘汰的事务修订数上界：修订 0 在册（start=0）时无淘汰；否则淘汰
+        # 修订为 0..锚修订，其中修订 0 为构造（永非事务候选），故事务候选可
+        # 占的已淘汰修订至多为锚修订号个（1..锚修订）。
+        eliminated_cap = anchor_revision if start == 1 else 0
+        total_candidates = 0
+        window_rev = []
         for index in range(total_audit - 1, -1, -1):
             event = chain[index]
             seq, _ev_now, ev_key, _ev_op, _sid, _result, origin = event[:7]
-            if len(selected) >= retained_count:
-                break
             # 键须为 str 才能查域索引；非 str 键的链项不入候选（由 3.3 归
             # “关联”），亦保证不抛异常。
             if (
@@ -7638,53 +7662,111 @@ class Sessions:
                 or not isinstance(outcome[1], str)
             ):
                 continue
+            total_candidates += 1
+            if len(window_rev) < pair_cap:
+                window_rev.append((seq, ev_key, cache))
+            # 已收满配对窗口后仍计数（供淘汰前缀上界校验），但不再保留。
+        window_rev.reverse()  # 回到审计序号升序。
+        # 早于末 R 个候选的事务首调必对应已淘汰修订（在册记录至多消费 R 个，
+        # 且配对候选为候选序列后缀）：其数量即不经哈希即采信的淘汰前缀。
+        pre_eliminated = max(0, total_candidates - pair_cap)
+        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v6 配置 JSON 去尾 LF 后
+        # 的 UTF-8 字节 sha256 小写值（同 config_revision/历史摘要）。
+        candidates = []
+        for fseq, ckey, cache in window_rev:
             try:
                 config_digest = hashlib.sha256(
-                    outcome[1][:-1].encode("utf-8")
+                    cache[3][1][:-1].encode("utf-8")
                 ).hexdigest()
             except Exception:
                 config_digest = None
-            selected.append((seq, ev_key, cache, config_digest))
-        selected.reverse()  # 回到事件序号升序（反向配对时倒序迭代）。
+            candidates.append((fseq, ckey, cache, config_digest))
 
-        # 保序配对（O(H) 摊还）：成功加载/回滚首调事件序列即全部事务修订
-        # 的提交序，在册事务修订是其连续后缀（直接修订在记录侧交错、已淘汰
-        # 事务修订的候选在事件侧为前缀）。每个 (操作, 摘要) 组维护在册记录
-        # 下标升序栈；自链尾向首处理候选，弹出大于全局游标的下标（游标只减，
-        # 这些下标再无可用之时），取栈顶即“最后一个仍空闲且同组”的记录
-        # （最晚匹配贪心）：回滚/回退常重建早前配置摘要，最晚同摘要记录才是
-        # 该事务真正产生的修订；组栈空的前缀候选对应已淘汰修订，落入可信
-        # 边界，直接记录虽可同摘要但配对恒保序且可由 3.1/3.3 复核。
-        load_rollback_records = [
-            record for record in log
-            if record[2] in (
-                _CONFIG_HISTORY_OP_LOAD,
-                _CONFIG_HISTORY_OP_ROLLBACK,
+        def source_conflict(conflict_record_index, cand):
+            """首个来源分歧 → 原因“来源”。conflict_record_index 为 R 下标
+            （越界表示无对应记录，断点修订取 -1）；检查只计此前通过修订。"""
+            cfseq = cand[0]
+            audit_bp = (
+                cfseq
+                if isinstance(cfseq, int) and not isinstance(cfseq, bool)
+                else -1
             )
-        ]
-        stacks_by_group = {}
-        for j, group_record in enumerate(load_rollback_records):
-            stacks_by_group.setdefault(
-                (group_record[2], group_record[4]), []
-            ).append(j)
+            if 0 <= conflict_record_index < len(load_rollback_records):
+                log_index, conflict_record = load_rollback_records[
+                    conflict_record_index
+                ]
+                revision_bp = conflict_record[0]
+                if not (
+                    isinstance(revision_bp, int)
+                    and not isinstance(revision_bp, bool)
+                ):
+                    revision_bp = -1
+                passed = log_index - start
+                last_rev = (
+                    log[log_index - 1][0] if log_index > start
+                    else anchor_revision
+                )
+            else:
+                # 候选无对应在册记录（缺失/多余）：断点修订 -1，此前在册记录
+                # 均已通过，检查计全部在册扫描项。
+                revision_bp = -1
+                passed = len(log) - start
+                last_rev = log[-1][0] if len(log) > start else anchor_revision
+            return render(
+                passed, False, revision_bp, audit_bp, "来源",
+                last_rev, total_audit,
+            )
+
+        # 淘汰边界反向定位（仅用于切出连续前缀）：自末个候选与末个在册
+        # load/rollback 记录起，反向就近找同 (操作, 摘要) 记录；找不到的候选
+        # 及其前全部候选为已淘汰连续前缀。此趟只确定切点，不做最终配对。
+        ci = len(candidates) - 1
+        ri = len(load_rollback_records) - 1
+        while ci >= 0:
+            _fseq, _ckey, cache, config_digest = candidates[ci]
+            j = ri
+            while j >= 0 and not (
+                load_rollback_records[j][1][2] == cache[0]
+                and load_rollback_records[j][1][4] == config_digest
+            ):
+                j -= 1
+            if j < 0:
+                break
+            ri = j - 1
+            ci -= 1
+        boundary_in_window = ci + 1
+        # 淘汰候选总数不得超过已淘汰修订数上界；超过则属来源断裂（正常历史
+        # 下不可能：链与历史均已全量校验通过），在窗口首个分歧判“来源”。
+        if pre_eliminated + boundary_in_window > eliminated_cap:
+            first_cand = (
+                candidates[0] if candidates
+                else (-1, None, None, None)
+            )
+            return source_conflict(0, first_cand)
+        survivors = candidates[boundary_in_window:]
+
+        # 正向保序一一映射：候选按审计序号升序，各取其后首个 (操作, 摘要)
+        # 相同且尚未消费的在册“加载/回滚”记录（记录按修订升序）。映射严格
+        # 保序——配出的事件序号随修订升序单调；两候选间被越过的异组记录判
+        # 直接来源（直接提交合法交错）。禁止分组贪心换配、禁止跳过候选或逆
+        # 序：某候选在其后找不到同 (操作, 摘要) 记录即首个来源分歧（缺失/
+        # 多余/失序），断点修订取分歧记录修订（记录已尽取 -1）、断点审计取
+        # 该候选事件序号。时间 O(H)、辅助空间 O(H)。
         paired = {}
-        record_cursor = len(load_rollback_records) - 1
-        for fseq, ckey, cache, config_digest in reversed(selected):
-            if config_digest is None:
-                continue
-            stack = stacks_by_group.get((cache[0], config_digest))
-            if not stack:
-                # 早于在册窗口（或无空闲同组记录）：前缀候选为可信边界，
-                # 游标不动。
-                continue
-            while stack and stack[-1] > record_cursor:
-                stack.pop()
-            if not stack:
-                continue
-            found_index = stack.pop()
-            pair_record = load_rollback_records[found_index]
-            paired[pair_record[0]] = (fseq, ckey, cache, config_digest)
-            record_cursor = found_index - 1
+        record_cursor = 0
+        for cand in survivors:
+            _fseq, _ckey, cache, config_digest = cand
+            j = record_cursor
+            while j < len(load_rollback_records) and not (
+                load_rollback_records[j][1][2] == cache[0]
+                and load_rollback_records[j][1][4] == config_digest
+            ):
+                j += 1
+            if j >= len(load_rollback_records):
+                return source_conflict(record_cursor, cand)
+            pair_record = load_rollback_records[j][1]
+            paired[pair_record[0]] = cand
+            record_cursor = j + 1
 
         # 3.1 按修订升序验在册项（可信锚记录不重验、不计；构造/CAS/回退恒
         # 为无关联来源；加载/回滚无配对候选即为直接来源）。检查逐项计，
