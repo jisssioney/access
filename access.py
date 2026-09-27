@@ -7177,6 +7177,202 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_history_replay(self):
+        """只读重放保留的配置历史，返回 LF 尾紧凑 JSON；不老化、不改任何状态，
+        首错即停且不抛异常。
+
+        可信锚：修订 0 在册时锚为 (-1, 64 个 0)、当前态为空、回滚点已知为空；
+        否则信任最老在册快照与最老在册记录的哈希为锚（锚修订取最老在册修订），
+        回滚点未知。锚后逐项先按 config_history_verify 契约校验字段、修订链、
+        操作/目标、快照摘要与哈希链（快照/哈希编码失败各归同名原因），再按提交
+        语义演算：构造仅生成修订 0；加载/CAS 取本项快照为新当前态；回退须目标
+        快照在册且本项快照与其规范 v6 JSON 逐字节相同；三者均保存前态为回滚点；
+        回滚须回滚点已知且本项快照与其规范 v6 JSON 逐字节相同，随后清除回滚点。
+        演算依赖（回退目标快照、回滚点）随窗口淘汰而不可知时归“边界”。任一项
+        首次出错即停：完整为 false，断点取首错项修订（修订不可读取 -1），原因
+        限“修订/父修订/操作/目标/快照/摘要/前哈希/哈希/回退/回滚/边界”；检查
+        只计通过项。顶层键序/型为“锚修订:int、锚哈希:str、检查:int、
+        完整:bool、断点:int、原因:str、末修订:int、末摘要:str”，成功时断点
+        -1、原因为空串；末修订/末摘要取最后通过态（无通过项取锚），完整时恒
+        等于 config_revision 的修订与摘要。时间 O(H·C)、辅助空间 O(C)，H 为
+        在册记录数（≤256），C 为单份配置编码成本。
+        """
+        log = self._config_history_log
+        history = self._config_history
+        zero_hash = "0" * 64
+        # 回滚点未知哨兵：仅用于修订 0 已淘汰的锚态，区别于已知为空（None）。
+        unknown = object()
+        if 0 in history:
+            anchor_revision = -1
+            anchor_hash = zero_hash
+            start = 0
+            current = None
+            rollback = None
+            last_revision = -1
+            last_summary = zero_hash
+        else:
+            # 修订 0 已随窗口淘汰：信任最老在册快照与记录哈希为锚，自次项起
+            # 校验；回滚点未知。
+            anchor_revision = log[0][0]
+            anchor_hash = log[0][6]
+            start = 1
+            current = history[anchor_revision]
+            rollback = unknown
+            last_revision = anchor_revision
+            last_summary = log[0][4]
+
+        allowed_ops = (
+            _CONFIG_HISTORY_OP_INIT,
+            _CONFIG_HISTORY_OP_LOAD,
+            _CONFIG_HISTORY_OP_ROLLBACK,
+            _CONFIG_HISTORY_OP_CAS,
+            _CONFIG_HISTORY_OP_REVERT,
+        )
+        expected_revision = anchor_revision
+        prev_revision = anchor_revision
+        prev_hash = anchor_hash
+        checked = 0
+        complete = True
+        breakpoint_revision = -1
+        reason = ""
+        for index in range(start, len(log)):
+            revision, parent, op, target, summary, rec_prev_hash, digest = log[
+                index
+            ]
+            expected_revision += 1
+            # 契约校验同 config_history_verify：修订须可读（非 bool 的 int）
+            # 且连续；不可读时断点取 -1。
+            revision_ok = (
+                isinstance(revision, int)
+                and not isinstance(revision, bool)
+                and revision == expected_revision
+            )
+            broken = None
+            if not revision_ok:
+                broken = (revision if isinstance(revision, int)
+                          and not isinstance(revision, bool) else -1, "修订")
+            if broken is None and parent != prev_revision:
+                broken = (revision, "父修订")
+            if broken is None:
+                if op not in allowed_ops:
+                    broken = (revision, "操作")
+                elif op == _CONFIG_HISTORY_OP_INIT:
+                    if revision != 0 or target != -1:
+                        broken = (revision, "目标")
+                elif op == _CONFIG_HISTORY_OP_REVERT:
+                    # 回退目标须为非 bool 非负 int 且小于父修订。
+                    if (
+                        not isinstance(target, int)
+                        or isinstance(target, bool)
+                        or target < 0
+                        or target >= parent
+                    ):
+                        broken = (revision, "目标")
+                elif target != -1:
+                    broken = (revision, "目标")
+            spec = None
+            if broken is None:
+                # 记录在册而对应快照缺失或编码失败：无法按 config_revision
+                # 口径重算摘要，记“快照”。
+                spec = history.get(revision)
+                recomputed_summary = None
+                if spec is not None:
+                    try:
+                        recomputed_summary = hashlib.sha256(
+                            _compact_config(spec).encode("utf-8")
+                        ).hexdigest()
+                    except Exception:
+                        recomputed_summary = None
+                if spec is None or recomputed_summary is None:
+                    broken = (revision, "快照")
+                elif summary != recomputed_summary:
+                    broken = (revision, "摘要")
+            if broken is None and rec_prev_hash != prev_hash:
+                broken = (revision, "前哈希")
+            if broken is None:
+                try:
+                    recomputed_hash = self._config_history_hash(
+                        revision, parent, op, target, summary, rec_prev_hash
+                    )
+                except Exception:
+                    recomputed_hash = None
+                if recomputed_hash is None or digest != recomputed_hash:
+                    broken = (revision, "哈希")
+
+            # 演算：契约通过后按提交语义推进当前态与回滚点；spec 已经快照
+            # 校验，必在册且可编码。
+            new_current = current
+            new_rollback = rollback
+            if broken is None:
+                if op == _CONFIG_HISTORY_OP_INIT:
+                    # 构造仅生成修订 0（契约已限）：当前态置本项快照，回滚点空。
+                    new_current, new_rollback = spec, None
+                elif op in (_CONFIG_HISTORY_OP_LOAD, _CONFIG_HISTORY_OP_CAS):
+                    # 加载/CAS 取本项快照，保存前态为回滚点。
+                    new_current, new_rollback = spec, current
+                elif op == _CONFIG_HISTORY_OP_REVERT:
+                    target_spec = history.get(target)
+                    if target_spec is None:
+                        # 目标快照已随窗口淘汰：依赖不可知，归“边界”。
+                        broken = (revision, "边界")
+                    else:
+                        try:
+                            same = _compact_config(spec) == _compact_config(
+                                target_spec
+                            )
+                        except Exception:
+                            same = None
+                        if same is None:
+                            broken = (revision, "快照")
+                        elif not same:
+                            # 本项快照与目标快照规范 v6 JSON 不逐字节相同。
+                            broken = (revision, "回退")
+                        else:
+                            new_current, new_rollback = spec, current
+                else:
+                    # 回滚须回滚点已知且本项快照与其逐字节相同，随后清除。
+                    if rollback is unknown:
+                        broken = (revision, "边界")
+                    elif rollback is None:
+                        broken = (revision, "回滚")
+                    else:
+                        try:
+                            same = _compact_config(spec) == _compact_config(
+                                rollback
+                            )
+                        except Exception:
+                            same = None
+                        if same is None:
+                            broken = (revision, "快照")
+                        elif not same:
+                            broken = (revision, "回滚")
+                        else:
+                            new_current, new_rollback = spec, None
+
+            if broken is not None:
+                breakpoint_revision, reason = broken
+                complete = False
+                break
+
+            checked += 1
+            current, rollback = new_current, new_rollback
+            prev_revision = revision
+            prev_hash = digest
+            last_revision = revision
+            last_summary = summary
+
+        payload = {
+            "锚修订": anchor_revision,
+            "锚哈希": anchor_hash,
+            "检查": checked,
+            "完整": complete,
+            "断点": breakpoint_revision,
+            "原因": reason,
+            "末修订": last_revision,
+            "末摘要": last_summary,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def config_cas(self, key, text, expected, now_ms):
         """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
 
