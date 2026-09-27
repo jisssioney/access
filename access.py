@@ -6966,6 +6966,130 @@ class Sessions:
         payload = {"修订": self._revision, "摘要": self._config_summary()}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def config_history_diff(self, left, right):
+        """只读比较两个仍保留的配置快照，返回 LF 尾紧凑 JSON；不老化、不缓存、
+        不审计、不改任何状态，同态同参逐字节相同。
+
+        left/right 须为非 bool 非负 int：类型错抛 TypeError，负值抛
+        ValueError；校验后依 left、right 次序在保留窗口（最近 256 项）查找，
+        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v6
+        配置：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或两侧节点
+        JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再下探，
+        同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer：
+        “~”转“~0”、“/”转“~1”（先转 ~），根为空串，数组索引为十进制串；
+        项目按路径 Unicode 码点升序。每项键序/型为“路径:str、左值:str、
+        右值:str”：存在值用基线紧凑 JSON 编码（ensure_ascii=False、
+        无空白），缺失为空串。
+
+        顶层键序/型为“左修订:int、右修订:int、改变:bool、变更:list、
+        摘要:str”；改变等于变更列表非空；摘要为前四键同法编码之 UTF-8 字节
+        的 sha256 小写值。时间 O(C+D log D)、辅助空间 O(D)（外加两份规范
+        配置 O(C)），C 为单份配置规模、D 为变更项数；各项取值子树互不相
+        交，取值编码总成本 O(C)。
+        """
+        if isinstance(left, bool) or not isinstance(left, int):
+            raise TypeError(f"left must be an int, got {type(left).__name__}")
+        if isinstance(right, bool) or not isinstance(right, int):
+            raise TypeError(f"right must be an int, got {type(right).__name__}")
+        if left < 0:
+            raise ValueError(f"left must be >= 0, got {left}")
+        if right < 0:
+            raise ValueError(f"right must be >= 0, got {right}")
+
+        history = self._config_history
+        if left not in history:
+            raise KeyError(left)
+        if right not in history:
+            raise KeyError(right)
+
+        left_doc = _config_payload(history[left])
+        right_doc = _config_payload(history[right])
+        missing = object()
+        entries = []
+
+        def encode(value):
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            )
+
+        def json_type(value):
+            # 规范 v6 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            if value is None:
+                return "null"
+            if isinstance(value, bool):
+                return "bool"
+            if isinstance(value, (int, float)):
+                return "number"
+            if isinstance(value, str):
+                return "string"
+            if isinstance(value, list):
+                return "array"
+            return "object"
+
+        def emit(path, lvalue, rvalue):
+            entries.append(
+                (
+                    path,
+                    "" if lvalue is missing else encode(lvalue),
+                    "" if rvalue is missing else encode(rvalue),
+                )
+            )
+
+        def pointer_token(token):
+            return str(token).replace("~", "~0").replace("/", "~1")
+
+        def walk(path, lvalue, rvalue):
+            if lvalue is missing or rvalue is missing:
+                emit(path, lvalue, rvalue)
+                return
+            ltype = json_type(lvalue)
+            rtype = json_type(rvalue)
+            if ltype != rtype:
+                # 节点类型不同：当前路径记一项，不再下探。
+                emit(path, lvalue, rvalue)
+                return
+            if ltype == "object":
+                # 对象取键并集（键序无关，最终按路径排序）。
+                for key in set(lvalue) | set(rvalue):
+                    child = path + "/" + pointer_token(key)
+                    walk(
+                        child,
+                        lvalue.get(key, missing),
+                        rvalue.get(key, missing),
+                    )
+            elif ltype == "array":
+                # 数组按索引递归，越界侧为缺失。
+                for index in range(max(len(lvalue), len(rvalue))):
+                    child = path + "/" + str(index)
+                    walk(
+                        child,
+                        lvalue[index] if index < len(lvalue) else missing,
+                        rvalue[index] if index < len(rvalue) else missing,
+                    )
+            else:
+                # 同型叶值：以基线紧凑编码逐字节判异（数值 1 与 1.0 亦异）。
+                if encode(lvalue) != encode(rvalue):
+                    emit(path, lvalue, rvalue)
+
+        walk("", left_doc, right_doc)
+        entries.sort(key=lambda item: item[0])
+        changes = [
+            {"路径": path, "左值": ltext, "右值": rtext}
+            for path, ltext, rtext in entries
+        ]
+        head = {
+            "左修订": left,
+            "右修订": right,
+            "改变": bool(changes),
+            "变更": changes,
+        }
+        summary = hashlib.sha256(
+            encode(head).encode("utf-8")
+        ).hexdigest()
+        payload = dict(head)
+        payload["摘要"] = summary
+        return encode(payload) + "\n"
+
     def config_history(self, after=-1, limit=100):
         """只读返回防篡改配置历史的 LF 尾紧凑 JSON，查询不老化、不改任何状态。
 
@@ -7742,6 +7866,18 @@ class Sessions:
                 candidates[0] if candidates
                 else (-1, None, None, None)
             )
+            # 窗口首个候选在全册（锚后）找不到任何同 (操作, 摘要) 记录时，
+            # 即“多余事务候选找不到对应在册记录”：它不可能属于已淘汰前缀
+            # （前缀已超淘汰上界），断点修订取 -1、断点审计取候选序号，
+            # 检查计全部在册扫描项、末修订取当前修订；否则按既有口径在首个
+            # 冲突记录处记“来源”（如互换首事件的失序/换配）。
+            fc_cache = first_cand[2]
+            fc_digest = first_cand[3]
+            if fc_cache is not None and not any(
+                record[2] == fc_cache[0] and record[4] == fc_digest
+                for _li, record in load_rollback_records
+            ):
+                return source_conflict(len(load_rollback_records), first_cand)
             return source_conflict(0, first_cand)
         survivors = candidates[boundary_in_window:]
 
@@ -7763,6 +7899,16 @@ class Sessions:
             ):
                 j += 1
             if j >= len(load_rollback_records):
+                # 该候选与其后在册记录无同 (操作, 摘要) 项：若全册（锚后）
+                # 亦无同组记录，则属“多余候选找不到任何在册记录”，断点修订
+                # 取 -1、检查计全部在册扫描项、末修订取当前修订（此前在册
+                # 记录均保持已通过，仅候选为外来分歧）；否则为失序/换配分歧，
+                # 断点取游标处冲突记录修订。
+                if not any(
+                    record[2] == cache[0] and record[4] == config_digest
+                    for _li, record in load_rollback_records
+                ):
+                    return source_conflict(len(load_rollback_records), cand)
                 return source_conflict(record_cursor, cand)
             pair_record = load_rollback_records[j][1]
             paired[pair_record[0]] = cand
