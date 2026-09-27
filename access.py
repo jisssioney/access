@@ -7177,25 +7177,33 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-    def config_history_replay(self):
-        """只读重放保留的配置历史，返回 LF 尾紧凑 JSON；不老化、不改任何状态，
-        首错即停且不抛异常。
+    def _config_history_scan(self, trust_boundary=False):
+        """按 config_history_replay 契约全量校验并演算在册配置历史（只读），
+        不老化、不改任何状态，首错即停，供 config_history_replay 与
+        config_audit_reconcile 共用同一扫描。
+
+        trust_boundary=False（config_history_replay）时，演算依赖（回退目标
+        快照、回滚点）随窗口淘汰而不可知即归“边界”失败；trust_boundary=True
+        （config_audit_reconcile，淘汰修订为可信边界）时不失败：回退目标已
+        淘汰则信任本项快照并保存前态，回滚点未知则信任本项快照并清除回滚点，
+        余契约校验不变。
 
         可信锚：修订 0 在册时锚为 (-1, 64 个 0)、当前态为空、回滚点已知为空；
         否则信任最老在册快照与最老在册记录的哈希为锚（锚修订取最老在册修订），
         回滚点未知。锚后逐项先按 config_history_verify 契约校验字段、修订链、
         操作/目标、快照摘要与哈希链（快照/哈希编码失败各归同名原因），再按提交
         语义演算：构造仅生成修订 0；加载/CAS 取本项快照为新当前态；回退须目标
-        快照在册且本项快照与其规范 v6 JSON 逐字节相同；三者均保存前态为回滚点；
-        回滚须回滚点已知且本项快照与其规范 v6 JSON 逐字节相同，随后清除回滚点。
-        演算依赖（回退目标快照、回滚点）随窗口淘汰而不可知时归“边界”。任一项
-        首次出错即停：完整为 false，断点取首错项修订（修订不可读取 -1），原因
-        限“修订/父修订/操作/目标/快照/摘要/前哈希/哈希/回退/回滚/边界”；检查
-        只计通过项。顶层键序/型为“锚修订:int、锚哈希:str、检查:int、
-        完整:bool、断点:int、原因:str、末修订:int、末摘要:str”，成功时断点
-        -1、原因为空串；末修订/末摘要取最后通过态（无通过项取锚），完整时恒
-        等于 config_revision 的修订与摘要。时间 O(H·C)、辅助空间 O(C)，H 为
-        在册记录数（≤256），C 为单份配置编码成本。
+        快照在册且本项快照与其规范 v6 JSON 逐字节相同；加载/CAS/回退均保存前态
+        为回滚点；回滚须回滚点已知且本项快照与其逐字节相同，随后清除回滚点。
+        演算依赖（回退目标快照、回滚点）随窗口淘汰而不可知时归“边界”。
+
+        返回 dict：anchor_revision/anchor_hash 为锚；start 为首项被扫描的
+        log 下标（修订 0 在册为 0，否则最老在册项作为锚不扫描、取 1）；
+        checked 为通过项数；complete 为是否全量通过；broken 为 None 或
+        (断点修订, 原因)（修订号不可读时取 -1）；last_revision/last_summary
+        取末个通过态（无通过项取锚）。原因限“修订/父修订/操作/目标/快照/
+        摘要/前哈希/哈希/回退/回滚/边界”；检查只计通过项。时间 O(H·C)、
+        辅助空间 O(C)。
         """
         log = self._config_history_log
         history = self._config_history
@@ -7212,11 +7220,36 @@ class Sessions:
             last_summary = zero_hash
         else:
             # 修订 0 已随窗口淘汰：信任最老在册快照与记录哈希为锚，自次项起
-            # 校验；回滚点未知。
+            # 校验；回滚点未知。锚快照若缺失（内部状态被破坏），锚不可信，
+            # 立即以最老在册记录的修订与“快照”失败返回，不抛异常。
             anchor_revision = log[0][0]
             anchor_hash = log[0][6]
+            anchor_spec = history.get(anchor_revision) if (
+                isinstance(anchor_revision, int)
+                and not isinstance(anchor_revision, bool)
+            ) else None
+            if anchor_spec is None:
+                return {
+                    "anchor_revision": anchor_revision,
+                    "anchor_hash": anchor_hash,
+                    "start": len(log),
+                    "checked": 0,
+                    "complete": False,
+                    "broken": (
+                        anchor_revision
+                        if isinstance(anchor_revision, int)
+                        and not isinstance(anchor_revision, bool)
+                        else -1,
+                        "快照",
+                    ),
+                    "last_revision": anchor_revision
+                    if isinstance(anchor_revision, int)
+                    and not isinstance(anchor_revision, bool)
+                    else -1,
+                    "last_summary": log[0][4],
+                }
             start = 1
-            current = history[anchor_revision]
+            current = anchor_spec
             rollback = unknown
             last_revision = anchor_revision
             last_summary = log[0][4]
@@ -7233,8 +7266,7 @@ class Sessions:
         prev_hash = anchor_hash
         checked = 0
         complete = True
-        breakpoint_revision = -1
-        reason = ""
+        broken = None
         for index in range(start, len(log)):
             revision, parent, op, target, summary, rec_prev_hash, digest = log[
                 index
@@ -7313,8 +7345,13 @@ class Sessions:
                 elif op == _CONFIG_HISTORY_OP_REVERT:
                     target_spec = history.get(target)
                     if target_spec is None:
-                        # 目标快照已随窗口淘汰：依赖不可知，归“边界”。
-                        broken = (revision, "边界")
+                        if trust_boundary:
+                            # 目标快照已随窗口淘汰：对账视淘汰为可信边界，
+                            # 信任本项快照并保存前态，继续演算。
+                            new_current, new_rollback = spec, current
+                        else:
+                            # 目标快照已随窗口淘汰：依赖不可知，归“边界”。
+                            broken = (revision, "边界")
                     else:
                         try:
                             same = _compact_config(spec) == _compact_config(
@@ -7332,7 +7369,12 @@ class Sessions:
                 else:
                     # 回滚须回滚点已知且本项快照与其逐字节相同，随后清除。
                     if rollback is unknown:
-                        broken = (revision, "边界")
+                        if trust_boundary:
+                            # 回滚点随窗口淘汰而不可知：对账视淘汰为可信
+                            # 边界，信任本项快照并清除回滚点，继续演算。
+                            new_current, new_rollback = spec, None
+                        else:
+                            broken = (revision, "边界")
                     elif rollback is None:
                         broken = (revision, "回滚")
                     else:
@@ -7350,7 +7392,6 @@ class Sessions:
                             new_current, new_rollback = spec, None
 
             if broken is not None:
-                breakpoint_revision, reason = broken
                 complete = False
                 break
 
@@ -7361,17 +7402,487 @@ class Sessions:
             last_revision = revision
             last_summary = summary
 
+        return {
+            "anchor_revision": anchor_revision,
+            "anchor_hash": anchor_hash,
+            "start": start,
+            "checked": checked,
+            "complete": complete,
+            "broken": broken,
+            "last_revision": last_revision,
+            "last_summary": last_summary,
+        }
+
+    def config_history_replay(self):
+        """只读重放保留的配置历史，返回 LF 尾紧凑 JSON；不老化、不改任何状态，
+        首错即停且不抛业务异常。
+
+        校验与演算规则见 _config_history_scan（与 config_audit_reconcile
+        共用同一扫描）：可信锚、逐项契约校验与提交语义演算不变，原因限
+        “修订/父修订/操作/目标/快照/摘要/前哈希/哈希/回退/回滚/边界”。
+        顶层键序/型为“锚修订:int、锚哈希:str、检查:int、完整:bool、
+        断点:int、原因:str、末修订:int、末摘要:str”，成功时断点 -1、原因
+        空串；末修订/末摘要取最后通过态（无通过项取锚），完整时恒等于
+        config_revision 的修订与摘要。时间 O(H·C)、辅助空间 O(C)，H 为
+        在册记录数（≤256），C 为单份配置编码成本。
+        """
+        scan = self._config_history_scan()
+        breakpoint_revision = -1
+        reason = ""
+        if scan["broken"] is not None:
+            breakpoint_revision, reason = scan["broken"]
         payload = {
-            "锚修订": anchor_revision,
-            "锚哈希": anchor_hash,
-            "检查": checked,
-            "完整": complete,
+            "锚修订": scan["anchor_revision"],
+            "锚哈希": scan["anchor_hash"],
+            "检查": scan["checked"],
+            "完整": scan["complete"],
             "断点": breakpoint_revision,
             "原因": reason,
-            "末修订": last_revision,
-            "末摘要": last_summary,
+            "末修订": scan["last_revision"],
+            "末摘要": scan["last_summary"],
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def config_audit_reconcile(self):
+        """
+        只读对账……规则与输出契约见下；本公开方法为不抛异常的总入口：
+        正常对账与可预期的链/历史损坏均返回结构化失败 JSON，任何未预期的
+        内部损坏（如被直接破坏的在册数据结构）也统一兜底为“历史”失败、
+        断点均 -1，而不抛出异常。
+
+        修订来源仅“构造/直接/事务”：修订 0 为构造；非经 config_change 的
+        提交（直载/直滚/CAS/回退）为直接；config_change 首次加载/回滚成功
+        为事务，并在 audit 链记原序号 0 的首次事件；失败、升级、重放不产生
+        修订。
+
+        校验次序固定：
+        一、先按 config_history_replay 规则（见 _config_history_scan）全量
+        校验并演算在册配置历史，但淘汰导致的演算依赖不可知（回退目标快照、
+        回滚点）视为可信边界而不断裂（信任本项快照继续演算）；其余首次出错
+        即归“历史”，断点修订取该修订（修订号不可读取 -1）、断点审计 -1
+        （audit 尚未校验）。
+        二、再自空哈希（64 个 0）起校验全量 audit 链：序号自 1 连续、前哈希
+        衔接前项（首项衔接 64 个 0）、哈希可由前八字段重算；任一首次出错即
+        归“审计”，断点修订 -1、断点审计取该事件序号（不可读取 -1）。
+        三、最后按修订升序验来源（覆盖历史扫描范围内的全部在册记录，修订 0
+        已淘汰时最老在册项作为可信锚不重验、不计），再做索引与链级复核。
+        config_change 域的“键 → 首次事件序号”索引为权威指认：构造与直接项
+        无关联；事务项（加载/回滚）由其键缓存原调操作与首果配置摘要
+        (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。配对采用
+        保序最晚贪心：成功加载/回滚首调事件按序号倒序，逐个匹配最后一个仍
+        空闲的同 (操作, 摘要) 在册记录——回滚/回退常重建早前配置摘要，最晚
+        同摘要记录才是该事务真正产生的修订；早于在册窗口的候选无匹配时落入
+        可信边界，直接记录恒不被占用。配对项的指认事件须为同键、原序号 0
+        的首事件，操作须为“配置加载/配置回滚”且与缓存原调及历史操作一致
+        （违例归“操作”），缓存首果与事件结果须同为“成功”（违例归“结果”），
+        键、时刻取原调用且会话为空串（时刻须等于缓存首调时刻，违例归“关联”）；
+        配对事件序号须随修订升序单调（违例归“来源”）。修订无配对候选即为
+        直接来源，合法。索引复核（断点修订 -1、断点审计取首次事件序号；
+        已与在册修订配对的首事件不重验）：每个键指认的首事件须存在、原序号
+        0、同键、同操作、同时刻、结果名与缓存首果相符（成功或业务异常类名）、
+        会话为空串，缓存缺失或指认失效归“关联”。链级复核（按事件序号升序，
+        不关联修订）：config_change 三操作的原序号 0 事件须恰为其键索引指认
+        事件（重复或未指认归“关联”，自报重放归“重放”）；原序号非 0 的
+        重放事件须指向其前同键同操作、原序号 0 的首次事件，结果须为
+        “重放成功”或“重放”加首果名（违例归“重放”）。配置升级及其余域
+        事件不关联修订。
+
+        淘汰修订（配置历史仅留最近 256 项，audit 链全量不淘汰）为可信
+        边界：仅对账在册修订，对应已淘汰修订的首次事件不要求关联。检查仅
+        计通过修订（来源阶段逐项计）；成功时两断点均 -1、原因为空串，末
+        修订取当前修订、末审计取末事件序号（空链为 0）；失败时末修订/末
+        审计取已验通过位置（历史阶段失败取历史扫描末态与 0，审计阶段失败
+        取当前修订与末个通过链序号，来源逐项失败取前一在册修订与全链序号，
+        索引/链级失败取当前修订与全链序号）。顶层键序/型为
+        “锚修订:int、检查:int、完整:bool、断点修订:int、断点审计:int、
+        原因:str、末修订:int、末审计:int”，原因仅取
+        “历史/审计/来源/关联/操作/结果/重放”，不可读断点为 -1。时间
+        O(A+H·C)、辅助空间 O(H)，A 为审计事件数、H 为在册修订数、C 为
+        单份配置编码成本。
+        """
+        try:
+            return self._config_audit_reconcile_check()
+        except Exception:
+            payload = {
+                "锚修订": -1,
+                "检查": 0,
+                "完整": False,
+                "断点修订": -1,
+                "断点审计": -1,
+                "原因": "历史",
+                "末修订": -1,
+                "末审计": 0,
+            }
+            return (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+
+    def _config_audit_reconcile_check(self):
+        """config_audit_reconcile 的对账实现；完整契约见公开方法文档。
+        """
+        scan = self._config_history_scan(trust_boundary=True)
+        anchor_revision = scan["anchor_revision"]
+
+        def render(checked, complete, bp_revision, bp_audit, reason,
+                   last_revision, last_audit):
+            payload = {
+                "锚修订": anchor_revision,
+                "检查": checked,
+                "完整": complete,
+                "断点修订": bp_revision,
+                "断点审计": bp_audit,
+                "原因": reason,
+                "末修订": last_revision,
+                "末审计": last_audit,
+            }
+            return (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+
+        # 一、配置历史（含提交语义演算）；audit 链尚未校验，末审计取 0，
+        # 检查仅计历史扫描中已通过的修订数。
+        if not scan["complete"]:
+            bp_revision, _hist_reason = scan["broken"]
+            return render(
+                scan["checked"], False, bp_revision, -1, "历史",
+                scan["last_revision"], 0,
+            )
+
+        log = self._config_history_log
+        current_revision = log[-1][0]
+        chain = self._chain_events
+        config_ops = (
+            _CONFIG_CHAIN_LOAD,
+            _CONFIG_CHAIN_ROLLBACK,
+            _CONFIG_CHAIN_UPGRADE,
+        )
+
+        # 二、全量 audit 链：连续序号、前哈希衔接、哈希重算。此阶段历史已
+        # 全量通过，检查取历史扫描通过修订数，末修订取当前修订。
+        history_checked = scan["checked"]
+        prev_hash = "0" * 64
+        last_audit = 0
+        for expect, event in enumerate(chain, start=1):
+            (seq, ev_now, key, op, sid, result, origin,
+             stored_prev, digest) = event
+            seq_ok = (
+                isinstance(seq, int)
+                and not isinstance(seq, bool)
+                and seq == expect
+            )
+            bp_audit = seq if seq_ok else -1
+            if not seq_ok or stored_prev != prev_hash:
+                return render(
+                    history_checked, False, -1, bp_audit, "审计",
+                    current_revision, last_audit,
+                )
+            recomputed = None
+            try:
+                recomputed = self._chain_hash(
+                    seq, ev_now, key, op, sid, result, origin, stored_prev
+                )
+            except Exception:
+                recomputed = None
+            if recomputed is None or digest != recomputed:
+                return render(
+                    history_checked, False, -1, bp_audit, "审计",
+                    current_revision, last_audit,
+                )
+            prev_hash = digest
+            last_audit = seq
+        total_audit = len(chain)
+
+        # 三、来源对账。config_change 域的“键 → 首次事件序号”索引
+        # （_config_change_chain_index）为权威指认：每次合法首调（成功或
+        # 业务异常）均在链上留一个原序号 0 首次事件并把其序号记入索引。
+        # 事务修订由“索引指认事件 + 缓存原调操作/首果摘要”保序配对（见下）；
+        # 事件的键/操作/时刻/结果/会话字段一律作为被验对象而非配对依据，故
+        # 篡改任一字段都会在本阶段暴露而不会令事务修订伪装成直接来源。重放
+        # 缓存不老化、audit 链全量不淘汰，索引、缓存与事件同寿。
+        cindex = self._config_change_chain_index
+        ccache = self._config_change_cache
+
+        # 候选选取：在册修订是修订序列的连续后缀，故事务首调事件与在册
+        # load/rollback 修订的配对整体构成候选事件序列的一个后缀（更早的
+        # 成功首调皆对应已淘汰修订）。自链尾反向取至多 H 个由域索引指认
+        # （cindex[事件键] == 序号）、缓存原调为成功加载/回滚的原序号 0
+        # 事件；识别仅用 O(1) 字段与缓存判定，配置摘要只对这至多 H 个
+        # 候选计算（O(H·C)），不哈希全链。事件字段本身仍是被验对象，篡改
+        # 致错配时由 3.1/3.2/3.3 捕获。
+        retained_count = len(log)
+        selected = []
+        for index in range(total_audit - 1, -1, -1):
+            event = chain[index]
+            seq, _ev_now, ev_key, _ev_op, _sid, _result, origin = event[:7]
+            if len(selected) >= retained_count:
+                break
+            # 键须为 str 才能查域索引；非 str 键的链项不入候选（由 3.3 归
+            # “关联”），亦保证不抛异常。
+            if (
+                not isinstance(ev_key, str)
+                or origin != 0
+                or cindex.get(ev_key) != seq
+            ):
+                continue
+            cache = ccache.get(ev_key)
+            if not isinstance(cache, tuple) or len(cache) != 4:
+                continue
+            c_op, _c_text, _c_now_ms, outcome = cache
+            if (
+                not isinstance(outcome, tuple)
+                or len(outcome) != 2
+                or c_op not in (_CONFIG_OP_LOAD, _CONFIG_OP_ROLLBACK)
+                or outcome[0] != "ok"
+                or not isinstance(outcome[1], str)
+            ):
+                continue
+            try:
+                config_digest = hashlib.sha256(
+                    outcome[1][:-1].encode("utf-8")
+                ).hexdigest()
+            except Exception:
+                config_digest = None
+            selected.append((seq, ev_key, cache, config_digest))
+        selected.reverse()  # 回到事件序号升序（反向配对时倒序迭代）。
+
+        # 保序配对（O(H) 摊还）：成功加载/回滚首调事件序列即全部事务修订
+        # 的提交序，在册事务修订是其连续后缀（直接修订在记录侧交错、已淘汰
+        # 事务修订的候选在事件侧为前缀）。每个 (操作, 摘要) 组维护在册记录
+        # 下标升序栈；自链尾向首处理候选，弹出大于全局游标的下标（游标只减，
+        # 这些下标再无可用之时），取栈顶即“最后一个仍空闲且同组”的记录
+        # （最晚匹配贪心）：回滚/回退常重建早前配置摘要，最晚同摘要记录才是
+        # 该事务真正产生的修订；组栈空的前缀候选对应已淘汰修订，落入可信
+        # 边界，直接记录虽可同摘要但配对恒保序且可由 3.1/3.3 复核。
+        load_rollback_records = [
+            record for record in log
+            if record[2] in (
+                _CONFIG_HISTORY_OP_LOAD,
+                _CONFIG_HISTORY_OP_ROLLBACK,
+            )
+        ]
+        stacks_by_group = {}
+        for j, group_record in enumerate(load_rollback_records):
+            stacks_by_group.setdefault(
+                (group_record[2], group_record[4]), []
+            ).append(j)
+        paired = {}
+        record_cursor = len(load_rollback_records) - 1
+        for fseq, ckey, cache, config_digest in reversed(selected):
+            if config_digest is None:
+                continue
+            stack = stacks_by_group.get((cache[0], config_digest))
+            if not stack:
+                # 早于在册窗口（或无空闲同组记录）：前缀候选为可信边界，
+                # 游标不动。
+                continue
+            while stack and stack[-1] > record_cursor:
+                stack.pop()
+            if not stack:
+                continue
+            found_index = stack.pop()
+            pair_record = load_rollback_records[found_index]
+            paired[pair_record[0]] = (fseq, ckey, cache, config_digest)
+            record_cursor = found_index - 1
+
+        # 3.1 按修订升序验在册项（可信锚记录不重验、不计；构造/CAS/回退恒
+        # 为无关联来源；加载/回滚无配对候选即为直接来源）。检查逐项计，
+        # 末修订取前一通过项（无通过项取锚修订）。
+        checked = 0
+        last_good_revision = anchor_revision
+        last_paired_seq = 0
+        for record in log[scan["start"]:]:
+            revision, _parent, hist_op, _target, _summary, _ph, _h = record
+            candidate = paired.get(revision)
+            if candidate is not None:
+                fseq, ckey, cache, config_digest = candidate
+                # 索引指认须可读且落在链内；事件须为同键的原序号 0 首事件。
+                fseq_ok = (
+                    isinstance(fseq, int)
+                    and not isinstance(fseq, bool)
+                    and 1 <= fseq <= total_audit
+                )
+                first_event = chain[fseq - 1] if fseq_ok else None
+                if (
+                    not fseq_ok
+                    or first_event is None
+                    or first_event[6] != 0
+                    or first_event[2] != ckey
+                ):
+                    return render(
+                        checked, False, revision,
+                        fseq if fseq_ok else -1, "关联",
+                        last_good_revision, total_audit,
+                    )
+                (_ev_seq, ev_now, _ev_key, ev_op, ev_sid,
+                 ev_result, ev_origin) = first_event[:7]
+                # 配对事件序号须随修订升序单调（记录先提交、事件后入链）。
+                if fseq <= last_paired_seq:
+                    return render(
+                        checked, False, revision, fseq, "来源",
+                        last_good_revision, total_audit,
+                    )
+                c_op, _c_text, c_now_ms, outcome = cache
+                # 操作匹配历史：缓存原调操作映射的链操作须等于事件操作，且
+                # 原调操作须等于历史记录操作（加载↔配置加载、回滚↔配置回滚）。
+                if _CONFIG_CHAIN_OP.get(c_op) != ev_op or c_op != hist_op:
+                    return render(
+                        checked, False, revision, fseq, "操作",
+                        last_good_revision, total_audit,
+                    )
+                # 事务首事件结果须为“成功”，缓存首果须同为成功。
+                if outcome[0] != "ok" or ev_result != "成功":
+                    return render(
+                        checked, False, revision, fseq, "结果",
+                        last_good_revision, total_audit,
+                    )
+                # 键、时刻取原调用：事件键须为缓存键（上方已验同源），时刻
+                # 须等于首调时刻；config_change 事件会话恒为空串。
+                if ev_now != c_now_ms or ev_sid != "":
+                    return render(
+                        checked, False, revision, fseq, "关联",
+                        last_good_revision, total_audit,
+                    )
+                last_paired_seq = fseq
+            checked += 1
+            last_good_revision = revision
+
+        # 3.2 索引全量复核（不关联修订，断点修订取 -1）：已与在册修订配对
+        # 的首事件在 3.1 验过，此处跳过；其余键指认的首次事件（成功加载/
+        # 回滚对应已淘汰修订——可信边界但缓存与事件仍须自洽；失败与升级不
+        # 产生修订）须存在、原序号 0、同键，且与缓存原调同操作、同时刻、
+        # 结果名相符（成功或业务异常类名）、会话为空串；缓存缺失归“关联”。
+        paired_pairs = {
+            (candidate[1], candidate[0])
+            for candidate in paired.values()
+        }
+        for ckey, fseq in cindex.items():
+            if (ckey, fseq) in paired_pairs:
+                continue
+            fseq_ok = (
+                isinstance(fseq, int)
+                and not isinstance(fseq, bool)
+                and 1 <= fseq <= total_audit
+            )
+            if not fseq_ok:
+                return render(
+                    checked, False, -1, -1, "关联",
+                    current_revision, total_audit,
+                )
+            event = chain[fseq - 1]
+            (_ev_seq, ev_now, ev_key, ev_op, ev_sid,
+             ev_result, ev_origin) = event[:7]
+            if ev_origin != 0 or ev_key != ckey:
+                return render(
+                    checked, False, -1, fseq, "关联",
+                    current_revision, total_audit,
+                )
+            cache = ccache.get(ckey)
+            if (
+                not isinstance(cache, tuple)
+                or len(cache) != 4
+                or not isinstance(cache[3], tuple)
+                or len(cache[3]) != 2
+            ):
+                return render(
+                    checked, False, -1, fseq, "关联",
+                    current_revision, total_audit,
+                )
+            c_op, _c_text, c_now_ms, outcome = cache
+            if _CONFIG_CHAIN_OP.get(c_op) != ev_op:
+                return render(
+                    checked, False, -1, fseq, "操作",
+                    current_revision, total_audit,
+                )
+            if outcome[0] == "ok":
+                if ev_result != "成功":
+                    return render(
+                        checked, False, -1, fseq, "结果",
+                        current_revision, total_audit,
+                    )
+            else:
+                exc_class = outcome[1][0]
+                exc_name = getattr(exc_class, "__name__", None)
+                if exc_name is None or ev_result != exc_name:
+                    return render(
+                        checked, False, -1, fseq, "结果",
+                        current_revision, total_audit,
+                    )
+            if ev_now != c_now_ms or ev_sid != "":
+                return render(
+                    checked, False, -1, fseq, "关联",
+                    current_revision, total_audit,
+                )
+
+        # 3.3 链级复核（按事件序号升序，不关联修订）：config_change 三操作
+        # 的原序号 0 事件须恰为其键索引指认的首次事件（唯一关联；未被指认
+        # 或自报重放均违例）；原序号非 0 的重放事件须指向其前同键同操作的
+        # 原序号 0 首次事件，结果为“重放成功”或“重放”加首果名。
+        for event in chain:
+            seq, ev_now, key, op, sid, result, origin = event[:7]
+            if op not in config_ops:
+                continue
+            # 字段型态由入链约束保证；此处对被篡改的内部状态做形状兜底，
+            # 保证不抛异常（原序号/结果非预期归“重放”，键不可读归“关联”）。
+            if not isinstance(origin, int) or isinstance(origin, bool):
+                return render(
+                    checked, False, -1,
+                    seq if isinstance(seq, int)
+                    and not isinstance(seq, bool) else -1,
+                    "重放", current_revision, total_audit,
+                )
+            if not isinstance(result, str):
+                return render(
+                    checked, False, -1,
+                    seq if isinstance(seq, int)
+                    and not isinstance(seq, bool) else -1,
+                    "重放", current_revision, total_audit,
+                )
+            if origin == 0:
+                if not isinstance(key, str) or cindex.get(key) != seq:
+                    # 未被其键索引指认：首次事件不唯一或来源不可证。
+                    return render(
+                        checked, False, -1, seq, "关联",
+                        current_revision, total_audit,
+                    )
+                if result.startswith("重放"):
+                    # 原序号 0 的事件不得自报重放结果。
+                    return render(
+                        checked, False, -1, seq, "重放",
+                        current_revision, total_audit,
+                    )
+            else:
+                if not (1 <= origin < seq):
+                    return render(
+                        checked, False, -1, seq, "重放",
+                        current_revision, total_audit,
+                    )
+                target = chain[origin - 1]
+                if target[6] != 0 or target[2] != key or target[3] != op:
+                    return render(
+                        checked, False, -1, seq, "重放",
+                        current_revision, total_audit,
+                    )
+                if not isinstance(target[5], str):
+                    return render(
+                        checked, False, -1, seq, "重放",
+                        current_revision, total_audit,
+                    )
+                expected_result = (
+                    "重放成功"
+                    if target[5] == "成功"
+                    else "重放" + target[5]
+                )
+                if result != expected_result:
+                    return render(
+                        checked, False, -1, seq, "重放",
+                        current_revision, total_audit,
+                    )
+
+        return render(
+            checked, True, -1, -1, "", current_revision, total_audit
+        )
 
     def config_cas(self, key, text, expected, now_ms):
         """比较修订号并原子加载配置，返回 LF 尾紧凑 JSON。
