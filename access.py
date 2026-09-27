@@ -5628,6 +5628,187 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def capacity_forecast(self, now_ms, limit=100):
+        """只读预测一次推进的结果，返回 LF 结尾紧凑 JSON；不老化、不缓存、
+        不审计、不写事件、不改任何状态（模拟态全部为局部副本）。
+
+        now_ms/limit 须为非 bool int：类型错 TypeError；now_ms<0 或
+        limit ∉ [1,1000] 抛 ValueError。预测语义与 capacity 推进同构：
+        待触发且 now_ms 已到触发值（含同刻）的超时演练令全队超时，不老化、
+        不晋升；否则先模拟老化——在线会话期限或租期 <= now_ms 即释址
+        （动态址回模拟空闲堆、静态址仅退租），期限到期另转挂起，挂起仍占
+        全局/用户/模板上限但不持址；再按入队序处理队项：截止 <= now_ms
+        者为超时（不占任何资源），其余依次按全局上限、单用户上限、模板
+        并发上限及 default 池取址规则模拟晋升，前项晋升对计数与地址的占用
+        影响后项。未晋升项的等待原因按固定次序取首个受阻项：全局（非下线
+        会话数达全局上限）/用户（达每用户上限）/模板（达模板会话上限）/
+        无池（缺 default 池）/池故障（default 池处于耗尽演练，now_ms <
+        注入截至）/地址（动态耗尽或该用户专属静态址已租用）；静态址已占用
+        时不回落动态址，与 _default_candidate 一致。
+
+        顶层键序/型为“时刻:int、剩余:int、项目:list”：项目按入队序取前
+        limit 项，剩余为未列队项数（O(1) 取队长，不扫描窗口外队项）。项
+        键序/型为“会话:str、用户:str、入队序:int、结果:str、原因:str”：
+        结果仅“晋升/超时/等待”，原因依次为空串、“截止”、上述六个等待
+        原因之一。时间 O(S+limit)、辅助空间 O(U+T+limit)（S 为会话数、
+        U/T 为涉及用户/模板数；动态址全池可互换，仅记老化后空闲槽计数，
+        静态址按用户记持租，均不复制地址表或租约表）。
+        """
+        _check_int("now_ms", now_ms, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        queue_order = self._queue_order
+        capacity_queue = self._capacity_queue
+        total_queue = len(queue_order)
+        window = queue_order[:limit]
+
+        # 到点的超时演练：全队超时，不老化、不晋升；窗口外队项无需处理。
+        if self._timeout_at is not None and now_ms >= self._timeout_at:
+            items = [
+                {
+                    "会话": queued_sid,
+                    "用户": capacity_queue[queued_sid][0],
+                    "入队序": capacity_queue[queued_sid][4],
+                    "结果": _CAP_TIMEOUT,
+                    "原因": "截止",
+                }
+                for queued_sid in window
+            ]
+            payload = {
+                "时刻": now_ms,
+                "剩余": total_queue - len(items),
+                "项目": items,
+            }
+            return (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+
+        # 模拟老化 + 非下线计数单扫 O(S)：不触碰实例会话。在线→挂起仍是非
+        # 下线，全局/用户/模板三类计数与老化前一致（挂起不持址但仍占上限）。
+        # 地址可用性无需逐址副本：动态址全池可互换，只需统计老化后空闲槽数；
+        # 静态址与用户一一对应，按用户记其静态址老化后是否仍被持租。
+        total_count = 0
+        per_user = {}
+        per_template = {}
+        pool = self._pools.get(_DEFAULT_POOL_ID)
+        dyn_released = 0
+        static_held = {}
+        static_ips = pool.static_ips if pool is not None else frozenset()
+        static_by_user = pool.static if pool is not None else {}
+        # default 静态址 -> 专属用户反查表（O(U)），供持租判定 O(1) 查找；
+        # 地址空间跨池可重叠，故仅在会话池恰为 default 时据此认租。
+        static_owner = {ip_int: held_user for held_user, ip_int in
+                        static_by_user.items()}
+        for session in self._sessions.values():
+            if session["state"] == _STATE_OFFLINE:
+                continue
+            total_count += 1
+            user = session["user"]
+            per_user[user] = per_user.get(user, 0) + 1
+            template_id = self._user_templates.get(user)
+            if template_id is not None:
+                per_template[template_id] = (
+                    per_template.get(template_id, 0) + 1
+                )
+            if session["state"] == _STATE_ONLINE and session["ip"] is not None:
+                aging = (
+                    session["deadline"] <= now_ms
+                    or session["lease"] <= now_ms
+                )
+                if session["pool"] != _DEFAULT_POOL_ID:
+                    continue
+                if aging:
+                    # 老化释放：动态址回空闲槽；静态址退租后对其用户可用。
+                    if session["ip"] not in static_ips:
+                        dyn_released += 1
+                else:
+                    # 未老化且持租的 default 静态址仍专属其用户占用。
+                    held_user = static_owner.get(session["ip"])
+                    if held_user is not None:
+                        static_held[held_user] = True
+        # 老化后 default 动态空闲槽 = 现空闲堆 + 老化回槽（晋升逐槽扣减）。
+        dyn_free = len(pool.free) + dyn_released if pool is not None else 0
+
+        items = []
+        for queued_sid in window:
+            entry = capacity_queue[queued_sid]
+            user = entry[0]
+            order = entry[4]
+            if entry[3] <= now_ms:
+                items.append(
+                    {
+                        "会话": queued_sid,
+                        "用户": user,
+                        "入队序": order,
+                        "结果": _CAP_TIMEOUT,
+                        "原因": "截止",
+                    }
+                )
+                continue
+
+            # 等待原因按全局/用户/模板/无池/池故障/地址取首个受阻项；全部
+            # 闸口通过且可取址才晋升，晋升占用即时影响后项。
+            template_id = self._user_templates.get(user)
+            session_limit = (
+                self._templates[template_id][3]
+                if template_id is not None
+                else 0
+            )
+            if total_count >= self._total:
+                result, reason = "等待", "全局"
+            elif per_user.get(user, 0) >= self._per:
+                result, reason = "等待", "用户"
+            elif (
+                session_limit
+                and per_template.get(template_id, 0) >= session_limit
+            ):
+                result, reason = "等待", "模板"
+            elif pool is None:
+                result, reason = "等待", "无池"
+            elif self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
+                result, reason = "等待", "池故障"
+            else:
+                static_ip = static_by_user.get(user)
+                if static_ip is None:
+                    # 动态用户：有空闲槽即可取址（具体址不影响后续判定）。
+                    address_ok = dyn_free > 0
+                else:
+                    # 专属静态址：未被持租方可用，不回落动态址。
+                    address_ok = not static_held.get(user)
+                if not address_ok:
+                    result, reason = "等待", "地址"
+                else:
+                    if static_ip is None:
+                        dyn_free -= 1
+                    else:
+                        static_held[user] = True
+                    total_count += 1
+                    per_user[user] = per_user.get(user, 0) + 1
+                    if template_id is not None:
+                        per_template[template_id] = (
+                            per_template.get(template_id, 0) + 1
+                        )
+                    result, reason = _CAP_PROMOTED, ""
+            items.append(
+                {
+                    "会话": queued_sid,
+                    "用户": user,
+                    "入队序": order,
+                    "结果": result,
+                    "原因": reason,
+                }
+            )
+
+        payload = {
+            "时刻": now_ms,
+            "剩余": total_queue - len(items),
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _checkpoint_sessions(self):
         """检查点会话快照：在线、挂起与下线墓碑全列，按会话升序。
 
@@ -7862,17 +8043,57 @@ class Sessions:
         # 淘汰候选总数不得超过已淘汰修订数上界；超过则属来源断裂（正常历史
         # 下不可能：链与历史均已全量校验通过），在窗口首个分歧判“来源”。
         if pre_eliminated + boundary_in_window > eliminated_cap:
-            first_cand = (
-                candidates[0] if candidates
-                else (-1, None, None, None)
-            )
-            # 窗口首个候选在全册（锚后）找不到任何同 (操作, 摘要) 记录时，
-            # 即“多余事务候选找不到对应在册记录”：它不可能属于已淘汰前缀
-            # （前缀已超淘汰上界），断点修订取 -1、断点审计取候选序号，
-            # 检查计全部在册扫描项、末修订取当前修订；否则按既有口径在首个
-            # 冲突记录处记“来源”（如互换首事件的失序/换配）。
+            # 首个分歧候选取反向就近对齐首次失配的候选：窗口内有失配项时为
+            # window[b-1]（其后候选均已反向配平，唯它无记录可配）；窗口全部
+            # 配平而溢出全落在被丢弃前缀时，前 eliminated_cap 个候选可作淘汰
+            # 边界、其后首个候选即首个分歧——窗口只保留末 R 个候选，故按同一
+            # 候选判定口径正向重扫链定位该候选（仅算这一份摘要，O(C)）。
+            if boundary_in_window > 0:
+                first_cand = candidates[boundary_in_window - 1]
+            else:
+                first_cand = None
+                seen = 0
+                for fc_event in chain:
+                    (fseq, _f_now, fkey, _f_op, _f_sid,
+                     _f_result, forigin) = fc_event[:7]
+                    if (
+                        not isinstance(fkey, str)
+                        or forigin != 0
+                        or cindex.get(fkey) != fseq
+                    ):
+                        continue
+                    fcache = ccache.get(fkey)
+                    if not isinstance(fcache, tuple) or len(fcache) != 4:
+                        continue
+                    fc_op, _fc_text, _fc_now, foutcome = fcache
+                    if (
+                        not isinstance(foutcome, tuple)
+                        or len(foutcome) != 2
+                        or fc_op not in (_CONFIG_OP_LOAD, _CONFIG_OP_ROLLBACK)
+                        or foutcome[0] != "ok"
+                        or not isinstance(foutcome[1], str)
+                    ):
+                        continue
+                    if seen == eliminated_cap:
+                        try:
+                            fc_digest0 = hashlib.sha256(
+                                fcache[3][1][:-1].encode("utf-8")
+                            ).hexdigest()
+                        except Exception:
+                            fc_digest0 = None
+                        first_cand = (fseq, fkey, fcache, fc_digest0)
+                        break
+                    seen += 1
+                if first_cand is None:
+                    first_cand = (-1, None, None, None)
             fc_cache = first_cand[2]
             fc_digest = first_cand[3]
+            # 该失配候选在全册（锚后）找不到任何同 (操作, 摘要) 记录时，即
+            # “多余事务候选无在册记录”：它不可能属于已淘汰前缀（前缀已超淘汰
+            # 上界），断点修订取 -1、断点审计取候选序号，检查计全部在册扫描
+            # 项、末修订取当前修订（此前在册记录均保持已通过，仅候选为外来
+            # 分歧，不抛异常）；否则按既有口径在首个冲突记录处记“来源”
+            # （如互换首事件的失序/换配）。
             if fc_cache is not None and not any(
                 record[2] == fc_cache[0] and record[4] == fc_digest
                 for _li, record in load_rollback_records
