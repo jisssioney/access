@@ -42,7 +42,11 @@
   do/meter/capacity 新 key 首次且已定位用户的认证/资源/状态/后端失败
   累计；查询不认证、不老化、不改态。runtime_stats 全局只读快照：同口径
   会话视图、建立新 key 首次计数与万分比成功率、跨用户失败聚合与各池
-  总量/占用/可用/保留；查询不认证、不老化、不改态。
+  总量/占用/可用/保留；查询不认证、不老化、不改态。sessions(now_ms,
+  after="", limit=100) 只读游标列出会话与未到期队项（不老化、不认证、
+  不回收租约、不写审计/事件/缓存、不改计数）：按 now_ms 取视图，标识
+  Unicode 码点升序、sid>after 的前 limit 项，顶层时刻/下个/剩余/项目，
+  LF 尾紧凑 JSON，O((S+Q) log(S+Q))/O(S+Q)。
 - Sessions.batch_offline 批量下线：按 key 独立重放缓存，首果（含参数异常）
   永久缓存；首次合法先老化，非原子逐项下线/未知、原子全存在才提交否则整批
   回滚（保留老化），不记审计或容量事件。
@@ -1184,6 +1188,17 @@ class Sessions:
     认证/资源/状态/后端；池按标识 Unicode 升序，项为标识/总量/占用/可用/
     保留，总量为可用地址数、占用为有效租约数、可用=总量-保留-占用。建立
     更新 O(1)，查询 O(S+Q+U+P log P)、无池时为 O(P) 的空列表。
+    sessions(now_ms, after="", limit=100) 只读游标列出会话与未到期队项，
+    查询不老化、不认证、不回收租约、不写审计/事件/缓存、不改计数：now_ms
+    为非 bool 非负 int；after 为 str，空串从头、非空沿用凭据约束；limit 为
+    非 bool int 且 1..1000，型/值错分别 TypeError/ValueError。按 now_ms 取
+    视图：在线期限 <= now_ms 视为挂起；期限或租期 <= now_ms 则池址空、租期
+    0；截止 <= now_ms 的队项不列。会话与队项按标识 Unicode 码点升序，取
+    标识 > after 的前 limit 项；队项状态“排队”、期限取截止、入队序取原值、
+    池址空、租期 0；普通会话入队序 0，挂起/下线池址空、期限租期 0。LF 尾
+    紧凑 JSON 顶层时刻:int/下个:str/剩余:int/项目:list，有项下个取末项会话、
+    否则为 after，剩余为游标后未返回数；项键序会话/用户/状态/期限/池/地址/
+    租期/入队序；同态同参同字节，O((S+Q) log(S+Q))/O(S+Q)。
     batch_offline(key, sids, now_ms, atomic=False) 批量下线：key/sid 沿用
     凭据约束，sids 为 1..1000 个互异 sid 的 tuple，now_ms 为非 bool 非负
     int，atomic 为 bool；类型错 TypeError，取值/长度/重复错 ValueError。
@@ -5135,6 +5150,109 @@ class Sessions:
                 {"类型": "后端", "次数": fail_totals[3]},
             ],
             "池": pool_rows,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def sessions(self, now_ms, after="", limit=100):
+        """返回会话与排队项的只读游标列表 JSON；查询不老化、不认证、不回收
+        租约、不写审计/事件/缓存、不改任何计数。
+
+        now_ms 为非 bool 非负 int；after 须为 str，空串从头、非空沿用凭据
+        约束；limit 为非 bool int 且 1..1000。类型错 TypeError、取值错
+        ValueError。按 now_ms 取视图（不落实例）：在线期限 <= now_ms 视为
+        挂起（期限清零）；期限或租期 <= now_ms 则池/地址为空串、租期 0；
+        截止 <= now_ms 的队项不列出。会话与队项按标识 Unicode 码点升序，
+        取标识 > after 的前 limit 项。队项状态恒为“排队”、期限取其截止、
+        入队序取原值、池/地址空串、租期 0；普通会话入队序恒 0，挂起/下线
+        的池/地址空串、期限与租期 0。顶层键序“时刻/下个/剩余/项目”：有项
+        时“下个”取末项会话标识，无项为 after；“剩余”为游标之后未返回项数。
+        项键序“会话/用户/状态/期限/池/地址/租期/入队序”。LF 结尾紧凑 JSON
+        （ensure_ascii=False、separators=(',',':')）；同态同参同字节。
+        查询 O((S+Q) log(S+Q)) 时间、O(S+Q) 辅助空间。
+        """
+        _check_int("now_ms", now_ms, 0)
+        if not isinstance(after, str):
+            raise TypeError(f"after must be a str, got {type(after).__name__}")
+        if after:
+            _check_credential("after", after)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        rows = []
+        for sid, session in self._sessions.items():
+            state = session["state"]
+            deadline = session["deadline"]
+            pool_id = ""
+            address = ""
+            lease = 0
+            if state == _STATE_ONLINE and deadline > now_ms:
+                # 在线且期限未到：租期亦未到才保留池/地址/租期视图。
+                status = _STATE_ONLINE
+                view_deadline = deadline
+                if session["ip"] is not None and session["lease"] > now_ms:
+                    pool_id = session["pool"]
+                    address = str(ipaddress.IPv4Address(session["ip"]))
+                    lease = session["lease"]
+            elif state == _STATE_ONLINE:
+                # 在线但期限已到（含同刻）：视图为挂起，期限/池址/租期清零。
+                status = _STATE_SUSPENDED
+                view_deadline = 0
+            elif state == _STATE_SUSPENDED:
+                status = _STATE_SUSPENDED
+                view_deadline = 0
+            else:
+                # 下线墓碑：全部清零。
+                status = _STATE_OFFLINE
+                view_deadline = 0
+            rows.append(
+                (
+                    sid,
+                    {
+                        "会话": sid,
+                        "用户": session["user"],
+                        "状态": status,
+                        "期限": view_deadline,
+                        "池": pool_id,
+                        "地址": address,
+                        "租期": lease,
+                        "入队序": 0,
+                    },
+                )
+            )
+
+        # 队项：截止 > now_ms 者列出（截止到的不摘队、仅不列），入队序取原值。
+        for queued_sid, entry in self._capacity_queue.items():
+            cutoff = entry[3]
+            if cutoff <= now_ms:
+                continue
+            rows.append(
+                (
+                    queued_sid,
+                    {
+                        "会话": queued_sid,
+                        "用户": entry[0],
+                        "状态": _CAP_QUEUED,
+                        "期限": cutoff,
+                        "池": "",
+                        "地址": "",
+                        "租期": 0,
+                        "入队序": entry[4],
+                    },
+                )
+            )
+
+        # 标识与队项 sid 互不重叠（同一 sid 不会既会话又排队），按码点升序。
+        rows.sort(key=lambda row: row[0])
+        page = [item for sid, item in rows if sid > after]
+        total_after = len(page)
+        page = page[:limit]
+        next_sid = page[-1]["会话"] if page else after
+        payload = {
+            "时刻": now_ms,
+            "下个": next_sid,
+            "剩余": total_after - len(page),
+            "项目": page,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
