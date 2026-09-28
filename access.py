@@ -7907,6 +7907,130 @@ class Sessions:
         payload["摘要"] = summary
         return encode(payload) + "\n"
 
+    def config_preflight(self, text):
+        """只读预检配置文本若按 load_config 加载将产生的差异，返回 LF 尾紧凑
+        JSON；不老化、不缓存、不审计，不改配置、修订、历史、回滚点及任何运行
+        态，同态同参逐字节相同。
+
+        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v6 配置或经
+        严格复核的升级包，解析、重键、键集/键序、结构、类型、值、排序或引用
+        错抛 ValueError，当前会话上限、模板占用、队长或在租租约不能承载抛
+        ResourceError；校验次序与 load_config 完全一致（共用 _parse_config_text：
+        先解析/迁移并复核升级包，再校验用户模板引用，最后做承载校验），承载
+        校验只构造临时池表、不触碰实例状态。
+
+        预检文本先规范化为 v6 spec，再与当前配置（_current_spec() 的规范 v6
+        形态）递归比较：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或
+        两侧节点 JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再
+        下探，同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer
+        （“~”转“~0”、“/”转“~1”，先转 ~，根为空串，数组索引为十进制串），
+        项目按路径 Unicode 码点升序；两侧值编码同 config_history_diff：存在值
+        用基线紧凑 JSON 编码（ensure_ascii=False、separators=(',',':')），缺失
+        为空串；变更项键序/型为“路径:str、当前:str、目标:str”。
+
+        顶层键序/型为“修订:int、当前摘要:str、目标摘要:str、改变:bool、
+        变更:list、摘要:str”；修订与当前摘要沿 config_revision（修订号、当前
+        export 去 LF 的 sha256），目标摘要为规范 v6 对象紧凑编码 UTF-8 字节的
+        sha256 小写值，摘要覆盖前五键（前五键同法编码之 UTF-8 字节 sha256），
+        改变恰为变更列表非空。时间 O(n log n + S + Q + D log D)、辅助空间
+        O(n + D)（外加两份规范配置），n 为配置规模、S/Q 为会话与等待队列规模、
+        D 为变更项数。
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        # 与 load_config 同一解析/引用/承载校验链；该方法只读，返回的池表为
+        # 临时对象，预检结束即弃，不安装、不提交。
+        spec, _new_pools = self._parse_config_text(text)
+
+        current_doc = _config_payload(self._current_spec())
+        target_doc = _config_payload(spec)
+        missing = object()
+        entries = []
+
+        def encode(value):
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            )
+
+        def json_type(value):
+            # 规范 v6 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            if value is None:
+                return "null"
+            if isinstance(value, bool):
+                return "bool"
+            if isinstance(value, (int, float)):
+                return "number"
+            if isinstance(value, str):
+                return "string"
+            if isinstance(value, list):
+                return "array"
+            return "object"
+
+        def emit(path, current, target):
+            entries.append(
+                (
+                    path,
+                    "" if current is missing else encode(current),
+                    "" if target is missing else encode(target),
+                )
+            )
+
+        def pointer_token(token):
+            return str(token).replace("~", "~0").replace("/", "~1")
+
+        def walk(path, current, target):
+            if current is missing or target is missing:
+                emit(path, current, target)
+                return
+            cur_type = json_type(current)
+            tgt_type = json_type(target)
+            if cur_type != tgt_type:
+                # 节点类型不同：当前路径记一项，不再下探。
+                emit(path, current, target)
+                return
+            if cur_type == "object":
+                # 对象取键并集（键序无关，最终按路径排序）。
+                for key in set(current) | set(target):
+                    child = path + "/" + pointer_token(key)
+                    walk(
+                        child,
+                        current.get(key, missing),
+                        target.get(key, missing),
+                    )
+            elif cur_type == "array":
+                # 数组按索引递归，越界侧为缺失。
+                for index in range(max(len(current), len(target))):
+                    child = path + "/" + str(index)
+                    walk(
+                        child,
+                        current[index] if index < len(current) else missing,
+                        target[index] if index < len(target) else missing,
+                    )
+            else:
+                # 同型叶值：以基线紧凑编码逐字节判异（数值 1 与 1.0 亦异）。
+                if encode(current) != encode(target):
+                    emit(path, current, target)
+
+        walk("", current_doc, target_doc)
+        entries.sort(key=lambda item: item[0])
+        changes = [
+            {"路径": path, "当前": cur_text, "目标": tgt_text}
+            for path, cur_text, tgt_text in entries
+        ]
+        head = {
+            "修订": self._revision,
+            "当前摘要": self._config_summary(),
+            "目标摘要": hashlib.sha256(
+                _compact_config(spec).encode("utf-8")
+            ).hexdigest(),
+            "改变": bool(changes),
+            "变更": changes,
+        }
+        summary = hashlib.sha256(encode(head).encode("utf-8")).hexdigest()
+        payload = dict(head)
+        payload["摘要"] = summary
+        return encode(payload) + "\n"
+
     def config_history(self, after=-1, limit=100):
         """只读返回防篡改配置历史的 LF 尾紧凑 JSON，查询不老化、不改任何状态。
 
