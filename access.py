@@ -1039,6 +1039,13 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
+    audit_snapshot(after, limit) 只读输出锚定窗口快照（顶层依次版本:1/锚序号/
+    锚哈希/上限/下个序号/事件/摘要，after=0 锚哈希为 64 个 0、否则取第 after
+    项哈希，事件复用 audit 九键序及类型，摘要为前六键紧凑 JSON 的 UTF-8 字节
+    sha256 小写值，参数规则同 audit 且 after 大于末序号抛 KeyError(after)），
+    verify_audit_snapshot(text) 校验文本的锚、窗口、游标、哈希链与摘要是否与
+    当前链相符（非 str 抛 TypeError，解析/重键/键序/结构/类型/范围/版本错抛
+    ValueError，与链不符返回 False），二者均 O(limit) 时空只读；
     参数错与异参 key 重放不入链。export_config 导出 v6 配置 JSON（顶层键序
     版本/会话/地址池/模板/用户模板/容量/认证；会话与地址池沿用 v2，模板按
     标识升序、项键序标识/限速/突发/配额/会话上限/超限（会话上限 0 不限并发
@@ -9790,6 +9797,195 @@ class Sessions:
             ):
                 return False
             prev_hash = digest
+        return True
+
+    def audit_snapshot(self, after=0, limit=100):
+        """返回防篡改审计链的锚定窗口快照 JSON；只读、不老化、不写链，
+        O(limit) 时空。
+
+        参数规则同 audit：after/limit 须为非 bool 的 int（型错 TypeError），
+        after<0 或 limit∉[1,1000] 抛 ValueError，after 大于末序号抛
+        KeyError(after)（空链仅 after=0 合法）；取序号 > after 的前 limit 项。
+        顶层依次为“版本:int、锚序号:int、锚哈希:str、上限:int、下个序号:int、
+        事件:list、摘要:str”：版本恒 1，锚序号=after，上限=limit；after=0 时
+        锚哈希为 64 个 0，否则取第 after 项（锚项）的哈希；事件复用 audit
+        九键序及类型；下个序号取末项序号，空窗取 after。摘要为前六键紧凑
+        JSON（ensure_ascii=False, separators=(',',':')）UTF-8 字节的 sha256
+        小写值；输出为加 LF 的紧凑 JSON。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        total = len(self._chain_events)
+        if after > total:
+            raise KeyError(after)
+
+        # after==0 锚在链首之前；否则锚即第 after 项，取其哈希。
+        anchor_hash = "0" * 64 if after == 0 else self._chain_events[after - 1][8]
+        window = self._chain_events[after : after + limit]
+        events = [
+            {
+                "序号": seq,
+                "时刻": now_ms,
+                "键": key,
+                "操作": op,
+                "会话": sid,
+                "结果": result,
+                "原序号": origin,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for seq, now_ms, key, op, sid, result, origin, prev_hash, digest in window
+        ]
+        # 有项取下一序号为末项序号，无项取 after。
+        next_seq = window[-1][0] if window else after
+        head = {
+            "版本": 1,
+            "锚序号": after,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": events,
+        }
+        # 摘要仅覆前六键（含已渲染事件），摘要自身居第七键不参与。
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        head["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(head, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def verify_audit_snapshot(self, text):
+        """校验 audit_snapshot 文本与当前 audit 链相符；只读、不老化，
+        O(limit) 时空，相符返回 True、不符返回 False。
+
+        text 非 str 抛 TypeError；JSON 解析失败、重键、顶层键集/键序、结构、
+        字段类型、取值范围或版本非法抛 ValueError。文本自身合法但锚哈希/锚序号、
+        窗口事件、下个序号游标、事件前哈希衔接/哈希重算或摘要与当前 audit 链
+        不符时返回 False。
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"audit snapshot is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("audit snapshot top level must be an object")
+        if list(doc) != [
+            "版本", "锚序号", "锚哈希", "上限", "下个序号", "事件", "摘要"
+        ]:
+            raise ValueError(
+                "audit snapshot top-level keys must be "
+                "版本/锚序号/锚哈希/上限/下个序号/事件/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        after = self._cp_int(doc["锚序号"], "锚序号", 0)
+        limit = self._cp_int(doc["上限"], "上限", 1)
+        if limit > 1000:
+            raise ValueError(f"上限 must be <= 1000, got {limit}")
+        next_seq = self._cp_int(doc["下个序号"], "下个序号", 0)
+        anchor_hash = self._cp_hex64(doc["锚哈希"], "锚哈希")
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        events_raw = doc["事件"]
+        if not isinstance(events_raw, list):
+            raise ValueError(f"事件 must be a list, got {type(events_raw).__name__}")
+        event_keys = [
+            "序号", "时刻", "键", "操作", "会话", "结果", "原序号", "前哈希", "哈希"
+        ]
+        parsed_events = []
+        for index, item in enumerate(events_raw, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    f"audit event {index} keys must be "
+                    "序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(item["序号"], f"事件{index}.序号", 1)
+            now_ms = self._cp_int(item["时刻"], f"事件{index}.时刻", 0)
+            origin = self._cp_int(item["原序号"], f"事件{index}.原序号", 0)
+            for field in ("键", "操作", "会话", "结果"):
+                value = item[field]
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"事件{index}.{field} must be a str, "
+                        f"got {type(value).__name__}"
+                    )
+            key = item["键"]
+            op = item["操作"]
+            sid = item["会话"]
+            result = item["结果"]
+            prev_hash = self._cp_hex64(item["前哈希"], f"事件{index}.前哈希")
+            digest = self._cp_hex64(item["哈希"], f"事件{index}.哈希")
+            parsed_events.append(
+                (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
+            )
+
+        total = len(self._chain_events)
+        # 锚：after 不得超过末序号；锚哈希 after=0 为 64 个 0，否则为第 after 项
+        # 哈希。任一不符返回 False（参数范围已在结构校验阶段约束）。
+        if after > total:
+            return False
+        expect_anchor = "0" * 64 if after == 0 else self._chain_events[after - 1][8]
+        if anchor_hash != expect_anchor:
+            return False
+
+        # 窗口：事件须恰为序号 > after 的前 limit 项（不足则取到链尾）。
+        window = self._chain_events[after : after + limit]
+        if len(parsed_events) != len(window):
+            return False
+
+        # 逐项比对在册事件，并独立校验前哈希衔接与哈希重算。
+        prev_hash = anchor_hash
+        for parsed, actual in zip(parsed_events, window):
+            seq, now_ms, key, op, sid, result, origin, stored_prev, digest = parsed
+            if parsed != actual:
+                return False
+            if stored_prev != prev_hash:
+                return False
+            if (
+                self._chain_hash(
+                    seq, now_ms, key, op, sid, result, origin, stored_prev
+                )
+                != digest
+            ):
+                return False
+            prev_hash = digest
+
+        # 游标：有项取末项序号，无项取 after。
+        expect_next = window[-1][0] if window else after
+        if next_seq != expect_next:
+            return False
+
+        # 摘要：用规范化前六键重算（数值/文本相等即与生成方基线逐字节一致）。
+        canonical_head = {
+            "版本": 1,
+            "锚序号": after,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": [
+                {
+                    "序号": seq,
+                    "时刻": now_ms,
+                    "键": key,
+                    "操作": op,
+                    "会话": sid,
+                    "结果": result,
+                    "原序号": origin,
+                    "前哈希": stored_prev,
+                    "哈希": digest,
+                }
+                for seq, now_ms, key, op, sid, result, origin, stored_prev, digest
+                in parsed_events
+            ],
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            return False
         return True
 
     @staticmethod
