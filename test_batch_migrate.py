@@ -382,7 +382,7 @@ class BatchMigrateAtomicTest(unittest.TestCase):
         self.assertEqual(len(s._pools["p2"].free), s._pools["p2"].capacity)
         self.assertEqual(set(s._pools["default"].leases.values()), {"a", "b"})
 
-    def test_multiple_failures_first_recorded_rest_rollback(self):
+    def test_all_failures_recorded_successes_between_roll_back(self):
         _auth, s = make()
         add_p2(s)
         s.do("e1", "建立", "a", ("alice", "pw"), 0)
@@ -392,9 +392,11 @@ class BatchMigrateAtomicTest(unittest.TestCase):
             0,
             atomic=True,
         )
+        # 前项失败不阻止后项判定：x、y 均为未知项各记 KeyError；a 在两失败
+        # 项之间预演成功，回滚时改记“回滚”并恢复至老化后快照。
         self.assertEqual(
             [(it["会话"], it["结果"]) for it in json.loads(out)["项目"]],
-            [("x", "KeyError"), ("a", "回滚"), ("y", "回滚")],
+            [("x", "KeyError"), ("a", "回滚"), ("y", "KeyError")],
         )
         self.assertEqual(s._sessions["a"]["pool"], "default")
         self.assertEqual(s._pools["p2"].leases, {})
@@ -430,9 +432,10 @@ class BatchMigrateAtomicTest(unittest.TestCase):
         s.do("e1", "建立", "a", ("alice", "pw"), 0)
         s.fault("f", "注入", 100, 0)
         out = s.batch_migrate("k", (item("a"), item("x")), 0, atomic=True)
+        # 前项 BackendError 不阻止后项判定：x 仍被查到为未知项记 KeyError。
         self.assertEqual(
             [(it["会话"], it["结果"]) for it in json.loads(out)["项目"]],
-            [("a", "BackendError"), ("x", "回滚")],
+            [("a", "BackendError"), ("x", "KeyError")],
         )
         self.assertEqual(s._backoff["alice"], (1, 100))
         self.assertEqual(s._sessions["a"]["pool"], "default")

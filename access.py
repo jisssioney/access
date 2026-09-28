@@ -4982,9 +4982,11 @@ class Sessions:
         在线或同池 StateError、认证非 ok AuthError、目标池耗尽或静态占用
         ResourceError；后端故障期按会话用户指数退避抛 BackendError，只改
         退避）。业务异常不抛，项结果记其类名。非原子逐项提交：释出地址即
-        回本池堆，影响后项取址，失败项不影响后项。原子时对老化后快照预演：
-        任一失败则失败项记异常类名、余项记“回滚”，会话、池与租约恢复至
-        老化后快照（认证失败计数、锁定与退避保留），否则整体提交。失败不计
+        回本池堆，影响后项取址，失败项不影响后项。原子时在同一老化后演算
+        态上按输入顺序预演全部项：前项失败不阻止后项判定，成功项的临时址
+        变须影响后项；每个失败项各记其异常类名，仅预演成功项在回滚时改记
+        “回滚”。任一失败即把会话、池空闲地址与租约恢复至老化后快照（认证
+        失败计数、锁定与退避保留），全部成功才整体提交。失败不计
         user_stats/runtime_stats/fault_stats；不记审计或容量事件。返回顶层
         键序“时刻/原子/结果/项目”：结果仅提交（全部迁移）、部分（非原子
         有失败）、回滚（原子有失败）；项目依输入顺序，项键序“会话/结果”，
@@ -5113,11 +5115,12 @@ class Sessions:
         堆协同：迁出释出的动态址入按池的 reclaimed 侧堆（仍可见，供后项取
         址），自原池堆弹出的址记入 borrowed 供回滚推回。取址取“原池堆顶”
         与“reclaimed 堆顶”的较小者，故与逐项提交的取址完全一致，且不会把
-        尚未提交的释址误计为空闲而虚假耗尽。任一失败即停止预演：失败项记
-        异常类名、此前成功项逆序回滚（恢复旧址/源池/旧租期与原池堆）、余项
-        记“回滚”；认证失败计数、锁定与后端退避不回滚（老化结果亦保留）。
-        全部成功则把剩余 reclaimed 址并入各源池堆提交。整体 O(B log A)
-        时间、O(B) 辅助空间。返回 (results, all_ok)。
+        尚未提交的释址误计为空闲而虚假耗尽。按输入顺序预演全部项：前项失
+        败不阻止后项判定，成功项的临时址变仍影响后项取址，每个失败项各记
+        其异常类名。任一失败则把全部成功项改记“回滚”并逆序回滚（恢复旧址/
+        源池/旧租期与原池堆）；认证失败计数、锁定与后端退避不回滚（老化结
+        果亦保留）。全部成功则把剩余 reclaimed 址并入各源池堆提交。整体
+        O(B log A) 时间、O(B) 辅助空间。返回 (results, all_ok)。
         """
         # pool_id -> 预演中释出且尚未被后项再取走的动态址最小堆。
         reclaimed = {}
@@ -5129,10 +5132,8 @@ class Sessions:
         results = []
         all_ok = True
         for sid, target, password in items:
-            if not all_ok:
-                # 已有失败：余项不再预演，一律回滚。
-                results.append({"会话": sid, "结果": _BATCH_ROLLBACK})
-                continue
+            # 前项失败不阻止后项判定：全部项在同一演算态上依序预演，成功项
+            # 的临时址变经 reclaimed/borrowed 影响后项。
             session = self._sessions.get(sid)
             # 先记录迁移前旧值（session 即 self._sessions[sid]，会被就地改写）。
             old_pool = session["pool"] if session is not None else None
@@ -5164,7 +5165,7 @@ class Sessions:
                 )
                 results.append({"会话": sid, "结果": _BATCH_ITEM_MIGRATE})
         if not all_ok:
-            # 失败项记异常类名，此前成功项改记“回滚”（余项循环中已记）。
+            # 每个失败项各记其异常类名；仅预演成功项改记“回滚”。
             for entry in results:
                 if entry["结果"] == _BATCH_ITEM_MIGRATE:
                     entry["结果"] = _BATCH_ROLLBACK
