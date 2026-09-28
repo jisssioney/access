@@ -382,7 +382,7 @@ class BatchMigrateAtomicTest(unittest.TestCase):
         self.assertEqual(len(s._pools["p2"].free), s._pools["p2"].capacity)
         self.assertEqual(set(s._pools["default"].leases.values()), {"a", "b"})
 
-    def test_multiple_failures_first_recorded_rest_rollback(self):
+    def test_multiple_failures_each_keeps_classname(self):
         _auth, s = make()
         add_p2(s)
         s.do("e1", "建立", "a", ("alice", "pw"), 0)
@@ -392,12 +392,40 @@ class BatchMigrateAtomicTest(unittest.TestCase):
             0,
             atomic=True,
         )
+        # 前项失败不阻止后项判定：x、y 均未知各自记 KeyError，仅预演成功的
+        # a 记“回滚”。
         self.assertEqual(
             [(it["会话"], it["结果"]) for it in json.loads(out)["项目"]],
-            [("x", "KeyError"), ("a", "回滚"), ("y", "回滚")],
+            [("x", "KeyError"), ("a", "回滚"), ("y", "KeyError")],
         )
+        self.assertEqual(json.loads(out)["结果"], "回滚")
         self.assertEqual(s._sessions["a"]["pool"], "default")
         self.assertEqual(s._pools["p2"].leases, {})
+
+    def test_failure_does_not_block_later_resource_judgement(self):
+        # a 预演成功占 p2.1；中间未知项失败不阻断；c 继续判定，因 a 的临时
+        # 占用仅余一址，b 取 p2.2 成功后 c 见耗尽记 ResourceError（非“回滚”）。
+        _auth, s = make()
+        add_p2(s)
+        for sid, user in (("a", "alice"), ("b", "bob"), ("c", "carol")):
+            s.do("e" + sid, "建立", sid, (user, "pw"), 0)
+        items = (item("a"), item("x"), item("b"), item("c"))
+        out = s.batch_migrate("k", items, 0, atomic=True)
+        self.assertEqual(
+            [(it["会话"], it["结果"]) for it in json.loads(out)["项目"]],
+            [
+                ("a", "回滚"),
+                ("x", "KeyError"),
+                ("b", "回滚"),
+                ("c", "ResourceError"),
+            ],
+        )
+        self.assertEqual(json.loads(out)["结果"], "回滚")
+        # 全部回滚至老化后快照：三会话均在 default，p2 全空。
+        for sid in ("a", "b", "c"):
+            self.assertEqual(s._sessions[sid]["pool"], "default")
+        self.assertEqual(s._pools["p2"].leases, {})
+        self.assertEqual(len(s._pools["p2"].free), s._pools["p2"].capacity)
 
     def test_rollback_preserves_aging(self):
         _auth, s = make(idle_ms=100, lease_ms=100000)
@@ -430,9 +458,10 @@ class BatchMigrateAtomicTest(unittest.TestCase):
         s.do("e1", "建立", "a", ("alice", "pw"), 0)
         s.fault("f", "注入", 100, 0)
         out = s.batch_migrate("k", (item("a"), item("x")), 0, atomic=True)
+        # 前项 BackendError 不阻止后项判定：x 未知记 KeyError。
         self.assertEqual(
             [(it["会话"], it["结果"]) for it in json.loads(out)["项目"]],
-            [("a", "BackendError"), ("x", "回滚")],
+            [("a", "BackendError"), ("x", "KeyError")],
         )
         self.assertEqual(s._backoff["alice"], (1, 100))
         self.assertEqual(s._sessions["a"]["pool"], "default")
