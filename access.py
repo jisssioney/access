@@ -60,6 +60,13 @@
   下线墓碑记“状态”；原子先查快照，全在线才提交，否则失败项记未知/状态、
   在线项记“回滚”且不延长期限。保活只改期限，不续租、不分址、不审计、不记
   容量事件或统计。
+- Sessions.batch_migrate 批量迁移：按 key 独立重放缓存，首果（含参数异常）
+  永久缓存；首次合法先老化，逐项沿用 do 迁移规则（不查后端，无
+  BackendError），业务异常不抛而记项结果类名；非原子逐项提交，前项释址影响
+  后项取址；原子在老化后快照上演算全部项，任一失败则失败项记类名、余项记
+  “回滚”，会话、池、租约精确恢复至老化后快照（经带落位记录的堆操作逆序逐格
+  逆放），全成才提交。失败不计 user_stats/runtime_stats/fault_stats，认证
+  失败计数与锁定、后端退避保留，回滚亦然；不记审计或容量事件。
 - Sessions.credential_change 凭据轮换：按 key 独立重放缓存，首果（含参数
   异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked 抛
   AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
@@ -846,6 +853,91 @@ def _replay_exception(exc_class, exc_args):
     return exc
 
 
+def _heap_push_track(heap, item):
+    """heapq.heappush 的等价实现，额外返回 item 上浮后的最终位。
+
+    规则与 heapq._siftdown 一致：自末位沿父链上浮，父值大于 item 才下移。
+    """
+    heap.append(item)
+    pos = len(heap) - 1
+    while pos > 0:
+        parent = (pos - 1) >> 1
+        if not heap[parent] > item:
+            break
+        heap[pos] = heap[parent]
+        pos = parent
+    heap[pos] = item
+    return pos
+
+
+def _heap_pop_track(heap):
+    """heapq.heappop 的等价实现，额外返回 (弹值, 原末项, 末项落位)。
+
+    规则与 heapq._siftup 一致：原末项置根后沿最小子链沉到叶，再按
+    item<父 上浮到最终位 bubble。
+    """
+    tail = heap.pop()
+    if not heap:
+        return tail, tail, 0
+    popped = heap[0]
+    heap[0] = tail
+    end = len(heap)
+    pos = 0
+    child = 1
+    while child < end:
+        right = child + 1
+        if right < end and not heap[child] < heap[right]:
+            child = right
+        heap[pos] = heap[child]
+        pos = child
+        child = 2 * pos + 1
+    bubble = pos
+    while pos > 0:
+        pos = (pos - 1) >> 1
+        if tail < heap[pos]:
+            heap[bubble] = heap[pos]
+            bubble = pos
+        else:
+            break
+    heap[bubble] = tail
+    return popped, tail, bubble
+
+
+def _heap_undo_pop_track(heap, popped, tail, dest):
+    """_heap_pop_track 的逐格逆：入参为弹后堆，复原为弹前堆，O(log A)。
+
+    末项落位 dest 的祖先链即正序下移路径；追加 tail 后自 dest 沿父链把
+    路径值逐格下移，根置弹值。弹前仅一元素时堆为空，直接置回弹值。
+    """
+    if not heap:
+        heap.append(popped)
+        return
+    heap.append(tail)
+    pos = dest
+    while pos > 0:
+        parent = (pos - 1) >> 1
+        heap[pos] = heap[parent]
+        pos = parent
+    heap[0] = popped
+
+
+def _heap_undo_push_track(heap, dest):
+    """_heap_push_track 的逐格逆：移除上浮到 dest 的推入值并弹末项，O(log A)。
+
+    dest 到末位为同一条父子链；自 dest 侧沿链把各值逐格上移复原父值。
+    dest 即末位（推入未移动）时仅弹末项。
+    """
+    last = len(heap) - 1
+    chain = [last]
+    pos = last
+    while pos != dest:
+        pos = (pos - 1) >> 1
+        chain.append(pos)
+    for i in range(len(chain) - 1, 0, -1):
+        heap[chain[i]] = heap[chain[i - 1]]
+    heap.pop()
+
+
 # 会话状态；初始/认证中仅为建立过程中的瞬态，落库状态为在线/挂起/下线。
 _STATE_ONLINE = "在线"
 _STATE_SUSPENDED = "挂起"
@@ -978,6 +1070,11 @@ _BATCH_ITEM_ONLINE = "上线"
 # _BATCH_ROLLBACK。
 _KEEPALIVE_OK = "保活"
 _KEEPALIVE_STATE = "状态"
+
+# batch_migrate 批量迁移：成功项结果“迁移”，区别于会话状态“在线”；失败项
+# 记业务异常类名（AuthError/ResourceError/StateError/BackendError/KeyError），
+# 回滚沿用 _BATCH_ROLLBACK。
+_BATCH_ITEM_MIGRATE = "迁移"
 
 # credential_change 凭据轮换：入防篡改审计链的操作名与返回 JSON 的结果串。
 _CREDENTIAL_OP = "凭据轮换"
@@ -1254,6 +1351,23 @@ class Sessions:
     输入顺序，项键序“会话/结果/期限”，项结果仅保活/未知/状态/回滚，保活项
     期限取改后新值、余项期限为 0。首次 O(S+B log A) 时间、O(B) 辅助空间，
     重放 O(B)。
+    batch_migrate(key, items, now_ms, atomic=False) 批量迁移：key 及
+    (sid, target, password) 三项串沿用凭据约束，items 为 1..1000 个互异
+    sid 三元组的 tuple；now_ms 为非 bool 非负 int，atomic 为 bool；类型错
+    TypeError，取值/长度/重复错 ValueError。验 key 后以独立域（与
+    do/meter/capacity/fault/pool_fault/timeout_fault/batch_offline/
+    batch_online/keepalive 分域）永久缓存首果（含参数异常），同型同参重放
+    不老化、不改态，异参 ValueError。首次合法先老化；逐项沿用 do 迁移规则
+    （零池 StateError、未知 sid/target KeyError、非持址在线或同池 StateError、
+    认证非 ok AuthError、目标池耗尽或静态占用 ResourceError；不查后端，故无
+    BackendError），业务异常不抛、项结果记类名。非原子逐项提交，前项释址影响
+    后项；原子在老化后快照上演算全部项，任一失败则失败项记类名、余项记回滚，
+    会话、池、租约恢复至老化后快照，全成才提交。失败不计
+    user_stats/runtime_stats/fault_stats；认证失败计数与锁定、后端退避保留，
+    回滚亦然。不记审计或容量事件。返回键序时刻/原子/结果/项目的 LF 尾紧凑
+    JSON，结果仅提交（全成）/部分（非原子有失败）/回滚（原子有失败），项目依
+    输入顺序，项键序“会话/结果”，项结果仅迁移/业务异常类名/回滚。首次
+    O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
     runtime_checkpoint(now_ms) 先验参再老化一次，输出运行态检查点基线
     JSON（LF 尾）：顶层键序版本/时刻/容量/配额/摘要，版本 1，容量沿用
     同刻 clog 对象契约（时刻等于顶层）、配额沿用同刻 quota_checkpoint
@@ -1495,6 +1609,10 @@ class Sessions:
         # pool_fault/timeout_fault/batch_offline/batch_online 分域：
         # key -> (sids, now_ms, atomic, outcome)。
         self._keepalive_cache = {}
+        # batch_migrate 批量迁移的重放缓存，与 do/meter/capacity/fault/
+        # pool_fault/timeout_fault/batch_offline/batch_online/keepalive 分域：
+        # key -> (items, now_ms, atomic, outcome)。
+        self._batch_migrate_cache = {}
         # config_change 配置加载/回滚/升级事务的重放缓存，与 do/meter/
         # capacity/fault/pool_fault/timeout_fault/batch_offline 分域：
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
@@ -5091,6 +5209,292 @@ class Sessions:
     def _render_keepalive(now_ms, atomic, result, items):
         # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
         # 结果为 str，项目为项（会话/结果/期限）列表，依输入顺序，期限为 int。
+        payload = {
+            "时刻": now_ms,
+            "原子": atomic,
+            "结果": result,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def batch_migrate(self, key, items, now_ms, atomic=False):
+        """批量迁移一批会话，返回 LF 结尾的 JSON 字符串。
+
+        key 沿用凭据约束；items 为含 1..1000 个 (sid, target, password)
+        三元组 tuple 的 tuple，三个串均沿用凭据约束且 sid 互异；now_ms 为
+        非 bool 非负 int，atomic 为 bool。依序校验：类型错 TypeError，
+        取值、长度、重复 sid 错 ValueError。key 有效后以独立域（与
+        do/meter/capacity/fault/pool_fault/timeout_fault/batch_offline/
+        batch_online/keepalive 分域）永久缓存首果（含参数异常）：同型同参
+        重放不老化、不改态，直接返回或重抛；异参抛 ValueError。
+
+        首次合法调用先老化（在线期限到先挂起释址、租期到释址），随后逐项
+        沿用 do 迁移规则：零池 StateError、未知 sid/target KeyError、非持址
+        在线或同池 StateError、认证非 ok AuthError、目标池耗尽或静态占用
+        ResourceError。迁移不经后端检查，故无 BackendError；业务异常不抛，
+        项结果记其类名。非原子逐项提交，前项释放的地址影响后项取址；原子
+        先在老化后快照上演算全部项，任一失败则失败项记异常类名、余项记
+        “回滚”，会话、地址池与租约全部恢复至老化后快照，否则逐项提交。
+        失败不计 user_stats/runtime_stats/fault_stats；认证失败计数与锁定、
+        后端退避保留，回滚亦然（本接口不查后端，退避不因批变更）。不记审计
+        或容量事件。返回顶层键序“时刻/原子/结果/项目”：结果仅提交（全部
+        迁移成功）、部分（非原子有失败）、回滚（原子有失败）；项目依输入
+        顺序，项键序“会话/结果”，项结果仅迁移/业务异常类名/回滚。首次
+        调用 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_migrate_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不迁移、不记审计/事件，仅按缓存返回或重抛。
+            c_items, c_now_ms, c_atomic, outcome = cached
+            if not _strict_equal(
+                (items, now_ms, atomic), (c_items, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存；校验失败不老化、不改态。
+        try:
+            self._validate_batch_migrate_params(items, now_ms, atomic)
+        except (TypeError, ValueError) as exc:
+            self._batch_migrate_cache[key] = (
+                items,
+                now_ms,
+                atomic,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 首次合法调用：先老化（与其他写接口一致，老化先于业务处理）。
+        self._age(now_ms)
+
+        if atomic:
+            results, commit = self._batch_migrate_atomic(items, now_ms)
+        else:
+            results, commit = self._batch_migrate_sequential(items, now_ms)
+        if commit:
+            result = _BATCH_COMMIT
+        else:
+            result = _BATCH_ROLLBACK if atomic else _BATCH_PARTIAL
+        output = self._render_batch_migrate(now_ms, atomic, result, results)
+        self._batch_migrate_cache[key] = (items, now_ms, atomic, ("ok", output))
+        return output
+
+    @staticmethod
+    def _validate_batch_migrate_params(items, now_ms, atomic):
+        """校验 batch_migrate 三参数：类型错先于取值/长度/重复错。
+
+        items 须为 tuple，含 1..1000 个 (sid, target, password) 三元组
+        tuple，三个串均满足凭据约束且 sid 互异；now_ms 为非 bool 非负
+        int；atomic 为 bool。类型阶段先查容器/各项/各串/now_ms/atomic
+        的类型；取值阶段依序查各项长度与三串取值、now_ms 下界、项数
+        上下界、sid 重复。
+        """
+        # 类型阶段：任一类型错先于任何取值错抛出。
+        if not isinstance(items, tuple):
+            raise TypeError(f"items must be a tuple, got {type(items).__name__}")
+        for item in items:
+            if not isinstance(item, tuple):
+                raise TypeError(
+                    f"item must be a tuple, got {type(item).__name__}"
+                )
+            for field in item:
+                if not isinstance(field, str):
+                    raise TypeError(
+                        f"item field must be a str, got {type(field).__name__}"
+                    )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
+
+        # 取值阶段：项长度、凭据值、下界、项数、重复。
+        for item in items:
+            if len(item) != 3:
+                raise ValueError(
+                    "item must be a 3-tuple (sid, target, password), "
+                    f"got {len(item)} items"
+                )
+            _check_credential("sid", item[0])
+            _check_credential("target", item[1])
+            _check_credential("password", item[2])
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(items) <= _BATCH_MAX_SIDS):
+            raise ValueError(
+                f"items must contain 1..{_BATCH_MAX_SIDS} items, got {len(items)}"
+            )
+        sids = [item[0] for item in items]
+        if len(set(sids)) != len(sids):
+            raise ValueError("items must not contain duplicate sid")
+
+    def _batch_migrate_sequential(self, items, now_ms):
+        """非原子逐项迁移：逐项提交，前项释址影响后项取址。
+
+        业务异常（AuthError/ResourceError/StateError/KeyError）不抛，项结果
+        记异常类名，失败项不影响后项。返回 (results, commit)：commit 恒为
+        是否无失败项。
+        """
+        results = []
+        commit = True
+        for sid, target, password in items:
+            try:
+                self._migrate(sid, target, password, now_ms)
+            except (AuthError, ResourceError, StateError, KeyError) as exc:
+                # 业务异常不抛：项结果记异常类名，不影响后项。
+                results.append({"会话": sid, "结果": type(exc).__name__})
+                commit = False
+            else:
+                results.append({"会话": sid, "结果": _BATCH_ITEM_MIGRATE})
+        return results, commit
+
+    def _batch_migrate_atomic(self, items, now_ms):
+        """原子批量迁移：先在老化后快照上演算全部项。
+
+        任一失败则失败项记异常类名、余项记“回滚”，并把会话、地址池与租约
+        全部恢复至老化后快照（老化、认证失败计数与锁定保留）；全部成功才
+        逐项提交。演算期每项成功迁移记录 O(1) 增量（会话旧址/旧租、源/目标
+        池址与堆操作落位），回滚按逆序逐格逆放，辅助空间 O(B)、时间
+        O(B log A)。返回 (results, commit)。
+        """
+        results = []
+        all_ok = True
+        # 每项成功迁移的逆放记录：
+        # (sid, source_id, old_ip, old_lease, target_id, new_ip,
+        #  push_dest, popped, tail, pop_dest, new_dynamic)
+        # 静态度对应堆操作缺省（push_dest 为 None 或 new_dynamic 为 False）。
+        changes = []
+        for sid, target, password in items:
+            session = self._sessions.get(sid)
+            old_pool = session["pool"] if session is not None else None
+            old_ip = session["ip"] if session is not None else None
+            old_lease = session["lease"] if session is not None else None
+            try:
+                new_ip, push_dest, pop_info = self._batch_migrate_step(
+                    sid, target, password, now_ms
+                )
+            except (AuthError, ResourceError, StateError, KeyError) as exc:
+                # 演算失败：项结果记异常类名；不中断，余项继续在已演算态上
+                # 试演，凡未抛错者提交时记“回滚”。失败项本身无任何变更。
+                results.append({"会话": sid, "结果": type(exc).__name__})
+                all_ok = False
+            else:
+                changes.append(
+                    (sid, old_pool, old_ip, old_lease, target, new_ip,
+                     push_dest, pop_info)
+                )
+                results.append({"会话": sid, "结果": _BATCH_ITEM_MIGRATE})
+
+        if not all_ok:
+            # 整批回滚：按逆序逐格逆放堆与租约操作，会话/池/租约精确恢复至
+            # 老化后快照；演算期的认证失败计数与锁定（在认证器内）保留。
+            self._batch_migrate_rollback(changes)
+            for entry in results:
+                if entry["结果"] == _BATCH_ITEM_MIGRATE:
+                    entry["结果"] = _BATCH_ROLLBACK
+            return results, False
+        return results, True
+
+    def _batch_migrate_step(self, sid, target, password, now_ms):
+        """批内（原子演算）单项迁移，规则与 _migrate 相同，但堆改动经带落位
+        记录的 _heap_push_track/_heap_pop_track，供整批逆序逐格回滚。
+
+        返回 (new_ip, push_dest, pop_info)：push_dest 为旧址动态回堆后的
+        落位（静态度为 None）；pop_info 为 (弹址, 原末项, 末项落位)（新址
+        动态）或 None（新址静态）。失败抛既有业务异常，不留半换址。
+        """
+        if not self._pools:
+            raise StateError("no pool: no address pool configured")
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        target_pool = self._pools.get(target)
+        if target_pool is None:
+            raise KeyError(f"unknown target pool: {target!r}")
+        if session["state"] != _STATE_ONLINE or session["ip"] is None:
+            raise StateError(
+                f"cannot migrate sid {sid!r} in state {session['state']!r} "
+                "without address"
+            )
+        source_id = session["pool"]
+        if source_id == target:
+            raise StateError(f"sid {sid!r} already in target pool {target!r}")
+
+        user = session["user"]
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        if self._pool_is_exhausted(target, now_ms):
+            raise ResourceError(f"target pool {target!r} exhausted")
+
+        source_pool = self._pools[source_id]
+        old_ip = session["ip"]
+        new_ip = target_pool.static.get(user)
+        pop_info = None
+        if new_ip is None:
+            # 非静态用户：取目标池最小动态空闲址。
+            if not target_pool.free:
+                raise ResourceError(f"target pool {target!r} exhausted")
+            new_ip, tail, pop_dest = _heap_pop_track(target_pool.free)
+            pop_info = (new_ip, tail, pop_dest)
+        elif new_ip in target_pool.leases:
+            # 目标静态址已被同用户的另一会话占用。
+            raise ResourceError(
+                f"static address {ipaddress.IPv4Address(new_ip)} for {user!r} "
+                "already in use"
+            )
+
+        # 全部校验通过：原子释旧址、换池址。动态旧址回本池堆。
+        del source_pool.leases[old_ip]
+        push_dest = None
+        if old_ip not in source_pool.static_ips:
+            push_dest = _heap_push_track(source_pool.free, old_ip)
+        target_pool.leases[new_ip] = sid
+
+        # 迁移重置租期，空闲期限（期限）保持不变。
+        session["ip"] = new_ip
+        session["pool"] = target
+        session["lease"] = now_ms + self._lease_ms
+        return new_ip, push_dest, pop_info
+
+    def _batch_migrate_rollback(self, changes):
+        """按逆序逐格逆放演算期每项成功迁移的全部变更。
+
+        每项迁移正序为：删源池旧租、旧址动态则 heappush 回源池空堆、置目标
+        池新租、新址动态则 heappop 目标池空堆、改会话池/址/租。逆序逆放：
+        新址动态则逆 heappop、删目标池新租、旧址动态则逆 heappush、复原
+        源池旧租与会话三字段。静态度不入堆，仅退租/复原租约。逆序保证每步
+        到达的堆态恰为对应正序操作后的堆态，逐格复原。
+        """
+        for change in reversed(changes):
+            sid, source_id, old_ip, old_lease, target_id, new_ip, push_dest, (
+                pop_info
+            ) = change
+            target_pool = self._pools[target_id]
+            if pop_info is not None:
+                popped, tail, pop_dest = pop_info
+                _heap_undo_pop_track(target_pool.free, popped, tail, pop_dest)
+            del target_pool.leases[new_ip]
+
+            source_pool = self._pools[source_id]
+            if push_dest is not None:
+                _heap_undo_push_track(source_pool.free, push_dest)
+            source_pool.leases[old_ip] = sid
+
+            session = self._sessions[sid]
+            session["ip"] = old_ip
+            session["pool"] = source_id
+            session["lease"] = old_lease
+
+    @staticmethod
+    def _render_batch_migrate(now_ms, atomic, result, items):
+        # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
+        # 结果为 str，项目为项（会话/结果）列表，依输入顺序。
         payload = {
             "时刻": now_ms,
             "原子": atomic,
