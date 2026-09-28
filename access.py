@@ -5628,6 +5628,185 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    def capacity_forecast(self, now_ms, limit=100):
+        """只读预测此刻一次“推进”的结果，返回 LF 结尾紧凑 JSON，不改任何状态。
+
+        now_ms/limit 须为非 bool 的 int：类型不符 TypeError；now_ms < 0 或
+        limit ∉ [1,1000] 抛 ValueError。不老化、不入缓存、不记审计/capacity
+        事件、不写任何状态（会话、队列、地址租约、触发均保持原样）。
+
+        预测口径与 capacity“推进”一致：在线期限或租期 <= now_ms 即释址，
+        期限到期（含同刻）另转挂起（挂起不持址、不计在线但仍占全局/用户/模板
+        上限）；待触发且 now_ms>=触发值的全局超时演练到点时，不老化、不晋升，
+        全队项按入队序记超时。否则队项截止 <= now_ms 为超时，其余依入队序按
+        全局、单用户、模板上限及 default 池取址规则模拟晋升，前项占址/占额
+        影响后项判定。等待原因按 全局/用户/模板/无池/池故障/地址 的优先级
+        取首个不满足项。
+
+        顶层键序“时刻/剩余/项目”，均为 int/int/list；项目取入队序前 limit
+        项，剩余为未列项数。项键序“会话/用户/入队序/结果/原因”，前两项为
+        str、入队序为 int；结果仅“晋升/超时/等待”，原因分别为空串/“截止”/
+        上述六值之一。时间 O(S+limit)，辅助空间 O(U+T+limit)（S 为会话数、
+        U 为用户数、T 为模板数）。
+        """
+        _check_int("now_ms", now_ms, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        queued_total = len(self._queue_order)
+        take = min(limit, queued_total)
+        drill_armed = self._timeout_at is not None and now_ms >= self._timeout_at
+
+        # 到点演练：推进不老化、不晋升，全部队项超时。无需演算计数与取址。
+        if drill_armed:
+            items = []
+            for index in range(take):
+                queued_sid = self._queue_order[index]
+                entry = self._capacity_queue[queued_sid]
+                items.append(
+                    {
+                        "会话": queued_sid,
+                        "用户": entry[0],
+                        "入队序": entry[4],
+                        "结果": _CAP_TIMEOUT,
+                        "原因": "截止",
+                    }
+                )
+            payload = {"时刻": now_ms, "剩余": queued_total - take, "项目": items}
+            return (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+
+        # 普通推进先老化（仅演算，不落库）：
+        # 计数——期限到期在线转挂起仍是非下线，挂起与租期到（未挂起）会话均仍
+        # 占全局/用户/模板上限，故老化后各类计数即全部非下线会话，单扫一次。
+        total_count = 0
+        per_user = {}
+        per_template = {}
+        pool = self._pools.get(_DEFAULT_POOL_ID)
+        # 老化后 default 池动态空闲址数：现堆内动态址加在线到期/租期到释放回的
+        # default 动态址（动态址无用户归属，互换不影响可服务性，故只计数量）。
+        dynamic_free = len(pool.free) if pool is not None else 0
+        # 老化后仍持租 default 静态址的用户（静态址专属用户、不回堆，按用户记）。
+        occupied_static_users = set()
+        for session in self._sessions.values():
+            if session["state"] == _STATE_OFFLINE:
+                continue
+            total_count += 1
+            user = session["user"]
+            per_user[user] = per_user.get(user, 0) + 1
+            template_id = self._user_templates.get(user)
+            if template_id is not None:
+                per_template[template_id] = per_template.get(template_id, 0) + 1
+            if session["state"] != _STATE_ONLINE or session["ip"] is None:
+                continue
+            expired = session["deadline"] <= now_ms
+            lease_due = session["lease"] <= now_ms
+            if not (expired or lease_due):
+                # 未释址：持址仍占用。
+                if (
+                    session["pool"] == _DEFAULT_POOL_ID
+                    and session["ip"] in pool.static_ips
+                ):
+                    occupied_static_users.add(user)
+            elif session["pool"] == _DEFAULT_POOL_ID:
+                # 释址：default 动态址回堆可再分配；静态址仅退租（不计入动态）。
+                if session["ip"] not in pool.static_ips:
+                    dynamic_free += 1
+
+        items = []
+        # 前项模拟晋升额外占用的动态址数与静态址用户（静态址按用户专属）。
+        used_dynamic = 0
+        used_static_users = set()
+        for index in range(take):
+            queued_sid = self._queue_order[index]
+            entry = self._capacity_queue[queued_sid]
+            user = entry[0]
+            order = entry[4]
+
+            if entry[3] <= now_ms:
+                # 截止到点（含同刻）：超时摘队，不占址、不占额，不影响后项。
+                items.append(
+                    {
+                        "会话": queued_sid,
+                        "用户": user,
+                        "入队序": order,
+                        "结果": _CAP_TIMEOUT,
+                        "原因": "截止",
+                    }
+                )
+                continue
+
+            # 晋升闸按全局、用户、模板、default 池取址的固定优先级取首个不满足
+            # 项作为等待原因；前项模拟晋升后占址/占额影响后项。
+            reason = ""
+            if total_count >= self._total:
+                reason = "全局"
+            elif per_user.get(user, 0) >= self._per:
+                reason = "用户"
+            else:
+                template_id = self._user_templates.get(user)
+                if template_id is not None:
+                    session_limit = self._templates[template_id][3]
+                    if (
+                        session_limit
+                        and per_template.get(template_id, 0) >= session_limit
+                    ):
+                        reason = "模板"
+                if reason == "":
+                    if pool is None:
+                        reason = "无池"
+                    elif self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
+                        reason = "池故障"
+                    else:
+                        if pool.static.get(user) is not None:
+                            # 静态用户仅用专属静态址，被占则等待（不回落动态）。
+                            if (
+                                user in occupied_static_users
+                                or user in used_static_users
+                            ):
+                                reason = "地址"
+                        elif dynamic_free - used_dynamic <= 0:
+                            reason = "地址"
+
+            if reason == "":
+                # 模拟晋升：占全局/用户/模板名额并占址，供后项判定。
+                total_count += 1
+                per_user[user] = per_user.get(user, 0) + 1
+                template_id = self._user_templates.get(user)
+                if template_id is not None:
+                    per_template[template_id] = (
+                        per_template.get(template_id, 0) + 1
+                    )
+                if pool.static.get(user) is not None:
+                    used_static_users.add(user)
+                else:
+                    used_dynamic += 1
+                items.append(
+                    {
+                        "会话": queued_sid,
+                        "用户": user,
+                        "入队序": order,
+                        "结果": _CAP_PROMOTED,
+                        "原因": "",
+                    }
+                )
+            else:
+                items.append(
+                    {
+                        "会话": queued_sid,
+                        "用户": user,
+                        "入队序": order,
+                        "结果": "等待",
+                        "原因": reason,
+                    }
+                )
+
+        payload = {"时刻": now_ms, "剩余": queued_total - take, "项目": items}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _checkpoint_sessions(self):
         """检查点会话快照：在线、挂起与下线墓碑全列，按会话升序。
 
@@ -7860,25 +8039,70 @@ class Sessions:
             ci -= 1
         boundary_in_window = ci + 1
         # 淘汰候选总数不得超过已淘汰修订数上界；超过则属来源断裂（正常历史
-        # 下不可能：链与历史均已全量校验通过），在窗口首个分歧判“来源”。
+        # 下不可能：链与历史均已全量校验通过）。反向对齐未安置的窗口前缀为
+        # candidates[:boundary_in_window]：自其中按审计序号升序找首个在全册
+        # （锚后）无任何同 (操作, 摘要) 记录的候选——即“多余候选无在册记
+        # 录”，它不可能属于已淘汰前缀（前缀已超淘汰上界），断点修订取 -1、
+        # 断点审计取该候选序号、检查计全部在册扫描项、末修订取当前修订
+        # （此前在册记录均保持已通过，仅候选为外来分歧）；前缀候选皆能在全
+        # 册找到同组记录时无外来候选，按既有口径在首个冲突记录处记“来源”
+        # （如互换首事件的失序/换配）。
         if pre_eliminated + boundary_in_window > eliminated_cap:
-            first_cand = (
-                candidates[0] if candidates
-                else (-1, None, None, None)
+            foreign_cand = None
+            for cand in candidates[:boundary_in_window]:
+                fc_cache = cand[2]
+                fc_digest = cand[3]
+                if not any(
+                    record[2] == fc_cache[0] and record[4] == fc_digest
+                    for _li, record in load_rollback_records
+                ):
+                    foreign_cand = cand
+                    break
+            if foreign_cand is not None:
+                return source_conflict(
+                    len(load_rollback_records), foreign_cand
+                )
+            if candidates:
+                # 前缀候选皆有同组在册记录：按既有口径在首个冲突记录处记
+                # “来源”（如互换首事件的失序/换配）。
+                return source_conflict(0, candidates[0])
+            # 配对窗口为空（在册无加载/回滚记录）而候选数超淘汰上界：正向找
+            # 第 eliminated_cap+1 个成功事务候选，即淘汰无法解释的首个多余
+            # 候选（其在全册必无同组记录），断点审计取其序号、断点修订 -1。
+            surplus_seq = -1
+            forward_rank = 0
+            for event in chain:
+                f_seq, _f_now, f_key, _f_op, _f_sid, _f_res, f_origin = event[
+                    :7
+                ]
+                if (
+                    not isinstance(f_key, str)
+                    or f_origin != 0
+                    or cindex.get(f_key) != f_seq
+                ):
+                    continue
+                f_cache = ccache.get(f_key)
+                if not isinstance(f_cache, tuple) or len(f_cache) != 4:
+                    continue
+                fc_op, _fc_text, _fc_now, fc_outcome = f_cache
+                if (
+                    not isinstance(fc_outcome, tuple)
+                    or len(fc_outcome) != 2
+                    or fc_op not in (_CONFIG_OP_LOAD, _CONFIG_OP_ROLLBACK)
+                    or fc_outcome[0] != "ok"
+                    or not isinstance(fc_outcome[1], str)
+                ):
+                    continue
+                forward_rank += 1
+                if forward_rank == eliminated_cap + 1:
+                    surplus_seq = f_seq if (
+                        isinstance(f_seq, int) and not isinstance(f_seq, bool)
+                    ) else -1
+                    break
+            return source_conflict(
+                len(load_rollback_records),
+                (surplus_seq, None, None, None),
             )
-            # 窗口首个候选在全册（锚后）找不到任何同 (操作, 摘要) 记录时，
-            # 即“多余事务候选找不到对应在册记录”：它不可能属于已淘汰前缀
-            # （前缀已超淘汰上界），断点修订取 -1、断点审计取候选序号，
-            # 检查计全部在册扫描项、末修订取当前修订；否则按既有口径在首个
-            # 冲突记录处记“来源”（如互换首事件的失序/换配）。
-            fc_cache = first_cand[2]
-            fc_digest = first_cand[3]
-            if fc_cache is not None and not any(
-                record[2] == fc_cache[0] and record[4] == fc_digest
-                for _li, record in load_rollback_records
-            ):
-                return source_conflict(len(load_rollback_records), first_cand)
-            return source_conflict(0, first_cand)
         survivors = candidates[boundary_in_window:]
 
         # 正向保序一一映射：候选按审计序号升序，各取其后首个 (操作, 摘要)
