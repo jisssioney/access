@@ -4,7 +4,9 @@
 - Authenticator：带失败计数与锁定的用户认证器。
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
-  takeover_audit、防篡改审计链 audit/verify_audit、配置导出/升级/加载/回滚
+  takeover_audit、防篡改审计链 audit/verify_audit、只读审计窗口快照
+  audit_snapshot/verify_audit_snapshot（版本 1，锚哈希取锚项、摘要盖前六键，
+  校验结构错抛 ValueError、与当前链不符返 False）、配置导出/升级/加载/回滚
   export_config/upgrade_config/load_config/rollback_config、修订查询/CAS 提交/
   历史回退 config_revision/config_cas/config_revert（构造态为修订 0，保留最近
   256 个配置修订供回退）、防篡改配置历史 config_history（构造即记录修订 0，
@@ -9790,6 +9792,183 @@ class Sessions:
             ):
                 return False
             prev_hash = digest
+        return True
+
+    def audit_snapshot(self, after=0, limit=100):
+        """返回审计窗口快照 JSON；只读、查询不老化，O(limit) 时空。
+
+        取序号 > after 的前 limit 项。after/limit 须为非 bool 的 int：类型不符
+        抛 TypeError，after<0 或 limit ∉ [1,1000] 抛 ValueError；after 大于末
+        序号（空链为 0）抛 KeyError(after)。顶层键序为
+        “版本/锚序号/锚哈希/上限/下个序号/事件/摘要”：版本恒 1，锚序号=after，
+        after=0 时锚哈希为 64 个 0、否则取第 after 项哈希，上限=limit，下个序号
+        取末项序号、空窗取 after；事件复用 audit 九键序及类型。摘要为前六键
+        紧凑 JSON（ensure_ascii=False、无空白）UTF-8 字节的 sha256 小写值，
+        输出末尾加 LF。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+        total = len(self._chain_events)
+        if after > total:
+            raise KeyError(after)
+
+        # 序号即位置+1：锚哈希取第 after 项（下标 after-1），窗口自下标 after 起。
+        anchor_hash = "0" * 64 if after == 0 else self._chain_events[after - 1][8]
+        window = self._chain_events[after : after + limit]
+        events = [
+            {
+                "序号": seq,
+                "时刻": now_ms,
+                "键": key,
+                "操作": op,
+                "会话": sid,
+                "结果": result,
+                "原序号": origin,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for seq, now_ms, key, op, sid, result, origin, prev_hash, digest in window
+        ]
+        # 有项取下一序号为末项序号，无项取 after。
+        next_seq = window[-1][0] if window else after
+        head = {
+            "版本": 1,
+            "锚序号": after,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": events,
+        }
+        # 摘要只盖前六键：重排前先对无摘要的头算 sha256，再补末键输出。
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        head["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(head, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def verify_audit_snapshot(self, text):
+        """校验审计快照文本：结构问题抛 ValueError，与当前 audit 链不符返 False。
+
+        text 非 str 抛 TypeError；JSON 解析、重键、键集/键序、结构、类型、范围
+        或版本非法抛 ValueError。结构通过后核对摘要、锚哈希、窗口事件（逐条
+        重算哈希链并与当前链比对）与游标：任一与当前 audit 链不符返回 False，
+        全部相符（含空窗）返回 True。只读，O(limit) 时空。
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"audit snapshot is not valid JSON: {exc}") from exc
+        top_keys = ["版本", "锚序号", "锚哈希", "上限", "下个序号", "事件", "摘要"]
+        if not isinstance(doc, dict) or list(doc) != top_keys:
+            raise ValueError(
+                "audit snapshot top-level keys must be "
+                "版本/锚序号/锚哈希/上限/下个序号/事件/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        anchor_seq = self._cp_int(doc["锚序号"], "锚序号", 0)
+        anchor_hash = self._cp_hex64(doc["锚哈希"], "锚哈希")
+        limit = self._cp_int(doc["上限"], "上限", 1)
+        if limit > 1000:
+            raise ValueError(f"上限 must be <= 1000, got {limit}")
+        next_seq = self._cp_int(doc["下个序号"], "下个序号", 0)
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        event_keys = [
+            "序号",
+            "时刻",
+            "键",
+            "操作",
+            "会话",
+            "结果",
+            "原序号",
+            "前哈希",
+            "哈希",
+        ]
+        raw_events = doc["事件"]
+        if not isinstance(raw_events, list):
+            raise ValueError("事件 must be a list")
+        events = []
+        for index, item in enumerate(raw_events, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    f"snapshot event {index} keys must be "
+                    "序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(item["序号"], "事件.序号", 1)
+            now_ms = self._cp_int(item["时刻"], "事件.时刻", 0)
+            key = item["键"]
+            op = item["操作"]
+            sid = item["会话"]
+            result = item["结果"]
+            for label, value in (
+                ("事件.键", key),
+                ("事件.操作", op),
+                ("事件.会话", sid),
+                ("事件.结果", result),
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"{label} must be a str, got {type(value).__name__}"
+                    )
+            origin = self._cp_int(item["原序号"], "事件.原序号", 0)
+            prev_hash = self._cp_hex64(item["前哈希"], "事件.前哈希")
+            digest = self._cp_hex64(item["哈希"], "事件.哈希")
+            events.append(
+                (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
+            )
+
+        # 摘要：前六键紧凑 JSON 的 UTF-8 sha256；事件子文档沿用解析键序，
+        # 紧凑重排与生成端逐字节一致。
+        head = {
+            "版本": version,
+            "锚序号": anchor_seq,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": raw_events,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            return False
+
+        # 与当前 audit 链核对：锚序号越界、锚哈希、游标、窗口逐项（含哈希链
+        # 重算与前哈希衔接）任一不符即 False。
+        total = len(self._chain_events)
+        if anchor_seq > total:
+            return False
+        expected_anchor = (
+            "0" * 64 if anchor_seq == 0 else self._chain_events[anchor_seq - 1][8]
+        )
+        if anchor_hash != expected_anchor:
+            return False
+        window = self._chain_events[anchor_seq : anchor_seq + limit]
+        if next_seq != (window[-1][0] if window else anchor_seq):
+            return False
+        if len(events) != len(window):
+            return False
+        prev_hash = anchor_hash
+        for presented, stored in zip(events, window):
+            seq, now_ms, key, op, sid, result, origin, given_prev, given_digest = (
+                presented
+            )
+            if given_prev != prev_hash:
+                return False
+            if (
+                self._chain_hash(
+                    seq, now_ms, key, op, sid, result, origin, given_prev
+                )
+                != given_digest
+            ):
+                return False
+            if presented != stored:
+                return False
+            prev_hash = given_digest
         return True
 
     @staticmethod
