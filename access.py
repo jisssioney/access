@@ -679,6 +679,90 @@ def _compact_config(spec):
     )
 
 
+def _config_diff_docs(left_doc, right_doc):
+    """按 config_history_diff 口径递归比较两份规范 v6 配置文档，返回按路径
+    Unicode 码点升序的 (路径, 左值编码, 右值编码) 三元组列表。
+
+    对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或两侧节点 JSON 类型
+    不同（bool 与数值不同型）即在当前路径记一项且不再下探，同型容器继续递归，
+    同型叶值仅在不同时记一项。路径为 JSON Pointer：“~”转“~0”、“/”转“~1”
+    （先转 ~），根为空串，数组索引为十进制串。存在值用基线紧凑 JSON 编码
+    （ensure_ascii=False、无空白），缺失为空串。config_history_diff 与
+    config_preflight 共用，保证两者路径、缺失/类型差异处理、排序与两侧值
+    编码完全同口径。
+    """
+    missing = object()
+    entries = []
+
+    def encode(value):
+        return json.dumps(
+            value, ensure_ascii=False, separators=(",", ":")
+        )
+
+    def json_type(value):
+        # 规范 v6 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, (int, float)):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        return "object"
+
+    def emit(path, lvalue, rvalue):
+        entries.append(
+            (
+                path,
+                "" if lvalue is missing else encode(lvalue),
+                "" if rvalue is missing else encode(rvalue),
+            )
+        )
+
+    def pointer_token(token):
+        return str(token).replace("~", "~0").replace("/", "~1")
+
+    def walk(path, lvalue, rvalue):
+        if lvalue is missing or rvalue is missing:
+            emit(path, lvalue, rvalue)
+            return
+        ltype = json_type(lvalue)
+        rtype = json_type(rvalue)
+        if ltype != rtype:
+            # 节点类型不同：当前路径记一项，不再下探。
+            emit(path, lvalue, rvalue)
+            return
+        if ltype == "object":
+            # 对象取键并集（键序无关，最终按路径排序）。
+            for key in set(lvalue) | set(rvalue):
+                child = path + "/" + pointer_token(key)
+                walk(
+                    child,
+                    lvalue.get(key, missing),
+                    rvalue.get(key, missing),
+                )
+        elif ltype == "array":
+            # 数组按索引递归，越界侧为缺失。
+            for index in range(max(len(lvalue), len(rvalue))):
+                child = path + "/" + str(index)
+                walk(
+                    child,
+                    lvalue[index] if index < len(lvalue) else missing,
+                    rvalue[index] if index < len(rvalue) else missing,
+                )
+        else:
+            # 同型叶值：以基线紧凑编码逐字节判异（数值 1 与 1.0 亦异）。
+            if encode(lvalue) != encode(rvalue):
+                emit(path, lvalue, rvalue)
+
+    walk("", left_doc, right_doc)
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
 def _compact_envelope(source, target, changed, summary, config):
     """升级包五字段紧凑 JSON 串（无尾 LF），固定键序与字段类型。"""
     return json.dumps(
