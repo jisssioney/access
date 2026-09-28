@@ -54,6 +54,12 @@
   永久缓存；首次合法先老化，逐项经后端、认证、容量、default 池与静态址
   规则建立，业务异常不抛而记项结果类名；非原子逐项提交，原子演算全部、
   任一失败整批回滚（保留老化、认证计数与退避），不记审计或容量事件。
+- Sessions.keepalive 批量保活：按 key 独立重放缓存，首果（含参数异常）
+  永久缓存；首次合法先老化（期限到的在线项挂起退租，老化不回滚），非原子
+  依序把在线项空闲期限改为 now_ms+idle_ms 记“保活”，未知记“未知”、挂起/
+  下线墓碑记“状态”；原子先查快照，全在线才提交，否则失败项记未知/状态、
+  在线项记“回滚”且不延长期限。保活只改期限，不续租、不分址、不审计、不记
+  容量事件或统计。
 - Sessions.credential_change 凭据轮换：按 key 独立重放缓存，首果（含参数
   异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked 抛
   AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
@@ -967,6 +973,12 @@ _BATCH_ROLLBACK = "回滚"
 # batch_online 批量建立：成功项结果“上线”，区别于会话状态“在线”。
 _BATCH_ITEM_ONLINE = "上线"
 
+# keepalive 批量保活：项结果“保活”（区别于会话状态“在线”）；非在线现存项
+# （挂起/下线墓碑）记“状态”，沿用 _CAP_UNKNOWN 记未知 sid，回滚沿用
+# _BATCH_ROLLBACK。
+_KEEPALIVE_OK = "保活"
+_KEEPALIVE_STATE = "状态"
+
 # credential_change 凭据轮换：入防篡改审计链的操作名与返回 JSON 的结果串。
 _CREDENTIAL_OP = "凭据轮换"
 _CREDENTIAL_ROTATED = "已轮换"
@@ -1227,6 +1239,21 @@ class Sessions:
     结果仅提交（全上线）/部分（非原子有失败）/回滚（原子有失败），
     项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务异常类名/
     回滚。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+    keepalive(key, sids, now_ms, atomic=False) 批量保活：key/sid 沿用
+    凭据约束，sids 为 1..1000 个互异 sid 的 tuple，now_ms 为非 bool 非负
+    int，atomic 为 bool；类型错 TypeError，取值/长度/重复错 ValueError。
+    验 key 后以独立域（与 do/meter/capacity/fault/pool_fault/timeout_fault/
+    batch_offline/batch_online 分域）永久缓存首果（含参数异常），同型同参
+    重放不老化、不改态，异参 ValueError。首次合法先老化：期限 <= now_ms
+    的在线项挂起、清期限退租且不回滚。非原子依序将在线项空闲期限改为
+    now_ms+idle_ms 并记“保活”，未知记“未知”，其余现存项（挂起/下线墓碑）
+    记“状态”；原子先查老化后快照，全在线才提交，否则失败项记未知/状态、
+    在线项记“回滚”且不延长期限。保活只改空闲期限，不续租、不分址、不审计、
+    不记容量事件或统计。返回键序时刻/原子/结果/项目的 LF 尾紧凑 JSON，
+    结果仅提交（全保活）/部分（非原子有失败）/回滚（原子有失败），项目依
+    输入顺序，项键序“会话/结果/期限”，项结果仅保活/未知/状态/回滚，保活项
+    期限取改后新值、余项期限为 0。首次 O(S+B log A) 时间、O(B) 辅助空间，
+    重放 O(B)。
     runtime_checkpoint(now_ms) 先验参再老化一次，输出运行态检查点基线
     JSON（LF 尾）：顶层键序版本/时刻/容量/配额/摘要，版本 1，容量沿用
     同刻 clog 对象契约（时刻等于顶层）、配额沿用同刻 quota_checkpoint
@@ -1464,6 +1491,10 @@ class Sessions:
         # pool_fault/timeout_fault/batch_offline 分域：
         # key -> (items, now_ms, atomic, outcome)。
         self._batch_online_cache = {}
+        # keepalive 批量保活的重放缓存，与 do/meter/capacity/fault/
+        # pool_fault/timeout_fault/batch_offline/batch_online 分域：
+        # key -> (sids, now_ms, atomic, outcome)。
+        self._keepalive_cache = {}
         # config_change 配置加载/回滚/升级事务的重放缓存，与 do/meter/
         # capacity/fault/pool_fault/timeout_fault/batch_offline 分域：
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
@@ -4921,6 +4952,145 @@ class Sessions:
     def _render_batch_online(now_ms, atomic, result, items):
         # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
         # 结果为 str，项目为项（会话/结果）列表，依输入顺序。
+        payload = {
+            "时刻": now_ms,
+            "原子": atomic,
+            "结果": result,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def keepalive(self, key, sids, now_ms, atomic=False):
+        """批量保活一批会话，返回 LF 结尾的 JSON 字符串。
+
+        key 沿用凭据约束；sids 为含 1..1000 个互异 sid 的 tuple（sid 沿用
+        凭据约束）；now_ms 为非 bool 非负 int，atomic 为 bool。依序校验：
+        类型错 TypeError，取值、长度、重复 sid 错 ValueError。key 有效后以
+        独立域（与 do/meter/capacity/fault/pool_fault/timeout_fault/
+        batch_offline/batch_online 分域）永久缓存首果（含参数异常）：同型
+        同参重放不老化、不改态，直接返回或重抛；异参抛 ValueError。
+
+        首次合法调用先老化（期限 <= now_ms 的在线项挂起、清期限并释放地址
+        租约，老化不回滚）。非原子时依输入顺序逐项处理：在线项（老化后仍
+        在线）把空闲期限改为 now_ms+idle_ms 并记“保活”（只改期限，不续租、
+        不分址、不审计、不记容量事件、不计统计）；未知 sid 记“未知”，其余
+        现存项（挂起/下线墓碑）记“状态”，失败项不影响后项。原子时基于老化
+        后快照先查全部项：全部在线才逐项提交保活；否则失败项记“未知”/“状态”、
+        在线项记“回滚”，不延长任何期限（老化保留）。返回顶层键序
+        “时刻/原子/结果/项目”：结果仅提交（全部保活）、部分（非原子有失败
+        项）、回滚（原子有失败项）；项目依输入顺序，项键序“会话/结果/期限”，
+        项结果仅保活/未知/状态/回滚，保活项期限取改后的新值，余项期限恒为 0。
+        首次调用 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+        """
+        _check_credential("key", key)
+
+        cached = self._keepalive_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不保活、不记审计/事件，仅按缓存返回或重抛。
+            c_sids, c_now_ms, c_atomic, outcome = cached
+            if not _strict_equal(
+                (sids, now_ms, atomic), (c_sids, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise exc_class(*exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存；校验失败不老化、不改态。
+        # 参数契约与 batch_offline 完全一致（tuple、1..1000、sid 凭据、互异）。
+        try:
+            self._validate_batch_offline_params(sids, now_ms, atomic)
+        except (TypeError, ValueError) as exc:
+            self._keepalive_cache[key] = (
+                sids,
+                now_ms,
+                atomic,
+                ("err", (type(exc), exc.args)),
+            )
+            raise
+
+        # 首次合法调用：先老化（期限到先挂起释址，老化不回滚）。
+        self._age(now_ms)
+
+        if atomic:
+            items, commit = self._keepalive_atomic(sids, now_ms)
+        else:
+            items, commit = self._keepalive_sequential(sids, now_ms)
+        if commit:
+            result = _BATCH_COMMIT
+        else:
+            result = _BATCH_PARTIAL if not atomic else _BATCH_ROLLBACK
+        output = self._render_keepalive(now_ms, atomic, result, items)
+        self._keepalive_cache[key] = (sids, now_ms, atomic, ("ok", output))
+        return output
+
+    def _keepalive_sequential(self, sids, now_ms):
+        """非原子逐项保活：在线项改期限为 now_ms+idle_ms 记“保活”，未知记
+        “未知”，挂起/下线墓碑记“状态”，失败项不影响后项。
+
+        只改空闲期限，不续租、不分址。返回 (items, commit)：commit 恒为
+        是否无失败项。
+        """
+        items = []
+        commit = True
+        new_deadline = now_ms + self._idle_ms
+        for sid in sids:
+            session = self._sessions.get(sid)
+            if session is None:
+                items.append({"会话": sid, "结果": _CAP_UNKNOWN, "期限": 0})
+                commit = False
+                continue
+            if session["state"] != _STATE_ONLINE:
+                items.append({"会话": sid, "结果": _KEEPALIVE_STATE, "期限": 0})
+                commit = False
+                continue
+            session["deadline"] = new_deadline
+            items.append(
+                {"会话": sid, "结果": _KEEPALIVE_OK, "期限": new_deadline}
+            )
+        return items, commit
+
+    def _keepalive_atomic(self, sids, now_ms):
+        """原子批量：基于老化后快照先查全部项。
+
+        全部在线才逐项提交保活（改期限）；否则失败项记“未知”（不存在）/
+        “状态”（挂起/下线墓碑），在线项记“回滚”，不延长任何期限（老化保留），
+        commit=False。返回 (items, commit)。
+        """
+        failed = {}
+        all_online = True
+        for sid in sids:
+            session = self._sessions.get(sid)
+            if session is None:
+                failed[sid] = _CAP_UNKNOWN
+                all_online = False
+            elif session["state"] != _STATE_ONLINE:
+                failed[sid] = _KEEPALIVE_STATE
+                all_online = False
+        if not all_online:
+            items = [
+                {"会话": sid, "结果": failed[sid], "期限": 0}
+                if sid in failed
+                else {"会话": sid, "结果": _BATCH_ROLLBACK, "期限": 0}
+                for sid in sids
+            ]
+            return items, False
+        # 全部在线：逐项保活，仅把空闲期限改为 now_ms+idle_ms。
+        new_deadline = now_ms + self._idle_ms
+        items = []
+        for sid in sids:
+            session = self._sessions[sid]
+            session["deadline"] = new_deadline
+            items.append(
+                {"会话": sid, "结果": _KEEPALIVE_OK, "期限": new_deadline}
+            )
+        return items, True
+
+    @staticmethod
+    def _render_keepalive(now_ms, atomic, result, items):
+        # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
+        # 结果为 str，项目为项（会话/结果/期限）列表，依输入顺序，期限为 int。
         payload = {
             "时刻": now_ms,
             "原子": atomic,
