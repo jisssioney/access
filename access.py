@@ -167,6 +167,15 @@ def _check_int(name, value, minimum):
     return value
 
 
+def _effective_used(used, last, now_ms, period_ms):
+    """按配额周期 P 折算当前有效累计：P>0 且 now_ms 与上次通过时刻 t 不在同一
+    周期窗（now_ms//P != t//P）时累计已重置，有效累计为 0；否则为账本 u。
+    P=0 表示不重置，恒取 u。调用方须已保证 now_ms >= t。"""
+    if period_ms > 0 and now_ms // period_ms != last // period_ms:
+        return 0
+    return used
+
+
 def _check_credential(name, value):
     """校验 str、UTF-8 编码后 1..256 字节、不含 U+0000。"""
     if not isinstance(value, str):
@@ -323,11 +332,13 @@ def _parse_config_pool(obj):
 def _parse_config_templates(doc, version):
     """校验 v3+ 的模板与用户模板，返回规范化 (templates, user_templates)。
 
-    templates 为按标识升序的 (标识, 限速, 突发, 配额, 会话上限, 超限) 元组：
-    标识沿用凭据约束，限速/配额为非 bool 正 int（限速为字节/秒、配额为字节），
-    突发为非 bool 非负 int（字节），会话上限为非 bool int 0..10000（0 表示
-    不限并发占用），超限仅“拒绝”或“下线”。v6 模板项键序为
-    标识/限速/突发/配额/会话上限/超限；v3-v5 模板项无会话上限键，迁移补 0。
+    templates 为按标识升序的 (标识, 限速, 突发, 配额, 周期毫秒, 会话上限,
+    超限) 元组：标识沿用凭据约束，限速/配额为非 bool 正 int（限速为字节/秒、
+    配额为字节），突发为非 bool 非负 int（字节），周期毫秒为非 bool 非负 int
+    （0 表示不重置），会话上限为非 bool int 0..10000（0 表示不限并发占用），
+    超限仅“拒绝”或“下线”。v7 模板项键序为
+    标识/限速/突发/配额/周期毫秒/会话上限/超限；v6 模板项无周期毫秒键，
+    v3-v5 模板项无周期毫秒与会话上限键，迁移均补 0。
     user_templates 为按用户升序的 (user, 标识) 元组：用户唯一，标识须已定义。
     结构、类型、值、重复项或标识引用错均抛 ValueError；用户是否在认证器中
     由调用方校验。
@@ -338,8 +349,18 @@ def _parse_config_templates(doc, version):
     templates = []
     seen_ids = set()
     for item in raw_templates:
-        # v6 模板项恰含六键（键序在规范重编码比对时约束）；v3-v5 为五键。
-        if version >= 6:
+        # v7 模板项恰含七键（键序在规范重编码比对时约束）；v6 为六键；
+        # v3-v5 为五键。
+        if version >= 7:
+            keys_ok = isinstance(item, dict) and set(item) == {
+                "标识", "限速", "突发", "配额", "周期毫秒", "会话上限", "超限"
+            }
+            if not keys_ok:
+                raise ValueError(
+                    "template entry keys must be exactly "
+                    "标识/限速/突发/配额/周期毫秒/会话上限/超限"
+                )
+        elif version >= 6:
             keys_ok = isinstance(item, dict) and set(item) == {
                 "标识", "限速", "突发", "配额", "会话上限", "超限"
             }
@@ -374,6 +395,17 @@ def _parse_config_templates(doc, version):
             if value < minimum:
                 raise ValueError(f"{name} must be >= {minimum}, got {value}")
             numbers[name] = value
+        if version >= 7:
+            period_ms = item["周期毫秒"]
+            if isinstance(period_ms, bool) or not isinstance(period_ms, int):
+                raise ValueError(
+                    f"周期毫秒 must be an int, got {type(period_ms).__name__}"
+                )
+            if period_ms < 0:
+                raise ValueError(f"周期毫秒 must be >= 0, got {period_ms}")
+        else:
+            # v3-v6 迁移：配额周期补 0（不重置）。
+            period_ms = 0
         if version >= 6:
             session_limit = item["会话上限"]
             if isinstance(session_limit, bool) or not isinstance(session_limit, int):
@@ -397,6 +429,7 @@ def _parse_config_templates(doc, version):
                 numbers["限速"],
                 numbers["突发"],
                 numbers["配额"],
+                period_ms,
                 session_limit,
                 exceed,
             )
@@ -499,24 +532,25 @@ def _parse_config_doc(doc, default_auth=None):
     capacity, auth)，capacity 为 (队列上限, 最大等待毫秒)，auth 为
     (最大失败, 锁定毫秒)；pools 为按标识升序的 (标识, cidr, reserved,
     static) 元组，reserved/static 已规范化排序；templates 为按标识升序的
-    (标识, 限速, 突发, 配额, 会话上限, 超限) 元组，user_templates 为按用户
-    升序的 (user, 标识) 元组。v1（版本=1）地址池为无标识单池对象，迁移为
-    default 池；v2（版本=2）地址池为池对象列表；v3（版本=3）增模板与用户
-    模板；v4（版本=4）增容量背压（队列上限/最大等待毫秒）；v5（版本=5）
+    (标识, 限速, 突发, 配额, 周期毫秒, 会话上限, 超限) 元组，user_templates
+    为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为无标识单池对象，
+    迁移为 default 池；v2（版本=2）地址池为池对象列表；v3（版本=3）增模板与
+    用户模板；v4（版本=4）增容量背压（队列上限/最大等待毫秒）；v5（版本=5）
     增认证策略（最大失败/锁定毫秒）；v6（版本=6）模板项增会话上限
-    （0..10000，0 不限）。v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时
-    容量补默认 (1024, 0)；v1-v4 迁移时认证补 default_auth（认证器当前两值，
-    缺省 None 时拒绝非 v5+ 文档）；v1-v5 迁移时模板会话上限补 0。
-    重复/未知/缺失键、结构、值、引用或版本错均抛 ValueError。
+    （0..10000，0 不限）；v7（版本=7）模板项增周期毫秒（非负 int，0 表示
+    不重置）。v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时容量补默认
+    (1024, 0)；v1-v4 迁移时认证补 default_auth（认证器当前两值，缺省 None
+    时拒绝非 v5+ 文档）；v1-v5 迁移时模板会话上限补 0；v1-v6 迁移时模板
+    周期毫秒补 0。重复/未知/缺失键、结构、值、引用或版本错均抛 ValueError。
     """
     if not isinstance(doc, dict):
         raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3, 4, 5, 6):
-        raise ValueError(f"版本 must be 1, 2, 3, 4, 5 or 6, got {version}")
-    if version in (5, 6):
+    if version not in (1, 2, 3, 4, 5, 6, 7):
+        raise ValueError(f"版本 must be 1..7, got {version}")
+    if version in (5, 6, 7):
         if set(doc) != {
             "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"
         }:
@@ -599,7 +633,7 @@ def _parse_config_doc(doc, default_auth=None):
         auth = _parse_config_auth(doc)
     else:
         # v1-v4 迁移：认证补认证器当前两值；无默认（如升级包内嵌配置须为
-        # v6 规范形态）时拒绝。
+        # v7 规范形态）时拒绝。
         if default_auth is None:
             raise ValueError(f"config version must be {_CONFIG_VERSION}")
         auth = default_auth
@@ -617,7 +651,7 @@ def _parse_config_doc(doc, default_auth=None):
 
 
 def _config_payload(spec):
-    """由规范化 spec 构建 export/升级共用的 v6 配置 payload（固定键序与排序）。"""
+    """由规范化 spec 构建 export/升级共用的 v7 配置 payload（固定键序与排序）。"""
     (
         total,
         per,
@@ -653,10 +687,12 @@ def _config_payload(spec):
                 "限速": rate,
                 "突发": burst,
                 "配额": quota,
+                "周期毫秒": period_ms,
                 "会话上限": session_limit,
                 "超限": exceed,
             }
-            for template_id, rate, burst, quota, session_limit, exceed in templates
+            for template_id, rate, burst, quota, period_ms, session_limit, exceed
+            in templates
         ],
         "用户模板": [
             [user, template_id] for user, template_id in user_templates
@@ -673,7 +709,7 @@ def _config_payload(spec):
 
 
 def _compact_config(spec):
-    """spec 的 v6 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
+    """spec 的 v7 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
     return json.dumps(
         _config_payload(spec), ensure_ascii=False, separators=(",", ":")
     )
@@ -698,8 +734,8 @@ def _parse_upgrade_envelope(doc):
     """严格复核升级包对象，返回 (源版本, 目标版本, 改变, 摘要, spec)。
 
     文档须恰含“源版本/目标版本/改变/摘要/配置”五键（键序亦须如此），
-    源版本为 1..6 的非 bool int、目标版本恒为 6、改变为 bool 且等于
-    源版本 != 6、摘要为 str；配置须为能解析出 v6 spec 的对象，再将其
+    源版本为 1..7 的非 bool int、目标版本恒为 7、改变为 bool 且等于
+    源版本 != 7、摘要为 str；配置须为能解析出 v7 spec 的对象，再将其
     规范化重编码与文档原编码逐字节比对（拒键序/形态/值偏差），摘要须为
     规范配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写十六进制。任何不符
     均抛 ValueError。
@@ -724,8 +760,8 @@ def _parse_upgrade_envelope(doc):
     summary = doc["摘要"]
     if isinstance(source, bool) or not isinstance(source, int):
         raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
-    if source not in (1, 2, 3, 4, 5, 6):
-        raise ValueError(f"源版本 must be 1, 2, 3, 4, 5 or 6, got {source}")
+    if source not in (1, 2, 3, 4, 5, 6, 7):
+        raise ValueError(f"源版本 must be 1..7, got {source}")
     if isinstance(target, bool) or not isinstance(target, int):
         raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
     if target != _CONFIG_VERSION:
@@ -747,7 +783,7 @@ def _parse_upgrade_envelope(doc):
     # 配置自 JSON 解析而来，再编码必成功；键序/排序/值偏差令两串不一致。
     original = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     if original != canonical:
-        raise ValueError("配置 must be a canonical v6 config object")
+        raise ValueError("配置 must be a canonical v7 config object")
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if summary != digest:
         raise ValueError("摘要 does not match the canonical config digest")
@@ -896,7 +932,7 @@ _MAX_QUEUE = 1024
 _MAX_QUEUE_LIMIT = 10000
 # QoS 模板并发会话上限：0..10000，0 表示不限。
 _MAX_TEMPLATE_SESSIONS = 10000
-_CONFIG_VERSION = 6
+_CONFIG_VERSION = 7
 # 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
 # 最旧项，当前修订永不淘汰。
 _CONFIG_HISTORY_LIMIT = 256
@@ -1041,20 +1077,22 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v6 配置 JSON（顶层键序
+    参数错与异参 key 重放不入链。export_config 导出 v7 配置 JSON（顶层键序
     版本/会话/地址池/模板/用户模板/容量/认证；会话与地址池沿用 v2，模板按
-    标识升序、项键序标识/限速/突发/配额/会话上限/超限（会话上限 0 不限并发
-    占用，占用为绑定模板用户的在线加挂起会话数）、用户模板按用户升序、容量
-    为队列上限/最大等待毫秒、认证为最大失败/锁定毫秒）；upgrade_config(text,
-    target=6) 只读地把 v1..v6 配置升级为 v6 升级包 JSON（LF 尾紧凑；顶层序/型
-    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=6，
-    配置同 export_config 的 v6，摘要为配置紧凑编码 UTF-8 字节的 sha256
-    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 6，
-    源版本限 1..6，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
+    标识升序、项键序标识/限速/突发/配额/周期毫秒/会话上限/超限（周期毫秒为
+    非 bool 非负 int、0 不重置，会话上限 0 不限并发占用，占用为绑定模板
+    用户的在线加挂起会话数）、用户模板按用户升序、容量为队列上限/最大等待
+    毫秒、认证为最大失败/锁定毫秒）；upgrade_config(text,
+    target=7) 只读地把 v1..v7 配置升级为 v7 升级包 JSON（LF 尾紧凑；顶层序/型
+    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=7，
+    配置同 export_config 的 v7，摘要为配置紧凑编码 UTF-8 字节的 sha256
+    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 7，
+    源版本限 1..7，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
     迁移沿 load_config 既有规则（v1 单池改 default、v1/v2 补空模板与用户模板、
     v1-v3 补容量 1024/0、v1-v4 以认证器当前两值补认证、v1-v5 模板会话上限
-    补 0、v6 只规范化），升级不改任何实例状态；load_config
-    直载 v1..v6 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
+    补 0、v1-v6 模板周期毫秒补 0、v7 只规范化），升级不改任何实例状态；
+    load_config
+    直载 v1..v7 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
     全验后原子替换并保存旧配置为唯一回滚点，升级包复核不符抛 ValueError，
     引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限、模板
     占用、租约或队长承载不满足抛 ResourceError，失败不改配置、回滚点、会话、
@@ -1086,17 +1124,21 @@ class Sessions:
     after!=-1 且该修订未保留抛 KeyError(after)；返回修订 > after 的升序前
     limit 项，顶层为“下个修订:int、项目:list”，无项下个修订=after，查询
     O(limit) 时空。
-    export/load/rollback 成功均返回 v6 配置 JSON，会话状态、期限、地址、租期与
+    export/load/rollback 成功均返回 v7 配置 JSON，会话状态、期限、地址、租期与
     旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
     会话用户所绑模板做令牌桶加配额计量，计量态为 (用户, 模板) 共享账本
-    （累计 u、上次通过时刻 t、千分字节令牌 c），同用户同模板的并发会话
-    共享配额、互不重置：通过则原子提交账本，超限取模板动作（拒绝不改账，
-    下线原子清场且不改账），重放缓存与 do 分域；下线、新建、接管不清账，
-    配置提交后同标识保留 u/t 并截顶 c，改绑用独立账本，加载或回滚失败
-    不改账。quota_stats(user, now_ms) 以 O(1) 只读返回用户所绑模板的
-    配额快照（不老化、不建账；无账本按累计 0、满桶）。meter 新 key 首次
+    （累计 u、上次通过时刻 t、千分字节令牌 c），同用户同模板的并发会话共享
+    配额：模板周期毫秒 P>0 且 now_ms//P != t//P 时有效累计重置为 0，P=0
+    不重置；令牌始终自 t 按原公式补充、跨周期不清零。通过则原子保存有效
+    累计+size、now_ms 及扣后令牌，超限取模板动作（拒绝不改账，下线原子
+    清场且不改账），异常与重放不改账；重放缓存与 do 分域；下线、新建、接管
+    不清账，配置热加载或回滚后同标识原样保留 u/t/c 并以新 P 判窗，改绑用
+    独立账本，加载或回滚失败不改账。quota_stats(user, now_ms) 以 O(1)
+    只读返回用户所绑模板的配额快照（不老化、不建账；无账本按有效累计 0、
+    满桶；累计为按新 P 折算的有效累计、剩余为 max(0, 配额-有效累计)、令牌
+    为补充后只读值；now_ms<t 抛 StateError）。meter 新 key 首次
     结果为通过/拒绝/下线时按当时会话用户与当次模板标识各记一次统计
     （通过另计字节），配置热加载或回滚不迁移历史计数；meter_stats
     (now_ms, group) 老化后按用户或查询时生效绑定（未绑定归空串）汇总
@@ -1382,8 +1424,9 @@ class Sessions:
             self._pools[_DEFAULT_POOL_ID] = _Pool(_check_pool(pool))
         self._lease_ms = _check_int("lease_ms", lease_ms, 1)
 
-        # QoS 模板：标识 -> (限速, 突发, 配额, 会话上限, 超限)，会话上限 0
-        # 表示不限并发占用；用户模板：user -> 标识。
+        # QoS 模板：标识 -> (限速, 突发, 配额, 周期毫秒, 会话上限, 超限)，
+        # 周期毫秒 0 表示不重置、会话上限 0 表示不限并发占用；用户模板：
+        # user -> 标识。
         self._templates = {}
         self._user_templates = {}
         # 容量背压：队列上限（0 表示不限）、最大等待毫秒（0 表示不限）。
@@ -1926,7 +1969,7 @@ class Sessions:
         template_id = self._user_templates.get(user)
         if template_id is None:
             return 0
-        return self._templates[template_id][3]
+        return self._templates[template_id][4]
 
     def _pool_is_exhausted(self, pool_id, now_ms):
         """池耗尽演练判定，O(1) 时空：注入后 now_ms < 截至即视为无可分配
@@ -1991,7 +2034,7 @@ class Sessions:
         # 模板并发会话上限：占用为绑定该模板用户的在线加挂起会话数。
         template_id = self._user_templates.get(user)
         if template_id is not None:
-            session_limit = self._templates[template_id][3]
+            session_limit = self._templates[template_id][4]
             if session_limit and self._template_occupancy(template_id) >= session_limit:
                 raise ResourceError(
                     f"template session limit {session_limit} reached "
@@ -2323,7 +2366,9 @@ class Sessions:
         template_id = self._user_templates.get(user)
         if template_id is None:
             raise StateError(f"no qos template bound for user {user!r}")
-        rate, burst, quota, _session_limit, exceed = self._templates[template_id]
+        rate, burst, quota, _period_ms, _session_limit, exceed = (
+            self._templates[template_id]
+        )
         payload = {
             "会话": sid,
             "用户": user,
@@ -2395,11 +2440,15 @@ class Sessions:
         """令牌桶加配额计量：通过则提交账本，拒绝不提交，下线原子清场。
 
         计量账本按 (用户, 模板标识) 共享：(u, t, c) 为累计字节、上次通过
-        时刻、千分字节令牌，首笔 (0, now_ms, C)，C=(限速+突发)*1000；之后
-        c 按限速补足并以 C 截顶（配置提交后同标识保留 u/t 并按新模板桶容
-        截顶 c）。size*1000 <= c 且 u+size <= 配额则通过并原子提交
-        (u+size, now_ms, c-size*1000)；否则取超限动作：拒绝不改账，下线
-        不累计并原子下线、清期限、释址退租，账本不变。
+        时刻、千分字节令牌，首笔本地态 (0, now_ms, C)，C=(限速+突发)*1000；
+        之后 c 按限速自 t 补足并以当前桶容 C 截顶（读取即截顶；配置热加载或
+        回滚后同标识原样保留 u/t/c，不主动改 c，新桶容在补充时自然截顶，
+        周期窗自新 P 判定）。P=模板周期毫秒：P>0 且 now_ms//P != t//P 时累计
+        已跨周期重置，有效累计按 0 计，否则按 u 计（P=0 不重置）；令牌始终
+        自 t 按原公式补充，不因跨周期清零。size*1000 <= c 且有效累计+size
+        <= 配额则通过并原子提交 (有效累计+size, now_ms, c-size*1000)；否则
+        取超限动作：拒绝不改账，下线不累计并原子下线、清期限、释址退租，账本
+        不变。
         """
         session = self._sessions.get(sid)
         if session is None:
@@ -2412,23 +2461,29 @@ class Sessions:
         template_id = self._user_templates.get(user)
         if template_id is None:
             raise StateError(f"no qos template bound for user {user!r}")
-        rate, burst, quota, _session_limit, exceed = self._templates[template_id]
+        rate, burst, quota, period_ms, _session_limit, exceed = (
+            self._templates[template_id]
+        )
         capacity = (rate + burst) * 1000
 
         ledger_key = (user, template_id)
         ledger = self._meter_ledgers.get(ledger_key)
         if ledger is None:
             # 首笔：满桶起步，时刻即此刻；未通过不落账。
-            ledger = [0, now_ms, capacity]
-        used, last, tokens = ledger
+            stored_used, last, stored_tokens = 0, now_ms, capacity
+        else:
+            stored_used, last, stored_tokens = ledger
         if now_ms < last:
             raise StateError(
                 f"now_ms {now_ms} before last meter time {last} for sid {sid!r}"
             )
-        tokens = min(capacity, tokens + rate * (now_ms - last))
+        # 令牌自上次通过时刻按原公式补充并截顶；跨周期不清零。
+        tokens = min(capacity, stored_tokens + rate * (now_ms - last))
+        # 有效累计：跨周期窗则视为 0，否则取账本累计 u。
+        used = _effective_used(stored_used, last, now_ms, period_ms)
 
         if size * 1000 <= tokens and used + size <= quota:
-            # 通过：原子提交累计、时刻与扣减后的令牌。
+            # 通过：原子提交有效累计+size、本次时刻与扣减后的令牌。
             used += size
             tokens -= size * 1000
             self._meter_ledgers[ledger_key] = [used, now_ms, tokens]
@@ -2520,8 +2575,10 @@ class Sessions:
         取值错 ValueError，未知用户抛 KeyError，未绑模板或 now_ms 早于账本
         上次通过时刻抛 StateError。查询不老化、不建账、不改账；无账本按
         累计 0、满桶返回。键序为“时刻/用户/模板/累计/剩余/令牌”：累计为
-        账本 u，剩余为 max(0, 配额-u)，令牌为按限速补充并以桶容截顶后的
-        千分字节数（只读演算，不落账）。
+        当前周期窗内有效累计（模板周期毫秒 P>0 且 now_ms//P != t//P 时为
+        0，否则为账本 u；P=0 恒为 u），剩余为 max(0, 配额-有效累计)，令牌
+        为自 t 按限速补充并以桶容截顶后的千分字节数（只读演算，不落账，跨
+        周期不清零）。
         """
         _check_credential("user", user)
         _check_int("now_ms", now_ms, 0)
@@ -2530,11 +2587,13 @@ class Sessions:
         template_id = self._user_templates.get(user)
         if template_id is None:
             raise StateError(f"no qos template bound for user {user!r}")
-        rate, burst, quota, _session_limit, _exceed = self._templates[template_id]
+        rate, burst, quota, period_ms, _session_limit, _exceed = (
+            self._templates[template_id]
+        )
         capacity = (rate + burst) * 1000
         ledger = self._meter_ledgers.get((user, template_id))
         if ledger is None:
-            # 无账本：累计 0、满桶，时刻即此刻（不可能触发时刻回拨）。
+            # 无账本：有效累计 0、满桶，时刻即此刻（不可能触发时刻回拨）。
             used, last, tokens = 0, now_ms, capacity
         else:
             used, last, tokens = ledger
@@ -2543,6 +2602,7 @@ class Sessions:
                 f"now_ms {now_ms} before last meter time {last} for user {user!r}"
             )
         tokens = min(capacity, tokens + rate * (now_ms - last))
+        used = _effective_used(used, last, now_ms, period_ms)
         payload = {
             "时刻": now_ms,
             "用户": user,
@@ -4928,7 +4988,7 @@ class Sessions:
         # 模板并发会话上限：占用为绑定该模板用户的在线加挂起会话数。
         template_id = self._user_templates.get(user)
         if template_id is not None:
-            session_limit = self._templates[template_id][3]
+            session_limit = self._templates[template_id][4]
             if session_limit and per_template.get(template_id, 0) >= session_limit:
                 raise ResourceError(
                     f"template session limit {session_limit} reached "
@@ -5970,7 +6030,7 @@ class Sessions:
         template_id = self._user_templates.get(user)
         template_open = True
         if template_id is not None:
-            session_limit = self._templates[template_id][3]
+            session_limit = self._templates[template_id][4]
             template_open = (
                 not session_limit
                 or self._template_occupancy(template_id) < session_limit
@@ -6041,7 +6101,7 @@ class Sessions:
             template_id = self._user_templates.get(user)
             template_open = True
             if template_id is not None:
-                session_limit = self._templates[template_id][3]
+                session_limit = self._templates[template_id][4]
                 template_open = (
                     not session_limit
                     or per_template.get(template_id, 0) < session_limit
@@ -6389,7 +6449,7 @@ class Sessions:
             # 闸口通过且可取址才晋升，晋升占用即时影响后项。
             template_id = self._user_templates.get(user)
             session_limit = (
-                self._templates[template_id][3]
+                self._templates[template_id][4]
                 if template_id is not None
                 else 0
             )
@@ -7420,32 +7480,32 @@ class Sessions:
         )
 
     def export_config(self):
-        """导出当前配置为 v6 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
+        """导出当前配置为 v7 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
 
         顶层键序为“版本/会话/地址池/模板/用户模板/容量/认证”；会话键序为
         “总数/每用户/空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为
         “标识/CIDR/保留/静态”，保留为按 IPv4 整数升序的串列表，静态为按用户
         再 IP 升序的二元串列表；模板为按标识升序的列表，项键序为“标识/限速/
-        突发/配额/会话上限/超限”，会话上限 0 表示不限并发占用；用户模板为按
-        用户升序的 [user, 标识] 二元串列表；容量键序为“队列上限/最大等待毫秒”，
-        0 分别表示不限队长与不限等待；认证键序为“最大失败/锁定毫秒”，取认证器
-        当前两值。
+        突发/配额/周期毫秒/会话上限/超限”，周期毫秒 0 表示不重置，会话上限 0
+        表示不限并发占用；用户模板为按用户升序的 [user, 标识] 二元串列表；
+        容量键序为“队列上限/最大等待毫秒”，0 分别表示不限队长与不限等待；
+        认证键序为“最大失败/锁定毫秒”，取认证器当前两值。
         """
         return _compact_config(self._current_spec()) + "\n"
 
-    def upgrade_config(self, text, target=6):
-        """只读地将 v1..v6 配置文本升级到 target（仅支持 6），返回升级包 JSON。
+    def upgrade_config(self, text, target=7):
+        """只读地将 v1..v7 配置文本升级到 target（仅支持 7），返回升级包 JSON。
 
         text 须为 str、target 须为非 bool int，否则抛 TypeError；源版本限
-        1..6 且 target 只许 6；JSON 解析、重复键、键缺失或未知、结构、值、
+        1..7 且 target 只许 7；JSON 解析、重复键、键缺失或未知、结构、值、
         引用或版本非法均抛 ValueError。迁移沿既有规则：v1 单池改 default，
         v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0)，v1-v4 以认证器
-        当前两值补认证，v1-v5 模板会话上限补 0，v6 只规范化。返回基线格式
-        的 LF 尾紧凑 JSON：顶层序/型为“源版本:int、目标版本:int、改变:bool、
-        摘要:str、配置:object”，改变 = 源版本 != 6；配置逐层键序、类型与
-        排序同 export_config() 的 v6；摘要为配置对象同法编码、去 LF 后的
-        UTF-8 字节 sha256 小写值。升级只读，不触碰任何实例状态；时/空上界
-        O(n log n)/O(n)。
+        当前两值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒补 0，
+        v7 只规范化。返回基线格式的 LF 尾紧凑 JSON：顶层序/型为“源版本:int、
+        目标版本:int、改变:bool、摘要:str、配置:object”，改变 = 源版本 != 7；
+        配置逐层键序、类型与排序同 export_config() 的 v7；摘要为配置对象同法
+        编码、去 LF 后的 UTF-8 字节 sha256 小写值。升级只读，不触碰任何实例
+        状态；时/空上界 O(n log n)/O(n)。
         """
         if not isinstance(text, str):
             raise TypeError(f"text must be a str, got {type(text).__name__}")
@@ -7510,7 +7570,8 @@ class Sessions:
         new_bindings = dict(user_templates)
         template_limits = {
             template_id: session_limit
-            for template_id, _rate, _burst, _quota, session_limit, _exceed in templates
+            for template_id, _rate, _burst, _quota, _period_ms, session_limit,
+            _exceed in templates
             if session_limit
         }
         if template_limits:
@@ -7589,8 +7650,8 @@ class Sessions:
     def _install_spec(self, spec, new_pools):
         """原子替换配置数值、池表、QoS 模板、容量背压与认证策略；会话状态、
         期限、地址、租期及旧队项的等待、截止、入队序均不变，认证器的用户
-        凭据、失败计数与锁定记录全部保留。计量账本同标识保留 u/t 并按新
-        模板桶容截顶 c。"""
+        凭据、失败计数与锁定记录全部保留。计量账本同标识原样保留 u/t/c，
+        周期重置自新模板的周期毫秒 P 即时按窗判定（不截顶 c、不重算累计）。"""
         (
             total,
             per,
@@ -7608,20 +7669,19 @@ class Sessions:
         self._lease_ms = lease_ms
         self._pools = new_pools
         self._templates = {
-            template_id: (rate, burst, quota, session_limit, exceed)
-            for template_id, rate, burst, quota, session_limit, exceed in templates
+            template_id: (rate, burst, quota, period_ms, session_limit, exceed)
+            for template_id, rate, burst, quota, period_ms, session_limit, exceed
+            in templates
         }
         self._user_templates = dict(user_templates)
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
         # 认证策略随配置提交；认证记录（凭据、失败计数、锁定）保留。
         self._auth.set_policy(max_fail, lock_ms)
-        # 计量账本：同标识保留 u/t 并按新模板桶容截顶 c；已删模板的账本原样
-        # 保留（改绑后按新 (用户, 模板) 独立建账），加载/回滚失败不经过本方法。
-        for (_ledger_user, ledger_template), ledger in self._meter_ledgers.items():
-            template = self._templates.get(ledger_template)
-            if template is not None:
-                ledger[2] = min(ledger[2], (template[0] + template[1]) * 1000)
+        # 计量账本：同标识原样保留 u/t/c；周期窗由 _meter/quota_stats 按新
+        # 模板周期毫秒 P 即时判定（P>0 且 now_ms//P != t//P 即视为新窗）。
+        # 已删模板的历史账本原样保留（改绑后按新 (用户, 模板) 独立建账），
+        # 加载/回滚失败不经过本方法。
         # 配置加载/回滚成功后保留同名池的耗尽演练、清除已删池（截至不改）；
         # 加载失败不经过本方法，故障态不变。
         self._pool_fault = {
@@ -7718,19 +7778,21 @@ class Sessions:
         return spec, self._build_pools(spec)
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v6 JSON。
+        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v7 JSON。
 
-        直载 v1..v6 配置，或加载 upgrade_config 产出的升级包；升级包须复核
+        直载 v1..v7 配置，或加载 upgrade_config 产出的升级包；升级包须复核
         键序、字段、配置规范形态与摘要，任一不符抛 ValueError。text 非 str
         抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、值、重复项或
         引用（用户模板引用未注册用户或未知模板标识）错抛 ValueError；上限、
         模板占用、租约或队长承载不满足抛 ResourceError。v1-v4 迁移时认证节
-        补认证器当前两值，v1-v5 迁移时模板会话上限补 0。全部校验通过后原子
-        提交：失败不改配置、历史、回滚点、会话、租约与运行态；成功不老化，
-        会话与租约不变，认证策略随配置替换但认证记录（凭据、失败计数、锁定）
-        保留，新值仅作用于后续操作与查询。成功加载覆盖唯一回滚点并将配置
-        修订号加 1，新修订（连同构造态修订 0）保留在最近 256 项修订历史中，
-        超限淘汰最旧项且不淘汰当前项；失败修订号与历史不变。
+        补认证器当前两值，v1-v5 迁移时模板会话上限补 0，v1-v6 迁移时模板
+        周期毫秒补 0。全部校验通过后原子提交：失败不改配置、历史、回滚点、
+        会话、租约与运行态；成功不老化，会话与租约不变，计量账本同标识原样
+        保留 u/t/c 并自新模板周期毫秒 P 即时判窗，认证策略随配置替换但认证
+        记录（凭据、失败计数、锁定）保留，新值仅作用于后续操作与查询。成功
+        加载覆盖唯一回滚点并将配置修订号加 1，新修订（连同构造态修订 0）
+        保留在最近 256 项修订历史中，超限淘汰最旧项且不淘汰当前项；失败修订
+        号与历史不变。
 
         首次成功另向防篡改配置历史追加“加载”记录（父修订取前一修订、
         目标 -1、摘要同 config_revision、哈希为前六键基线紧凑 JSON 的
@@ -7744,7 +7806,7 @@ class Sessions:
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v6 JSON。
+        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v7 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点、
         历史或运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，生成
@@ -7789,7 +7851,7 @@ class Sessions:
 
         left/right 须为非 bool 非负 int：类型错抛 TypeError，负值抛
         ValueError；校验后依 left、right 次序在保留窗口（最近 256 项）查找，
-        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v6
+        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v7
         配置：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或两侧节点
         JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再下探，
         同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer：
@@ -7830,7 +7892,7 @@ class Sessions:
             )
 
         def json_type(value):
-            # 规范 v6 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            # 规范 v7 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
             if value is None:
                 return "null"
             if isinstance(value, bool):
@@ -7912,14 +7974,14 @@ class Sessions:
         JSON；不老化、不缓存、不审计，不改配置、修订、历史、回滚点及任何运行
         态，同态同参逐字节相同。
 
-        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v6 配置或经
+        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v7 配置或经
         严格复核的升级包，解析、重键、键集/键序、结构、类型、值、排序或引用
         错抛 ValueError，当前会话上限、模板占用、队长或在租租约不能承载抛
         ResourceError；校验次序与 load_config 完全一致（共用 _parse_config_text：
         先解析/迁移并复核升级包，再校验用户模板引用，最后做承载校验），承载
         校验只构造临时池表、不触碰实例状态。
 
-        预检文本先规范化为 v6 spec，再与当前配置（_current_spec() 的规范 v6
+        预检文本先规范化为 v7 spec，再与当前配置（_current_spec() 的规范 v7
         形态）递归比较：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或
         两侧节点 JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再
         下探，同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer
@@ -7930,7 +7992,7 @@ class Sessions:
 
         顶层键序/型为“修订:int、当前摘要:str、目标摘要:str、改变:bool、
         变更:list、摘要:str”；修订与当前摘要沿 config_revision（修订号、当前
-        export 去 LF 的 sha256），目标摘要为规范 v6 对象紧凑编码 UTF-8 字节的
+        export 去 LF 的 sha256），目标摘要为规范 v7 对象紧凑编码 UTF-8 字节的
         sha256 小写值，摘要覆盖前五键（前五键同法编码之 UTF-8 字节 sha256），
         改变恰为变更列表非空。时间 O(n log n + S + Q + D log D)、辅助空间
         O(n + D)（外加两份规范配置），n 为配置规模、S/Q 为会话与等待队列规模、
@@ -7953,7 +8015,7 @@ class Sessions:
             )
 
         def json_type(value):
-            # 规范 v6 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            # 规范 v7 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
             if value is None:
                 return "null"
             if isinstance(value, bool):
@@ -8258,7 +8320,7 @@ class Sessions:
         回滚点未知。锚后逐项先按 config_history_verify 契约校验字段、修订链、
         操作/目标、快照摘要与哈希链（快照/哈希编码失败各归同名原因），再按提交
         语义演算：构造仅生成修订 0；加载/CAS 取本项快照为新当前态；回退须目标
-        快照在册且本项快照与其规范 v6 JSON 逐字节相同；加载/CAS/回退均保存前态
+        快照在册且本项快照与其规范 v7 JSON 逐字节相同；加载/CAS/回退均保存前态
         为回滚点；回滚须回滚点已知且本项快照与其逐字节相同，随后清除回滚点。
         演算依赖（回退目标快照、回滚点）随窗口淘汰而不可知时归“边界”。
 
@@ -8427,7 +8489,7 @@ class Sessions:
                         if same is None:
                             broken = (revision, "快照")
                         elif not same:
-                            # 本项快照与目标快照规范 v6 JSON 不逐字节相同。
+                            # 本项快照与目标快照规范 v7 JSON 不逐字节相同。
                             broken = (revision, "回退")
                         else:
                             new_current, new_rollback = spec, current
@@ -8536,7 +8598,7 @@ class Sessions:
         (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。候选按审计
         序号升序收集：仅取由同键索引指认的原序号 0 首次事件，且缓存原调为
         成功的加载/回滚（失败、升级、重放与未指认事件不入候选）；其首果配置
-        为缓存返回的 v6 JSON，摘要按 config_revision 既有口径（去尾 LF 的
+        为缓存返回的 v7 JSON，摘要按 config_revision 既有口径（去尾 LF 的
         UTF-8 字节 sha256）求。再按修订升序扫描在册“加载/回滚”记录做配对：
         候选仅允许丢弃一段连续前缀作为已淘汰边界（其数量不得超过已淘汰修订
         数，且由反向就近同 (操作, 摘要) 对齐定切点）；其余候选必须与记录形成
@@ -8679,7 +8741,7 @@ class Sessions:
         # 候选选取（审计序号升序；时间 O(A)、不在此步算配置摘要）：事务候选
         # 仅取 config_change 域“键 → 首次事件序号”索引指认
         # （cindex[事件键] == 序号）的原序号 0 事件，且该键缓存原调为成功的
-        # 加载/回滚（首果 ("ok", v6 JSON 文本)）；失败、升级、重放与未被同键
+        # 加载/回滚（首果 ("ok", v7 JSON 文本)）；失败、升级、重放与未被同键
         # 索引指认的事件一律不是候选。每个在册修订至多消费一个候选，故事务候
         # 选与在册 load/rollback 记录的保序配对所用候选必为候选序列的一个后缀
         # （更早的成功首调皆对应已淘汰修订，为可信边界前缀）：自链尾反向仅收
@@ -8735,7 +8797,7 @@ class Sessions:
         # 早于末 R 个候选的事务首调必对应已淘汰修订（在册记录至多消费 R 个，
         # 且配对候选为候选序列后缀）：其数量即不经哈希即采信的淘汰前缀。
         pre_eliminated = max(0, total_candidates - pair_cap)
-        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v6 配置 JSON 去尾 LF 后
+        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v7 配置 JSON 去尾 LF 后
         # 的 UTF-8 字节 sha256 小写值（同 config_revision/历史摘要）。
         candidates = []
         for fseq, ckey, cache in window_rev:
@@ -9261,7 +9323,7 @@ class Sessions:
         缓存但不审计。
 
         首次合法调用分别执行既有 load_config(text)/rollback_config()/
-        upgrade_config(text, 6)：成功原样返回其 JSON；加载时配置非法抛
+        upgrade_config(text, 7)：成功原样返回其 JSON；加载时配置非法抛
         ValueError、承载冲突抛 ResourceError、无回滚点抛 StateError，升级只读
         （不触碰配置、运行态与回滚点），异常类型与 args 一并缓存。除缓存、
         审计外，失败不得改变配置、回滚点、用户、会话、租约、队列、统计或故障态。
