@@ -22,6 +22,11 @@
   优先级（QoS 模板排队优先级随等待老化）确定性晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
   creplay 提供 capacity 状态检查点、事件哈希链校验与原子重放恢复。
+  capacity_rebalance 按 (种类,目标,值) 变更列表调整模板排队优先级、
+  用户绑定与容量背压，并对等待队列做截止钳制、按入队序超时、按
+  (有效值↑,入队序↓) 淘汰至队限、按反序晋升可承载项：预检只读，
+  执行原子提交（旧配置作回滚点、修订 +1 存 v9 快照、config_history
+  记“加载”），执行仅缓存成功、同参重放原字节。
   runtime_checkpoint/runtime_restore 提供覆盖会话/租约、容量队列/事件与
   共享 QoS 账本的运行态检查点（版本 1，摘要覆盖前四键）与按 key 原子
   恢复（仅缓存成功，同摘要空操作，异摘要覆盖状态 StateError），供续租、
@@ -1057,6 +1062,19 @@ _MAX_TEMPLATE_SESSIONS = 10000
 _MAX_QUEUE_PRIORITY = 100
 # 有效优先级上界：min(1000, 基础 + 等待秒数)。
 _MAX_EFFECTIVE_PRIORITY = 1000
+# capacity_rebalance 容量再平衡：模式仅预检/执行；变更种类仅优先级/绑定/
+# 容量，(种类, 目标) 对互异，单次变更数 1..1000。
+_REBALANCE_MODE_PRECHECK = "预检"
+_REBALANCE_MODE_EXECUTE = "执行"
+_REBALANCE_KIND_PRIORITY = "优先级"
+_REBALANCE_KIND_BINDING = "绑定"
+_REBALANCE_KIND_CAPACITY = "容量"
+_REBALANCE_KINDS = (
+    _REBALANCE_KIND_PRIORITY,
+    _REBALANCE_KIND_BINDING,
+    _REBALANCE_KIND_CAPACITY,
+)
+_REBALANCE_MAX_CHANGES = 1000
 _CONFIG_VERSION = 9
 # 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
 # 最旧项，当前修订永不淘汰。
@@ -1194,6 +1212,19 @@ class _Pool:
         heapq.heapify(self.free)
         # 本池已租用地址 int -> sid（含静态与动态）。
         self.leases = {}
+
+
+def _pool_snapshot(pool):
+    """池的演算副本：共享不可变字段，复制空闲堆与租约表（供预检换入）。"""
+    clone = _Pool.__new__(_Pool)
+    clone.capacity = pool.capacity
+    clone.cidr = pool.cidr
+    clone.reserved = pool.reserved
+    clone.static = pool.static
+    clone.static_ips = pool.static_ips
+    clone.free = list(pool.free)
+    clone.leases = dict(pool.leases)
+    return clone
 
 
 class Sessions:
@@ -1692,6 +1723,10 @@ class Sessions:
         # capacity 的重放缓存，与 do/meter 分域：
         # key -> (op, sid, args, now_ms, outcome)。
         self._capacity_cache = {}
+        # capacity_rebalance 容量再平衡的重放缓存，与其余各域独立：
+        # key -> (mode, changes, now_ms, 结果 JSON)；仅执行模式首次成功
+        # 占位，预检与任何失败（含参数错）不占 key。
+        self._capacity_rebalance_cache = {}
         # capacity 事件哈希链：七元组序列 (序号, 时刻, 会话, 结果, 入队序,
         # 前哈希, 哈希)，序号自 1；末项哈希（空链为 64 个 0，即首项前哈希）。
         # 取消保留原入队序；事件时刻可早于前事件（显式时钟允许回拨）。
@@ -8006,6 +8041,500 @@ class Sessions:
             "时刻": now_ms,
             "剩余": total_queue - len(items),
             "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def capacity_rebalance(self, key, mode, changes, now_ms):
+        """容量再平衡：按变更列表调整模板排队优先级、用户绑定与容量背压，
+        并对等待队列做截止钳制/超时/淘汰/晋升，返回 LF 尾基线 JSON。
+
+        key 沿用凭据约束；mode 仅“预检/执行”；changes 为 1..1000 项
+        (种类, 目标, 值) 三元组 tuple，(种类, 目标) 对互异：优先级项
+        目标为模板标识、值为 v9 排队优先级（非 bool int 0..100）；绑定项
+        目标为用户、值为模板标识或 ""（解绑）；容量项目标为 ""、值为
+        v9 容量三元组 (队列上限, 最大等待毫秒, 队满策略)。now_ms 为非
+        bool 非负 int。类型错 TypeError，结构/取值错 ValueError；模板/
+        用户未知引用或新绑定下模板占用超其会话上限（承载失败）抛
+        ResourceError；now_ms 小于调用前任一排队项申请时刻抛
+        StateError（空队列不触发）。
+
+        全量校验后演算再平衡：含容量变更且新最大等待毫秒非 0 时，各队项
+        截止钳为 min(旧截止, 申请时刻+新值)；再按入队序摘除截止
+        <= now_ms 的超时项；再按 (有效值↑, 入队序↓) 淘汰至队限（0 表示
+        不限）；余留项按反序（有效值↓, 入队序↑）尝试晋升可承载者（全局/
+        单用户/模板上限与 default 池可取址，口径同推进），受限项留队并
+        保持原入队序。有效优先级按新配置在 now_ms 计算（同推进口径）。
+        预检只读：在换入的副本态上演算，实例任何状态不变。执行原子提交：
+        旧配置作回滚点、修订 +1 并存 v9 快照、config_history 追加“加载”
+        （目标 -1，不关联 audit），随后落实队列再平衡并按 超时→淘汰→
+        晋升 顺序记容量事件（各带原入队序）；任何失败实例不变。
+
+        执行仅缓存首次成功：严格同型同参重放返原字节，异参抛
+        ValueError；预检与任何失败不占 key。返回键序
+        时刻/模式/修订/超时/淘汰/晋升/剩余：数值为 int、模式为 str，
+        超时/淘汰/晋升按事件序为 sid str 列表，修订为新值（预检为将产生
+        的修订）。时间 O((S+Q) log Q + Q log A + K)、辅助空间
+        O(S+Q+K)，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._capacity_rebalance_cache.get(key)
+        if cached is not None:
+            # 仅执行首成功入缓存：重放不演算、不改态，同参返原字节。
+            c_mode, c_changes, c_now_ms, result = cached
+            if not _strict_equal(
+                (mode, changes, now_ms), (c_mode, c_changes, c_now_ms)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        # 预检与执行共用同一全量校验；参数错不缓存，实例不变。
+        self._validate_capacity_rebalance_params(mode, changes, now_ms)
+
+        # 时钟守卫：now_ms 早于任一在队项申请时刻即拒（空队列不触发）。
+        if self._capacity_queue:
+            earliest = min(entry[1] for entry in self._capacity_queue.values())
+            if now_ms < earliest:
+                raise StateError(
+                    f"now_ms {now_ms} is before queued apply time {earliest}"
+                )
+
+        # 引用与承载校验并生成新 spec；未知引用/承载失败 ResourceError。
+        spec, clamp_wait = self._capacity_rebalance_spec(changes)
+
+        if mode == _REBALANCE_MODE_PRECHECK:
+            # 预检只读：在副本态上跑同一再平衡，结束后还原，不缓存。
+            return self._capacity_rebalance_simulate(
+                spec, clamp_wait, mode, now_ms
+            )
+
+        # 执行：旧配置作回滚点原子提交（修订 +1、存 v9 快照、config_history
+        # 追加“加载”/目标 -1，不关联 audit），再按新配置落实再平衡；校验
+        # 均已通过，提交与再平衡不再失败。
+        self._commit_config(
+            spec, self._pools, self._current_spec(), _CONFIG_HISTORY_OP_LOAD
+        )
+        timed_out, evicted, promoted, remaining = self._cap_rebalance_run(
+            now_ms, clamp_wait, record=True
+        )
+        result = self._render_capacity_rebalance(
+            now_ms,
+            mode,
+            self._revision,
+            timed_out,
+            evicted,
+            promoted,
+            remaining,
+        )
+        self._capacity_rebalance_cache[key] = (mode, changes, now_ms, result)
+        return result
+
+    @staticmethod
+    def _capacity_rebalance_check_types(mode, changes, now_ms):
+        """capacity_rebalance 校验的类型阶段：容器/模式/各项前二字段/值/
+        now_ms 的任一类型错均在此阶段抛出，先于任何长度、取值、重复等
+        结构/值错（沿 fault_plan 约定）。值的类型仅在形状可判定时检查
+        （种类可识别且项长恰为 3；容量三元组的元素类型须其恰为三项）。"""
+        if isinstance(mode, bool) or not isinstance(mode, str):
+            raise TypeError(f"mode must be a str, got {type(mode).__name__}")
+        if not isinstance(changes, tuple):
+            raise TypeError(
+                f"changes must be a tuple, got {type(changes).__name__}"
+            )
+        for change in changes:
+            if not isinstance(change, tuple):
+                raise TypeError(
+                    f"change must be a tuple, got {type(change).__name__}"
+                )
+            # 长度未定前仅查存在的前二字段：种类/目标均须为 str。
+            for field in change[:2]:
+                if not isinstance(field, str):
+                    raise TypeError(
+                        f"种类/目标 must be str, got {type(field).__name__}"
+                    )
+            if len(change) == 3:
+                kind, _target, value = change
+                if kind == _REBALANCE_KIND_PRIORITY:
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        raise TypeError(
+                            f"值 must be an int, got {type(value).__name__}"
+                        )
+                elif kind == _REBALANCE_KIND_BINDING:
+                    if not isinstance(value, str):
+                        raise TypeError(
+                            f"值 must be a str, got {type(value).__name__}"
+                        )
+                elif kind == _REBALANCE_KIND_CAPACITY:
+                    if not isinstance(value, tuple):
+                        raise TypeError(
+                            f"值 must be a tuple, got {type(value).__name__}"
+                        )
+                    if len(value) == 3:
+                        for element in value[:2]:
+                            if isinstance(element, bool) or not isinstance(
+                                element, int
+                            ):
+                                raise TypeError(
+                                    "队列上限/最大等待毫秒 must be int, got "
+                                    f"{type(element).__name__}"
+                                )
+                        if not isinstance(value[2], str):
+                            raise TypeError(
+                                "队满策略 must be a str, got "
+                                f"{type(value[2]).__name__}"
+                            )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+
+    @staticmethod
+    def _capacity_rebalance_check_values(mode, changes, now_ms):
+        """capacity_rebalance 校验的取值/结构阶段：模式、时钟下界、变更
+        数、逐项长度/种类/目标/唯一性/值取值。须在
+        _capacity_rebalance_check_types 之后调用；模板/用户存在与否不在
+        本结构校验内（演算阶段查，未知引用抛 ResourceError）。"""
+        if mode not in (_REBALANCE_MODE_PRECHECK, _REBALANCE_MODE_EXECUTE):
+            raise ValueError(f"mode must be one of 预检/执行, got {mode!r}")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(changes) <= _REBALANCE_MAX_CHANGES):
+            raise ValueError(
+                f"changes must contain 1..{_REBALANCE_MAX_CHANGES} items, "
+                f"got {len(changes)}"
+            )
+        seen = set()
+        for change in changes:
+            if len(change) != 3:
+                raise ValueError(
+                    "change must be a 3-tuple (种类, 目标, 值), "
+                    f"got {len(change)} items"
+                )
+            kind, target, value = change
+            if kind not in _REBALANCE_KINDS:
+                raise ValueError(
+                    f"种类 must be one of 优先级/绑定/容量, got {kind!r}"
+                )
+            if kind == _REBALANCE_KIND_CAPACITY:
+                if target != "":
+                    raise ValueError(
+                        f"容量 target must be \"\", got {target!r}"
+                    )
+            else:
+                _check_credential("target", target)
+            pair = (kind, target)
+            if pair in seen:
+                raise ValueError(
+                    f"(种类, 目标) must be unique, got duplicate {pair!r}"
+                )
+            seen.add(pair)
+            if kind == _REBALANCE_KIND_PRIORITY:
+                if not (0 <= value <= _MAX_QUEUE_PRIORITY):
+                    raise ValueError(
+                        f"优先级 value must be 0..{_MAX_QUEUE_PRIORITY}, "
+                        f"got {value}"
+                    )
+            elif kind == _REBALANCE_KIND_BINDING:
+                if value != "":
+                    _check_credential("template value", value)
+            else:  # 容量
+                if len(value) != 3:
+                    raise ValueError(
+                        "容量 value must be a 3-tuple "
+                        "(队列上限, 最大等待毫秒, 队满策略), "
+                        f"got {len(value)} items"
+                    )
+                queue_limit, max_wait_ms, queue_policy = value
+                if not (0 <= queue_limit <= _MAX_QUEUE_LIMIT):
+                    raise ValueError(
+                        f"队列上限 must be 0..{_MAX_QUEUE_LIMIT}, "
+                        f"got {queue_limit}"
+                    )
+                if max_wait_ms < 0:
+                    raise ValueError(
+                        f"最大等待毫秒 must be >= 0, got {max_wait_ms}"
+                    )
+                if queue_policy not in _QUEUE_POLICIES:
+                    raise ValueError(
+                        "队满策略 must be one of 拒绝/替换, got "
+                        f"{queue_policy!r}"
+                    )
+
+    @classmethod
+    def _validate_capacity_rebalance_params(cls, mode, changes, now_ms):
+        """校验 capacity_rebalance 三参数（key 已由调用方校验）：类型
+        阶段先于结构/取值阶段。
+
+        mode 限预检/执行；changes 须为 tuple，含 1..1000 项 3 元组
+        (种类, 目标, 值)：种类/目标为非 bool str，种类限优先级/绑定/
+        容量，(种类, 目标) 对互异；优先级项目标沿凭据约束、值为非 bool
+        int 0..100，绑定项目标沿凭据约束、值为 "" 或凭据约束的模板标识，
+        容量项目标为 ""、值为 v9 容量三元组（队列上限 0..10000、最大
+        等待毫秒非负、队满策略拒绝/替换）；now_ms 为非 bool 非负 int。
+        引用存在与否不在本结构校验内（演算阶段查，未知引用抛
+        ResourceError）。
+        """
+        cls._capacity_rebalance_check_types(mode, changes, now_ms)
+        cls._capacity_rebalance_check_values(mode, changes, now_ms)
+
+    def _capacity_rebalance_spec(self, changes):
+        """把变更套用到当前配置生成新规范化 spec，返回 (spec, 钳制等待)。
+
+        模板/用户未知引用抛 ResourceError；新绑定下任一模板占用（在线加
+        挂起，沿 _build_pools 口径）超其会话上限（0 表示不限）为承载
+        失败，抛 ResourceError。钳制等待为容量变更的新最大等待毫秒
+        （非 0 时），无容量变更或新值为 0 时为 None（不钳制）。本方法
+        不改任何状态。
+        """
+        (
+            total,
+            per,
+            idle_ms,
+            lease_ms,
+            pool_specs,
+            templates,
+            user_templates,
+            (queue_limit, max_wait_ms, queue_policy),
+            auth_policy,
+        ) = self._current_spec()
+        template_map = {item[0]: item[1:] for item in templates}
+        bindings = dict(user_templates)
+        clamp_wait = None
+        for kind, target, value in changes:
+            if kind == _REBALANCE_KIND_PRIORITY:
+                if target not in template_map:
+                    raise ResourceError(f"unknown template: {target!r}")
+                fields = list(template_map[target])
+                fields[5] = value
+                template_map[target] = tuple(fields)
+            elif kind == _REBALANCE_KIND_BINDING:
+                if target not in self._auth:
+                    raise ResourceError(f"unknown user: {target!r}")
+                if value == "":
+                    bindings.pop(target, None)
+                else:
+                    if value not in template_map:
+                        raise ResourceError(f"unknown template: {value!r}")
+                    bindings[target] = value
+            else:  # _REBALANCE_KIND_CAPACITY
+                queue_limit, max_wait_ms, queue_policy = value
+                clamp_wait = max_wait_ms if max_wait_ms != 0 else None
+        # 承载校验：新绑定下模板占用不得超其会话上限（0 表示不限）。
+        template_limits = {
+            template_id: fields[4]
+            for template_id, fields in template_map.items()
+            if fields[4]
+        }
+        if template_limits:
+            per_template = {}
+            for session in self._sessions.values():
+                if session["state"] == _STATE_OFFLINE:
+                    continue
+                template_id = bindings.get(session["user"])
+                if template_id is not None:
+                    per_template[template_id] = (
+                        per_template.get(template_id, 0) + 1
+                    )
+            for template_id, session_limit in template_limits.items():
+                occupancy = per_template.get(template_id, 0)
+                if occupancy > session_limit:
+                    raise ResourceError(
+                        f"template session limit {session_limit} below "
+                        f"{occupancy} active sessions for template "
+                        f"{template_id!r}"
+                    )
+        spec = (
+            total,
+            per,
+            idle_ms,
+            lease_ms,
+            pool_specs,
+            tuple(
+                (template_id,) + template_map[template_id]
+                for template_id in sorted(template_map)
+            ),
+            tuple(sorted(bindings.items())),
+            (queue_limit, max_wait_ms, queue_policy),
+            auth_policy,
+        )
+        return spec, clamp_wait
+
+    def _capacity_rebalance_simulate(self, spec, clamp_wait, mode, now_ms):
+        """预检：把新配置与队列/会话/池的副本换入实例，跑同一再平衡后
+        整体还原，返回演算结果 JSON；实例任何状态不变。"""
+        saved = (
+            self._templates,
+            self._user_templates,
+            self._queue_limit,
+            self._max_wait_ms,
+            self._queue_policy,
+            self._capacity_queue,
+            self._queue_order,
+            self._sessions,
+            self._pools,
+        )
+        (
+            _total,
+            _per,
+            _idle_ms,
+            _lease_ms,
+            _pool_specs,
+            templates,
+            user_templates,
+            (queue_limit, max_wait_ms, queue_policy),
+            _auth_policy,
+        ) = spec
+        self._templates = {item[0]: item[1:] for item in templates}
+        self._user_templates = dict(user_templates)
+        self._queue_limit = queue_limit
+        self._max_wait_ms = max_wait_ms
+        self._queue_policy = queue_policy
+        # 副本上再平衡：换入后原件不再被触碰，结束后整体还原。
+        self._capacity_queue = {
+            sid: list(entry) for sid, entry in saved[5].items()
+        }
+        self._queue_order = list(saved[6])
+        self._sessions = dict(saved[7])
+        self._pools = {
+            pool_id: _pool_snapshot(pool) for pool_id, pool in saved[8].items()
+        }
+        try:
+            timed_out, evicted, promoted, remaining = self._cap_rebalance_run(
+                now_ms, clamp_wait, record=False
+            )
+        finally:
+            (
+                self._templates,
+                self._user_templates,
+                self._queue_limit,
+                self._max_wait_ms,
+                self._queue_policy,
+                self._capacity_queue,
+                self._queue_order,
+                self._sessions,
+                self._pools,
+            ) = saved
+        # 预检不提交：修订为将产生的新值（当前 +1）。
+        return self._render_capacity_rebalance(
+            now_ms,
+            mode,
+            self._revision + 1,
+            timed_out,
+            evicted,
+            promoted,
+            remaining,
+        )
+
+    def _cap_rebalance_run(self, now_ms, clamp_wait, record):
+        """在当前（或预检换入的）态上执行队列再平衡四步，返回
+        (超时, 淘汰, 晋升, 剩余)：三个按事件序的 sid 列表与余留队长。
+
+        含容量变更且新最大等待非 0（clamp_wait 非 None）时先把各队项
+        截止钳为 min(旧截止, 申请时刻+新值)；再按入队序摘除截止
+        <= now_ms 的超时项；再按 (有效值↑, 入队序↓) 淘汰至队限（0 表示
+        不限）；余留项按反序（有效值↓, 入队序↑）尝试晋升可承载者（口径
+        同推进：全局/单用户/模板上限、default 池可取址），受限项留队并
+        保持原入队序。record=True 时按 超时→淘汰→晋升 顺序记容量事件
+        （各带原入队序）。时间 O((S+Q) log Q + Q log A)、辅助 O(Q)。
+        """
+        # 截止钳制：仅含容量变更且新最大等待非 0 时。
+        if clamp_wait is not None:
+            for entry in self._capacity_queue.values():
+                deadline = entry[1] + clamp_wait
+                if entry[3] > deadline:
+                    entry[3] = deadline
+
+        # 超时（含同刻）：按入队序摘除截止 <= now_ms 者。
+        timed_out = []
+        survivors = []
+        for queued_sid in self._queue_order:
+            entry = self._capacity_queue[queued_sid]
+            if entry[3] <= now_ms:
+                timed_out.append((queued_sid, entry[4]))
+                del self._capacity_queue[queued_sid]
+            else:
+                survivors.append(queued_sid)
+
+        # 存活项按 (有效值↑, 入队序↓) 排序：前段为淘汰段（淘汰至队限），
+        # 余段反序即晋升尝试序（有效值↓, 入队序↑）。有效值同推进口径。
+        scored = []
+        for queued_sid in survivors:
+            entry = self._capacity_queue[queued_sid]
+            effective = self._queue_effective(entry[0], entry[1], now_ms)
+            scored.append((effective, entry[4], queued_sid))
+        scored.sort(key=lambda item: (item[0], -item[1]))
+        limit = self._queue_limit
+        evict_count = len(scored) - limit if limit and len(scored) > limit else 0
+        evicted = scored[:evict_count]
+        kept = scored[evict_count:]
+        removed = set()
+        for _effective, _order, queued_sid in evicted:
+            removed.add(queued_sid)
+            del self._capacity_queue[queued_sid]
+
+        # 晋升：计数只扫一次会话表，晋升时增量维护；前项成功占用即时
+        # 影响后项，受限项留队。
+        total_count, per_user, per_template = self._active_counts()
+        promoted = []
+        for _effective, order, queued_sid in reversed(kept):
+            entry = self._capacity_queue[queued_sid]
+            user = entry[0]
+            template_id = self._user_templates.get(user)
+            template_open = True
+            if template_id is not None:
+                session_limit = self._templates[template_id][4]
+                template_open = (
+                    not session_limit
+                    or per_template.get(template_id, 0) < session_limit
+                )
+            pool_id, ip_int = self._default_candidate(user, now_ms)
+            if (
+                total_count < self._total
+                and per_user.get(user, 0) < self._per
+                and template_open
+                and pool_id is not None
+                and ip_int is not None
+            ):
+                self._commit_session(queued_sid, user, pool_id, ip_int, now_ms)
+                promoted.append((queued_sid, order))
+                removed.add(queued_sid)
+                del self._capacity_queue[queued_sid]
+                total_count += 1
+                per_user[user] = per_user.get(user, 0) + 1
+                if template_id is not None:
+                    per_template[template_id] = (
+                        per_template.get(template_id, 0) + 1
+                    )
+        # 余留项保持原入队序（入队序不随再平衡改写）。
+        self._queue_order = [sid for sid in survivors if sid not in removed]
+
+        if record:
+            for queued_sid, order in timed_out:
+                self._cap_event(now_ms, queued_sid, _CAP_TIMEOUT, order)
+            for _effective, order, queued_sid in evicted:
+                self._cap_event(now_ms, queued_sid, _CAP_EVICTED, order)
+            for queued_sid, order in promoted:
+                self._cap_event(now_ms, queued_sid, _CAP_PROMOTED, order)
+
+        return (
+            [sid for sid, _order in timed_out],
+            [sid for _effective, _order, sid in evicted],
+            [sid for sid, _order in promoted],
+            len(self._queue_order),
+        )
+
+    @staticmethod
+    def _render_capacity_rebalance(
+        now_ms, mode, revision, timed_out, evicted, promoted, remaining
+    ):
+        # 键序：时刻、模式、修订、超时、淘汰、晋升、剩余；数值为 int、
+        # 模式为 str，超时/淘汰/晋升按事件序为 sid str 列表。
+        payload = {
+            "时刻": now_ms,
+            "模式": mode,
+            "修订": revision,
+            "超时": timed_out,
+            "淘汰": evicted,
+            "晋升": promoted,
+            "剩余": remaining,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
