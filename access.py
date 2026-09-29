@@ -103,7 +103,14 @@
   重放、异参 ValueError；返回 LF 尾紧凑 JSON（用户/状态/时刻/下线/取消）；
   成功首果与成功同参重放写防篡改审计链（用户停用/用户启用，会话=user，
   成功/重放），参数错及业务异常不审计。
-  停用态不随配置加载/回滚与检查点恢复改变。
+  停用态不随配置加载/回滚与运行态检查点恢复改变（认证态恢复除外，见下）。
+- Sessions.auth_checkpoint / Sessions.auth_restore 提供认证态（各用户
+  凭据摘要、失败计数、锁定至与停用态）检查点（版本 1，摘要覆盖前三键）与按
+  key 原子恢复：检查点只读、不老化、不清到期锁，失败与锁定至不依当前最大
+  失败数校验、原样往返；恢复严格全验（JSON/重键/键序结构类型值/排序重复/
+  版本摘要错 ValueError，用户集与当前认证器不一致 ResourceError）后原子
+  替换四项且不改认证策略，后续认证沿既有规则，任何失败不改实例；仅缓存首次
+  成功、同型同 text 重放原字节、异参 ValueError，不老化、不审计。
 - Sessions.fault_plan 批量故障演练计划：key 沿用凭据，mode 仅预检/执行，
   steps 为 1..1000 项 (domain,target,op,value) 四元组；域仅后端/池/超时、
   op 仅注入/恢复，后端/超时 target 为 "" 且各唯一，池 target 沿标识且互异，
@@ -1405,6 +1412,20 @@ class Sessions:
     原序号指认首次、结果“重放”。停用态不随配置加载/回滚或
     creplay/runtime_restore 改变。首次
     O(S+Q) 时间、O(1) 辅助空间，重放 O(1)。
+    auth_checkpoint(now_ms) 只读输出认证态检查点基线 JSON（LF 尾），
+    不老化、不清到期锁：顶层依次版本:int/时刻:int/用户:list/摘要:str，版本 1；
+    用户按 Unicode 码点升序，项键序用户:str/凭据:str/失败:int/锁定至:int|null/
+    停用:bool，凭据为认证记录摘要的 64 位小写十六进制，失败为非 bool 非负 int、
+    锁定至为 null 或非 bool 非负 int（两值不依当前最大失败数校验、原样往返），
+    停用为 bool；摘要为前三键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值；
+    now_ms 为非 bool 非负 int，型/值错抛 TypeError/ValueError；
+    O(U log U) 时间、O(U) 空间。auth_restore(key, text) 校验并原子替换上述
+    四项（凭据、失败、锁定至与停用态），返回规范包：key 沿凭据约束，text 非 str
+    抛 TypeError；JSON、重键、键集/键序、结构、类型、范围、排序/重复、版本或
+    摘要错抛 ValueError；用户集不等于当前认证器抛 ResourceError。全验后原子
+    替换，认证策略（最大失败/锁定毫秒）保留不变，恢复不改认证策略、后续认证沿
+    既有规则，失败不改实例；不老化、不审计。仅缓存首次成功，同 key 同型同 text
+    重放原字节且不重验，异参抛 ValueError，失败不占 key。
     do 另受理挂起/恢复：挂起 args 须为 None 否则 ValueError，先老化，
     未知 sid 抛 KeyError、非在线抛 StateError，置挂起、期限 0 并释址
     退租；恢复 args 为 (pool, password) 二元 tuple（非 tuple 抛
@@ -1690,6 +1711,10 @@ class Sessions:
         # （含参数错、ResourceError、StateError）不占 key。合并不写审计链，
         # 故无原序号索引。
         self._stats_merge_cache = {}
+        # auth_restore 认证态检查点恢复的重放缓存，与其余各域独立：
+        # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错与
+        # ResourceError）不占 key。恢复不写审计链，故无原序号索引。
+        self._auth_restore_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -10513,6 +10538,206 @@ class Sessions:
             "取消": cancelled,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _auth_payload(self, now_ms):
+        """组装认证态检查点文档 dict（顶层键序：版本/时刻/用户/摘要）。
+
+        用户按用户 Unicode 码点升序；项键序“用户/凭据/失败/锁定至/停用”，
+        凭据为认证记录摘要的 64 位小写十六进制，失败为非 bool 非负 int、
+        锁定至为 None 或非 bool 非负 int（两值原样取，不随到期或当前最大
+        失败数收敛），停用取自 Sessions 停用态集合；摘要为前三键紧凑 JSON
+        （无 LF）UTF-8 字节的 sha256 小写值。纯渲染：不认证、不老化、不清
+        到期锁、不改态。
+        """
+        users = []
+        for user in sorted(self._auth._users):
+            digest, failed, until = self._auth._users[user]
+            users.append(
+                {
+                    "用户": user,
+                    "凭据": digest.hex(),
+                    "失败": failed,
+                    "锁定至": until,
+                    "停用": user in self._disabled_users,
+                }
+            )
+        doc = {"版本": 1, "时刻": now_ms, "用户": users}
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return doc
+
+    def _auth_checkpoint_text(self, now_ms):
+        """认证态检查点的 LF 结尾紧凑 JSON（基线序列化，不老化、不改态）。"""
+        return json.dumps(
+            self._auth_payload(now_ms), ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def auth_checkpoint(self, now_ms):
+        """只读输出认证态检查点的 LF 结尾基线 JSON，O(U log U) 时间、O(U)
+        空间；不认证、不老化、不清到期锁、不审计、不动各域缓存与认证策略。
+
+        now_ms 限非 bool 非负 int：类型错 TypeError、取值错 ValueError。
+        顶层依次为“版本/时刻/用户/摘要”：版本恒为 1，时刻为 now_ms；用户
+        按 Unicode 码点升序、无重复，项键序“用户/凭据/失败/锁定至/停用”，
+        用户为凭据约束串，凭据为认证记录摘要的 64 位小写十六进制，失败为非
+        bool 非负 int，锁定至为 null 或非 bool 非负 int（两值不依当前最大
+        失败数校验、原样往返），停用为 bool；摘要为前三键紧凑 JSON（无 LF）
+        UTF-8 字节的 sha256 小写值。同态同时刻查询逐字节相同。
+        """
+        _check_int("now_ms", now_ms, 0)
+        return self._auth_checkpoint_text(now_ms)
+
+    def auth_restore(self, key, text):
+        """按认证态检查点原子替换各用户凭据、失败、锁定至与停用态，返回
+        替换后检查点（规范包）的 LF 结尾基线 JSON。
+
+        key 沿凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
+        text 非 str 抛 TypeError。JSON 解析、重键、键集/键序、结构、类型、
+        取值范围、用户排序或重复、版本或摘要错均抛 ValueError；用户集与当前
+        认证器不一致（多或缺）抛 ResourceError。全部校验通过后原子替换
+        用户表（凭据、失败计数、锁定至）与停用态集合四项，认证策略（最大
+        失败/锁定毫秒）、会话、租约、队列及各域缓存均不变，后续认证沿既有
+        规则；任何失败不改实例，不老化、不审计。
+
+        重放缓存与各域独立：仅缓存首次成功，同 key 同型同 text 重放不解析、
+        不重验、不替换，直接返回首次规范包原字节；异参（含异型）抛
+        ValueError；失败（含参数错与 ResourceError）不占 key。首次
+        O(U log U) 时间、O(U) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._auth_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text 后返回缓存原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        now_ms, rows = self._parse_auth_checkpoint(text)
+        if {user for user, _h, _f, _u, _d in rows} != set(self._auth._users):
+            raise ResourceError(
+                "auth checkpoint user set does not match the authenticator"
+            )
+
+        # 全验后原子替换四项：凭据摘要、失败计数、锁定至（在认证器用户表内）
+        # 与停用态集合；认证策略（最大失败/锁定毫秒）保留不变。
+        new_users = {
+            user: [bytes.fromhex(cred_hex), failed, until]
+            for user, cred_hex, failed, until, _disabled in rows
+        }
+        self._auth._users = new_users
+        self._disabled_users = {
+            user for user, _h, _f, _u, disabled in rows if disabled
+        }
+
+        result = self._auth_checkpoint_text(now_ms)
+        self._auth_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_auth_checkpoint(self, text):
+        """解析并全量校验认证态检查点文本，返回
+        (时刻, 用户行五元组列表 (用户,凭据,失败,锁定至,停用))；
+        任何文本非法均抛 ValueError。
+
+        顶层须恰含“版本/时刻/用户/摘要”且键序如此；版本为 1，时刻为非
+        bool 非负 int；用户项键序“用户/凭据/失败/锁定至/停用”，用户为凭据
+        约束串，凭据为 64 位小写十六进制，失败为非 bool 非负 int（不与当前
+        最大失败数比较），锁定至为 null 或非 bool 非负 int，停用为 bool，
+        行按用户 Unicode 码点严格升序、无重复；摘要须为规范化前三键紧凑
+        JSON（无 LF）UTF-8 字节的 sha256 小写值（与原文排版无关）。仅做
+        结构自洽校验；用户集与当前认证器是否一致由调用方判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"auth checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("auth checkpoint top level must be an object")
+        if list(doc) != ["版本", "时刻", "用户", "摘要"]:
+            raise ValueError(
+                "auth checkpoint top-level keys must be 版本/时刻/用户/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+
+        users_raw = doc["用户"]
+        if not isinstance(users_raw, list):
+            raise ValueError("用户 must be a list")
+        rows = []
+        last_user = None
+        for index, item in enumerate(users_raw, start=1):
+            if not isinstance(item, dict) or list(item) != [
+                "用户",
+                "凭据",
+                "失败",
+                "锁定至",
+                "停用",
+            ]:
+                raise ValueError(
+                    f"auth user {index} keys must be "
+                    "用户/凭据/失败/锁定至/停用 in order"
+                )
+            user = self._cp_str(item["用户"], "用户.用户")
+            cred_hex = self._cp_hex64(item["凭据"], "用户.凭据")
+            failed = item["失败"]
+            if isinstance(failed, bool) or not isinstance(failed, int):
+                raise ValueError(
+                    f"用户.失败 must be an int, got {type(failed).__name__}"
+                )
+            if failed < 0:
+                raise ValueError(f"用户.失败 must be >= 0, got {failed}")
+            until = item["锁定至"]
+            if until is not None:
+                if isinstance(until, bool) or not isinstance(until, int):
+                    raise ValueError(
+                        "用户.锁定至 must be null or an int, got "
+                        f"{type(until).__name__}"
+                    )
+                if until < 0:
+                    raise ValueError(f"用户.锁定至 must be >= 0, got {until}")
+            disabled = item["停用"]
+            if not isinstance(disabled, bool):
+                raise ValueError(
+                    f"用户.停用 must be a bool, got {type(disabled).__name__}"
+                )
+            if last_user is not None and user <= last_user:
+                raise ValueError(
+                    "auth user rows must be strictly sorted by 用户 ascending "
+                    "with no duplicates"
+                )
+            last_user = user
+            rows.append((user, cred_hex, failed, until, disabled))
+
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        # 摘要：用规范化值重建前三键（数值相等即与生成方基线逐字节一致）。
+        canonical_head = {
+            "版本": 1,
+            "时刻": now_ms,
+            "用户": [
+                {
+                    "用户": user,
+                    "凭据": cred_hex,
+                    "失败": failed,
+                    "锁定至": until,
+                    "停用": disabled,
+                }
+                for user, cred_hex, failed, until, disabled in rows
+            ],
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical auth checkpoint")
+        return now_ms, rows
 
     def _audit_append(self, key, old, sid, result, now_ms, origin=0):
         """追加一条接管审计事件，O(1) 时空。
