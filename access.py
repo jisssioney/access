@@ -135,6 +135,18 @@
   JSON UTF-8 字节的 sha256 小写值；LF 尾紧凑。时间
   O(S+Q+K+CP+P log P)、辅助空间 O(CP+K)，C/P/K 为场景数/池并集数/步骤
   总数。
+- CLI 入口 python access.py stats-merge（子命令不带额外参数）：stdin 为
+  UTF-8 JSON 对象（尾部仅允许空白），键依次且仅为 key/users/base/left/
+  right；key 沿凭据约束，users 为 1..10000 个按 Unicode 码点严格升序且
+  互异的凭据串，base/left/right 为遵循版本 1 统计检查点契约的 str。临时
+  Authenticator 注册 users 后构造临时 Sessions 调用 stats_merge，方法
+  行为不变（文档非法 ValueError、引用未注册用户 ResourceError、分支回退
+  StateError("left"/"right")）。成功仅向 stdout 写返回值、stderr 空、
+  退出 0；失败 stdout 空，stderr 写键序“错误/类型”的 LF 尾紧凑 JSON
+  （值为 stats-merge 与异常类名），TypeError/ValueError 退 2、
+  ResourceError 退 3、StateError 退 4；缺失或未知子命令、额外参数按
+  ValueError。同输入逐字节同结果；时空 O(L+n log n)/O(L+n)，L/n 为
+  输入字节长度/检查点总行数。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -143,6 +155,7 @@ import heapq
 import hmac
 import ipaddress
 import json
+import sys
 
 __all__ = [
     "Authenticator",
@@ -11009,3 +11022,139 @@ class Sessions:
             "租期": lease,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+# CLI 入口：python access.py <子命令>。子命令不带额外参数，请求体整体取自
+# stdin。当前仅 stats-merge。
+
+_CLI_ENVELOPE_KEYS = ("key", "users", "base", "left", "right")
+
+
+def _cli_json_only_trailing_ws(text):
+    """解析文本为单个 JSON 值，顶层值后仅允许空白；返回解析值。
+
+    重键抛 ValueError；非对象、空输入或尾随非空白内容均抛 ValueError。
+    """
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_object)
+    try:
+        value, end = decoder.raw_decode(text)
+    except ValueError as exc:
+        raise ValueError(f"input is not valid JSON: {exc}") from exc
+    for ch in text[end:]:
+        if ch not in " \t\r\n":
+            raise ValueError("input has trailing content after the JSON object")
+    return value
+
+
+def _cli_validate_users(users):
+    """users 须为 list，含 1..10000 个互异凭据串，按 Unicode 码点严格升序。
+
+    长度、排序、重复或凭据取值错抛 ValueError；元素型错（非 str）抛 TypeError。
+    """
+    if not (1 <= len(users) <= _MAX_USERS):
+        raise ValueError(
+            f"users length must be 1..{_MAX_USERS}, got {len(users)}"
+        )
+    last = None
+    for index, user in enumerate(users):
+        # 凭据串自身的型/值（str、UTF-8 1..256 字节、无 U+0000）：
+        # 型错 TypeError，取值错 ValueError。
+        _check_credential(f"users[{index}]", user)
+        if last is not None and user <= last:
+            if user == last:
+                raise ValueError(f"users contains duplicate credential: {user!r}")
+            raise ValueError("users must be strictly sorted by Unicode codepoint")
+        last = user
+    return users
+
+
+def _cli_stats_merge(raw_bytes):
+    """解析并执行 stats-merge 子命令的 stdin 请求，返回 stats_merge 的返回串。"""
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"input is not valid UTF-8: {exc}") from exc
+
+    envelope = _cli_json_only_trailing_ws(text)
+    if not isinstance(envelope, dict):
+        raise ValueError("input top level must be a JSON object")
+    if list(envelope) != list(_CLI_ENVELOPE_KEYS):
+        raise ValueError(
+            "input keys must be exactly key/users/base/left/right in order"
+        )
+
+    key = envelope["key"]
+    users = envelope["users"]
+    base = envelope["base"]
+    left = envelope["left"]
+    right = envelope["right"]
+
+    # 字段类型检查先于取值与业务校验：key 沿凭据约束的 str，users 为 list，
+    # 后三项为 str；类型不符抛 TypeError。
+    if not isinstance(key, str):
+        raise TypeError(f"key must be a str, got {type(key).__name__}")
+    if not isinstance(users, list):
+        raise TypeError(f"users must be a list, got {type(users).__name__}")
+    for name, value in (("base", base), ("left", left), ("right", right)):
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a str, got {type(value).__name__}")
+
+    # 取值检查：key 凭据长度/字符、users 长度/排序/重复与各凭据串取值，
+    # 三文本的契约合法性由 stats_merge 校验，均为 ValueError 家族。
+    _check_credential("key", key)
+    _cli_validate_users(users)
+
+    # 临时实例：注册 users 后调用 stats_merge；实例不持久、无地址池与配置。
+    auth = Authenticator(1, 0)
+    for user in users:
+        auth.add(user, user)
+    sessions = Sessions(auth, 1, 1, 0)
+    return sessions.stats_merge(key, base, left, right)
+
+
+def _cli_run(argv, stdin_buffer, stdout, stderr):
+    """子命令分派，返回退出码。成功仅写 stdout；失败 stdout 空、stderr 写
+    键序“错误/类型”的 LF 尾紧凑 JSON（错误恒为 stats-merge，类型为异常类名）。
+
+    缺失或未知子命令及额外参数按 ValueError。TypeError/ValueError 退 2，
+    ResourceError 退 3，StateError 退 4。
+    """
+    if len(argv) < 2:
+        command = None
+        exc = ValueError("missing subcommand")
+    elif argv[1] != "stats-merge":
+        command = None
+        exc = ValueError(f"unknown subcommand: {argv[1]!r}")
+    elif len(argv) > 2:
+        command = "stats-merge"
+        exc = ValueError("stats-merge takes no additional arguments")
+    else:
+        command = "stats-merge"
+        try:
+            result = _cli_stats_merge(stdin_buffer.read())
+        except (TypeError, ValueError, ResourceError, StateError) as caught:
+            exc = caught
+        else:
+            stdout.write(result)
+            return 0
+
+    payload = {"错误": command or "stats-merge", "类型": type(exc).__name__}
+    stderr.write(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    if isinstance(exc, (TypeError, ValueError)):
+        return 2
+    if isinstance(exc, ResourceError):
+        return 3
+    return 4
+
+
+def main(argv=None):
+    """CLI 入口：同输入逐字节同结果（无时钟、无随机源）。"""
+    if argv is None:
+        argv = sys.argv
+    return _cli_run(argv, sys.stdin.buffer, sys.stdout, sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
