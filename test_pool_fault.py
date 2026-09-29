@@ -295,7 +295,7 @@ class PoolFaultCapacityTest(unittest.TestCase):
     def test_queue_full_still_resource_error(self):
         _auth, s = make()
         doc = json.loads(s.export_config())
-        doc["容量"] = {"队列上限": 1, "最大等待毫秒": 0}
+        doc["容量"] = {"队列上限": 1, "最大等待毫秒": 0, "队满策略": "拒绝"}
         s.load_config(json.dumps(doc, ensure_ascii=False))
         s.pool_fault("fi", "注入", "default", 1000, 0)
         s.capacity("q0", "申请", "q1", ("alice", "pw", 1000), 0)
@@ -308,7 +308,7 @@ class PoolFaultCapacityTest(unittest.TestCase):
     def test_wait_limit_value_error_precedes(self):
         _auth, s = make()
         doc = json.loads(s.export_config())
-        doc["容量"] = {"队列上限": 1024, "最大等待毫秒": 100}
+        doc["容量"] = {"队列上限": 1024, "最大等待毫秒": 100, "队满策略": "拒绝"}
         s.load_config(json.dumps(doc, ensure_ascii=False))
         s.pool_fault("fi", "注入", "default", 1000, 0)
         # 等待超最大等待：验参即 ValueError，先于资源，不入队。

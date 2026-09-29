@@ -553,16 +553,34 @@ def _parse_config_templates(doc, version):
     return tuple(templates), tuple(user_templates)
 
 
-def _parse_config_capacity(doc):
-    """校验 v4 的容量节，返回 (队列上限, 最大等待毫秒)。
+def _parse_config_capacity(doc, version):
+    """校验容量节，返回 (队列上限, 最大等待毫秒, 队满策略)。
 
-    容量须恰含“队列上限/最大等待毫秒”，二者为非 bool int：队列上限
-    0..10000（0 表示不限），最大等待毫秒 >= 0（0 表示不限）。结构、类型或
-    值错均抛 ValueError。
+    v4..v8 容量须恰含“队列上限/最大等待毫秒”，迁移时队满策略补“拒绝”；
+    v9 须恰含“队列上限/最大等待毫秒/队满策略”。队列上限与最大等待毫秒为
+    非 bool int：队列上限 0..10000（0 表示不限），最大等待毫秒 >= 0（0
+    表示不限）；队满策略为 str 且仅“拒绝/替换”。结构、类型或值错均抛
+    ValueError。
     """
     raw = doc["容量"]
-    if not isinstance(raw, dict) or set(raw) != {"队列上限", "最大等待毫秒"}:
-        raise ValueError("容量 keys must be exactly 队列上限/最大等待毫秒")
+    if version >= 9:
+        if not isinstance(raw, dict) or set(raw) != {
+            "队列上限", "最大等待毫秒", "队满策略"
+        }:
+            raise ValueError(
+                "容量 keys must be exactly 队列上限/最大等待毫秒/队满策略"
+            )
+        policy = raw["队满策略"]
+        if not isinstance(policy, str) or policy not in _QUEUE_POLICIES:
+            raise ValueError(
+                "队满策略 must be one of 拒绝/替换, got "
+                f"{policy!r}"
+            )
+    else:
+        if not isinstance(raw, dict) or set(raw) != {"队列上限", "最大等待毫秒"}:
+            raise ValueError("容量 keys must be exactly 队列上限/最大等待毫秒")
+        # v1..v8 迁移：队满策略补“拒绝”。
+        policy = _QUEUE_POLICY_REJECT
     queue_limit = raw["队列上限"]
     max_wait = raw["最大等待毫秒"]
     if isinstance(queue_limit, bool) or not isinstance(queue_limit, int):
@@ -577,7 +595,7 @@ def _parse_config_capacity(doc):
         raise ValueError(f"最大等待毫秒 must be an int, got {type(max_wait).__name__}")
     if max_wait < 0:
         raise ValueError(f"最大等待毫秒 must be >= 0, got {max_wait}")
-    return queue_limit, max_wait
+    return queue_limit, max_wait, policy
 
 
 def _parse_config_auth(doc):
@@ -617,7 +635,7 @@ def _parse_config_doc(doc, default_auth=None):
     """由已解析对象文档校验并迁移为规范化 spec；任何错均抛 ValueError。
 
     spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
-    capacity, auth)，capacity 为 (队列上限, 最大等待毫秒)，auth 为
+    capacity, auth)，capacity 为 (队列上限, 最大等待毫秒, 队满策略)，auth 为
     (最大失败, 锁定毫秒)；pools 为按标识升序的 (标识, cidr, reserved,
     static) 元组，reserved/static 已规范化排序；templates 为按标识升序的
     (标识, 限速, 突发, 配额, 周期毫秒, 会话上限, 排队优先级, 超限) 元组，
@@ -627,20 +645,22 @@ def _parse_config_doc(doc, default_auth=None):
     等待毫秒）；v5（版本=5）增认证策略（最大失败/锁定毫秒）；v6（版本=6）
     模板项增会话上限（0..10000，0 不限）；v7（版本=7）模板项增周期毫秒
     （非负 int，0 表示不重置）；v8（版本=8）模板项增排队优先级（非 bool
-    int 0..100）。v1/v2 迁移时模板、用户模板为空；v1-v3 迁移时容量补默认
-    (1024, 0)；v1-v4 迁移时认证补 default_auth（认证器当前两值，缺省 None
-    时拒绝非 v5+ 文档）；v1-v5 迁移时模板会话上限补 0；v1-v6 迁移时模板
-    周期毫秒补 0；v1-v7 迁移时模板排队优先级补 0。重复/未知/缺失键、结构、
-    值、引用或版本错均抛 ValueError。
+    int 0..100）；v9（版本=9）容量节增队满策略（str，仅“拒绝/替换”，
+    键序 队列上限/最大等待毫秒/队满策略）。v1/v2 迁移时模板、用户模板为空；
+    v1-v3 迁移时容量补默认 (1024, 0, 拒绝)；v1-v8 迁移时队满策略补“拒绝”；
+    v1-v4 迁移时认证补 default_auth（认证器当前两值，缺省 None 时拒绝非
+    v5+ 文档）；v1-v5 迁移时模板会话上限补 0；v1-v6 迁移时模板周期毫秒补
+    0；v1-v7 迁移时模板排队优先级补 0；v8 只规范化容量旧两键。重复/未知/
+    缺失键、结构、值、引用或版本错均抛 ValueError。
     """
     if not isinstance(doc, dict):
         raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3, 4, 5, 6, 7, 8):
-        raise ValueError(f"版本 must be 1..8, got {version}")
-    if version in (5, 6, 7, 8):
+    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+        raise ValueError(f"版本 must be 1..9, got {version}")
+    if version in (5, 6, 7, 8, 9):
         if set(doc) != {
             "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"
         }:
@@ -715,10 +735,10 @@ def _parse_config_doc(doc, default_auth=None):
         # v1/v2 迁移：模板与用户模板均为空。
         templates, user_templates = (), ()
     if version >= 4:
-        capacity = _parse_config_capacity(doc)
+        capacity = _parse_config_capacity(doc, version)
     else:
-        # v1-v3 迁移：容量补默认 1024 项队列、不限等待。
-        capacity = (_MAX_QUEUE, 0)
+        # v1-v3 迁移：容量补默认 1024 项队列、不限等待、队满拒绝。
+        capacity = (_MAX_QUEUE, 0, _QUEUE_POLICY_REJECT)
     if version >= 5:
         auth = _parse_config_auth(doc)
     else:
@@ -741,7 +761,7 @@ def _parse_config_doc(doc, default_auth=None):
 
 
 def _config_payload(spec):
-    """由规范化 spec 构建 export/升级共用的 v8 配置 payload（固定键序与排序）。"""
+    """由规范化 spec 构建 export/升级共用的 v9 配置 payload（固定键序与排序）。"""
     (
         total,
         per,
@@ -750,7 +770,7 @@ def _config_payload(spec):
         pool_specs,
         templates,
         user_templates,
-        (queue_limit, max_wait_ms),
+        (queue_limit, max_wait_ms, queue_policy),
         (max_fail, lock_ms),
     ) = spec
     pools = [
@@ -792,6 +812,7 @@ def _config_payload(spec):
         "容量": {
             "队列上限": queue_limit,
             "最大等待毫秒": max_wait_ms,
+            "队满策略": queue_policy,
         },
         "认证": {
             "最大失败": max_fail,
@@ -801,7 +822,7 @@ def _config_payload(spec):
 
 
 def _compact_config(spec):
-    """spec 的 v8 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
+    """spec 的 v9 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
     return json.dumps(
         _config_payload(spec), ensure_ascii=False, separators=(",", ":")
     )
@@ -826,8 +847,8 @@ def _parse_upgrade_envelope(doc):
     """严格复核升级包对象，返回 (源版本, 目标版本, 改变, 摘要, spec)。
 
     文档须恰含“源版本/目标版本/改变/摘要/配置”五键（键序亦须如此），
-    源版本为 1..8 的非 bool int、目标版本恒为 8、改变为 bool 且等于
-    源版本 != 8、摘要为 str；配置须为能解析出 v8 spec 的对象，再将其
+    源版本为 1..9 的非 bool int、目标版本恒为 9、改变为 bool 且等于
+    源版本 != 9、摘要为 str；配置须为能解析出 v9 spec 的对象，再将其
     规范化重编码与文档原编码逐字节比对（拒键序/形态/值偏差），摘要须为
     规范配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写十六进制。任何不符
     均抛 ValueError。
@@ -852,8 +873,8 @@ def _parse_upgrade_envelope(doc):
     summary = doc["摘要"]
     if isinstance(source, bool) or not isinstance(source, int):
         raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
-    if source not in (1, 2, 3, 4, 5, 6, 7, 8):
-        raise ValueError(f"源版本 must be 1..8, got {source}")
+    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+        raise ValueError(f"源版本 must be 1..9, got {source}")
     if isinstance(target, bool) or not isinstance(target, int):
         raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
     if target != _CONFIG_VERSION:
@@ -875,7 +896,7 @@ def _parse_upgrade_envelope(doc):
     # 配置自 JSON 解析而来，再编码必成功；键序/排序/值偏差令两串不一致。
     original = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     if original != canonical:
-        raise ValueError("配置 must be a canonical v8 config object")
+        raise ValueError("配置 must be a canonical v9 config object")
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if summary != digest:
         raise ValueError("摘要 does not match the canonical config digest")
@@ -1001,6 +1022,7 @@ _CAP_CANCELLED = "取消"
 _CAP_TIMEOUT = "超时"
 _CAP_PROMOTED = "晋升"
 _CAP_QUEUE_FULL = "队满"
+_CAP_EVICTED = "淘汰"
 _CAP_AUTH_FAILED = "认证失败"
 _CAP_STATE_FAILED = "状态失败"
 _CAP_UNKNOWN = "未知"
@@ -1012,23 +1034,30 @@ _CAP_VERDICTS = (
     _CAP_TIMEOUT,
     _CAP_PROMOTED,
     _CAP_QUEUE_FULL,
+    _CAP_EVICTED,
     _CAP_AUTH_FAILED,
     _CAP_STATE_FAILED,
     _CAP_UNKNOWN,
 )
-# 仅排队相关事件携带正入队序，其余事件入队序恒为 0。
+# 仅排队相关事件携带正入队序，其余事件入队序恒为 0。淘汰事件携带被删旧项
+# 的原入队序（该序随即终结）。
 _CAP_VERDICTS_WITH_ORDER = frozenset(
-    (_CAP_QUEUED, _CAP_CANCELLED, _CAP_TIMEOUT, _CAP_PROMOTED)
+    (_CAP_QUEUED, _CAP_CANCELLED, _CAP_TIMEOUT, _CAP_PROMOTED, _CAP_EVICTED)
 )
 _MAX_QUEUE = 1024
 _MAX_QUEUE_LIMIT = 10000
+# v9 容量队满策略：拒绝沿用 ResourceError 与“队满”事件；替换按有效优先级
+# 原子淘汰最低值旧项（并列取入队序最大）。
+_QUEUE_POLICY_REJECT = "拒绝"
+_QUEUE_POLICY_REPLACE = "替换"
+_QUEUE_POLICIES = (_QUEUE_POLICY_REJECT, _QUEUE_POLICY_REPLACE)
 # QoS 模板并发会话上限：0..10000，0 表示不限。
 _MAX_TEMPLATE_SESSIONS = 10000
 # QoS 模板排队优先级：非 bool int 0..100，作为推进老化提升的基础值。
 _MAX_QUEUE_PRIORITY = 100
 # 有效优先级上界：min(1000, 基础 + 等待秒数)。
 _MAX_EFFECTIVE_PRIORITY = 1000
-_CONFIG_VERSION = 8
+_CONFIG_VERSION = 9
 # 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
 # 最旧项，当前修订永不淘汰。
 _CONFIG_HISTORY_LIMIT = 256
@@ -1181,24 +1210,26 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v8 配置 JSON（顶层键序
+    参数错与异参 key 重放不入链。export_config 导出 v9 配置 JSON（顶层键序
     版本/会话/地址池/模板/用户模板/容量/认证；会话与地址池沿用 v2，模板按
     标识升序、项键序标识/限速/突发/配额/周期毫秒/会话上限/排队优先级/超限
     （周期毫秒为非 bool 非负 int、0 不重置，会话上限 0 不限并发占用，占用为
     绑定模板用户的在线加挂起会话数，排队优先级为非 bool int 0..100）、用户
-    模板按用户升序、容量为队列上限/最大等待毫秒、认证为最大失败/锁定毫秒）；
+    模板按用户升序、容量为队列上限/最大等待毫秒/队满策略（策略 str 仅
+    “拒绝/替换”）、认证为最大失败/锁定毫秒）；
     upgrade_config(text,
-    target=8) 只读地把 v1..v8 配置升级为 v8 升级包 JSON（LF 尾紧凑；顶层序/型
-    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=8，
-    配置同 export_config 的 v8，摘要为配置紧凑编码 UTF-8 字节的 sha256
-    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 8，
-    源版本限 1..8，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
+    target=9) 只读地把 v1..v9 配置升级为 v9 升级包 JSON（LF 尾紧凑；顶层序/型
+    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=9，
+    配置同 export_config 的 v9，摘要为配置紧凑编码 UTF-8 字节的 sha256
+    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 9，
+    源版本限 1..9，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
     迁移沿 load_config 既有规则（v1 单池改 default、v1/v2 补空模板与用户模板、
-    v1-v3 补容量 1024/0、v1-v4 以认证器当前两值补认证、v1-v5 模板会话上限
-    补 0、v1-v6 模板周期毫秒补 0、v1-v7 模板排队优先级补 0、v8 只规范化），
+    v1-v3 补容量 1024/0/拒绝、v1-v4 以认证器当前两值补认证、v1-v5 模板会话上限
+    补 0、v1-v6 模板周期毫秒补 0、v1-v7 模板排队优先级补 0、v1-v8 容量队满
+    策略补“拒绝”、v9 只规范化），
     升级不改任何实例状态；
     load_config
-    直载 v1..v8 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
+    直载 v1..v9 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
     全验后原子替换并保存旧配置为唯一回滚点，升级包复核不符抛 ValueError，
     引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限、模板
     占用、租约或队长承载不满足抛 ResourceError，失败不改配置、回滚点、会话、
@@ -1230,7 +1261,7 @@ class Sessions:
     after!=-1 且该修订未保留抛 KeyError(after)；返回修订 > after 的升序前
     limit 项，顶层为“下个修订:int、项目:list”，无项下个修订=after，查询
     O(limit) 时空。
-    export/load/rollback 成功均返回 v8 配置 JSON，会话状态、期限、地址、租期与
+    export/load/rollback 成功均返回 v9 配置 JSON，会话状态、期限、地址、租期与
     旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
@@ -1265,8 +1296,9 @@ class Sessions:
     持址、不计在线但仍占全局与单用户上限；按 key 重放缓存与 do/meter
     分域；既有 do 建立仍立即拒绝、绝不入队。capacity_events(after,
     limit) 查询事件（游标与参数规则同 audit，查询不老化）：仅首个验参
-    成功的新 key 记事件，结果限在线/排队/取消/超时/晋升/队满/认证失败/
-    状态失败/未知，推进先记超时（按入队序）后记晋升（按尝试序），重放不记。capacity_stats
+    成功的新 key 记事件，结果限在线/排队/取消/超时/晋升/淘汰/队满/认证失败/
+    状态失败/未知，推进先记超时（按入队序）后记晋升（按尝试序），替换成功先
+    记旧项“淘汰”（原入队序）后记新项“排队”（新入队序），重放不记。capacity_stats
     (now_ms) 先验参再老化，输出全局在线/挂起/排队/可用/水位/最早截止
     与按标识升序的用户、池明细。clog(now_ms) 先验参再老化，输出检查点基线
     JSON：全量事件哈希链（事件键序序号/时刻/会话/结果/入队序/前哈希/
@@ -1589,9 +1621,11 @@ class Sessions:
         # 优先级为推进老化提升的基础值 0..100；用户模板：user -> 标识。
         self._templates = {}
         self._user_templates = {}
-        # 容量背压：队列上限（0 表示不限）、最大等待毫秒（0 表示不限）。
+        # 容量背压：队列上限（0 表示不限）、最大等待毫秒（0 表示不限）、
+        # 队满策略（拒绝/替换）。
         self._queue_limit = _MAX_QUEUE
         self._max_wait_ms = 0
+        self._queue_policy = _QUEUE_POLICY_REJECT
 
         # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
         #         "lease": int, "pool": str|None}
@@ -2159,6 +2193,21 @@ class Sessions:
             ):
                 occupancy += 1
         return occupancy
+
+    def _queue_effective(self, user, applied, now_ms):
+        """队项在 now_ms 的有效优先级（与推进同口径）：
+        min(1000, 基础+max(0,now_ms-申请时刻)//1000)，基础取此刻用户绑定
+        模板的排队优先级、未绑定为 0。O(1) 时空。"""
+        template_id = self._user_templates.get(user)
+        base = (
+            self._templates[template_id][5]
+            if template_id is not None
+            else 0
+        )
+        return min(
+            _MAX_EFFECTIVE_PRIORITY,
+            base + max(0, now_ms - applied) // 1000,
+        )
 
     def _template_limit_of(self, user):
         """用户所绑模板的并发会话上限；未绑定或模板无上限（0）返回 0。"""
@@ -7206,9 +7255,14 @@ class Sessions:
         BackendError（只入缓存，不老化、不认证、不入队、不记事件），健康
         才老化。通过该上界后申请先老化再认证：认证非 ok 抛 AuthError，
         sid 已存在（在线/挂起/下线会话或排队项）抛 StateError。非下线会话数
-        达全局/单用户上限或缺 default 池、无可取址则入队等待，需排队且队长
-        已达配置队列上限（0 表示不限，默认 1024）抛 ResourceError 并记既有
-        “队满”事件；否则原子建立在线会话，失败不留半分配。老化挂起即释址，
+        达全局/单用户上限或缺 default 池、无可取址则入队等待，需排队且非零
+        队限已满时按队满策略处理：“拒绝”沿用 ResourceError 与既有“队满”
+        事件；“替换”在 now_ms 按推进同口径公式算有效优先级（新项申请时刻
+        取 now_ms），旧项选有效值最低、并列取入队序最大者，新值严格更高才
+        原子删旧入新——先追加旧项“淘汰”（原入队序）再追加新项“排队”
+        （新入队序），返回“排队”，否则按“拒绝”处理。失败除既有老化、认证
+        副作用和“队满”事件外不改队列、入队序号或其他事件。否则原子建立在线
+        会话，失败不留半分配。老化挂起即释址，
         挂起会话不持址、不计在线，但仍占全局与单用户上限。
         取消未知 sid 抛 KeyError，sid 为非排队项抛 StateError。推进遇待触发
         且 now_ms>=触发值的全局超时演练（timeout_fault 注入）时，不老化、不
@@ -7225,9 +7279,10 @@ class Sessions:
         AuthError/ResourceError/StateError/KeyError，含验参异常）永久缓存，
         同参重放无副作用、直接返回或重抛，异参抛 ValueError；缓存与
         do/meter 分域。仅首个验参成功的新 key 记 capacity 事件，重放不记。
-        时间复杂度：申请 O(S+log A)、取消 O(Q)、推进
-        O(Q log Q+S+Q log A)（超时演练触发批为 O(S log A+Q)），辅助空间
-        O(Q)。
+        时间复杂度：申请 O(S+Q+log A)（替换策略满队时须扫全队选旧项，余为
+        O(S+log A)）、取消 O(Q)、推进
+        O(Q log Q+S+Q log A)（超时演练触发批为 O(S log A+Q)），申请辅助
+        空间 O(1)。
         """
         _check_credential("key", key)
 
@@ -7410,12 +7465,48 @@ class Sessions:
             self._cap_event(now_ms, sid, _CAP_ONLINE, 0)
             return self._render_capacity(sid, _CAP_ONLINE, now_ms, deadline)
 
-        # 在线满（含挂起占位）或缺址：入队等待，队列本身达上限则 ResourceError；
-        # 队列上限为 0 表示不限。
+        # 在线满（含挂起占位）或缺址：入队等待，队列本身达上限则按队满策略
+        # 处理；队列上限为 0 表示不限。
         if self._queue_limit != 0 and len(self._capacity_queue) >= self._queue_limit:
-            raise ResourceError(
-                f"capacity queue limit {self._queue_limit} reached"
-            )
+            if self._queue_policy != _QUEUE_POLICY_REPLACE:
+                raise ResourceError(
+                    f"capacity queue limit {self._queue_limit} reached"
+                )
+            # 替换：在 now_ms 按推进同口径算各队项与新项的有效优先级（新项
+            # 申请时刻取 now_ms），选有效值最低、并列取入队序最大的旧项。
+            new_effective = self._queue_effective(user, now_ms, now_ms)
+            victim_sid = None
+            victim_effective = None
+            victim_order = None
+            for queued_sid in self._queue_order:
+                entry = self._capacity_queue[queued_sid]
+                effective = self._queue_effective(entry[0], entry[1], now_ms)
+                order = entry[4]
+                if (
+                    victim_sid is None
+                    or effective < victim_effective
+                    or (effective == victim_effective and order > victim_order)
+                ):
+                    victim_sid = queued_sid
+                    victim_effective = effective
+                    victim_order = order
+            # 新值严格更高才原子删旧入新；否则按“拒绝”处理（ResourceError
+            # 由调用方记“队满”事件，队列、入队序号与其他事件均不变）。
+            if new_effective <= victim_effective:
+                raise ResourceError(
+                    f"capacity queue limit {self._queue_limit} reached"
+                )
+            victim_entry = self._capacity_queue.pop(victim_sid)
+            self._queue_order.remove(victim_sid)
+            # 先追加旧项“淘汰”（原入队序），再追加新项“排队”（新入队序）。
+            self._cap_event(now_ms, victim_sid, _CAP_EVICTED, victim_entry[4])
+            self._queue_seq += 1
+            order = self._queue_seq
+            self._capacity_queue[sid] = [user, now_ms, wait, deadline, order]
+            self._queue_order.append(sid)
+            self._cap_event(now_ms, sid, _CAP_QUEUED, order)
+            return self._render_capacity(sid, _CAP_QUEUED, now_ms, deadline)
+
         self._queue_seq += 1
         order = self._queue_seq
         self._capacity_queue[sid] = [user, now_ms, wait, deadline, order]
@@ -8859,8 +8950,8 @@ class Sessions:
 
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
-        模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒)，
-        认证为认证器当前 (最大失败, 锁定毫秒)。"""
+        模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒,
+        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒)。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -8888,12 +8979,12 @@ class Sessions:
             tuple(pool_specs),
             templates,
             user_templates,
-            (self._queue_limit, self._max_wait_ms),
+            (self._queue_limit, self._max_wait_ms, self._queue_policy),
             self._auth.policy(),
         )
 
     def export_config(self):
-        """导出当前配置为 v8 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
+        """导出当前配置为 v9 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
 
         顶层键序为“版本/会话/地址池/模板/用户模板/容量/认证”；会话键序为
         “总数/每用户/空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为
@@ -8902,23 +8993,25 @@ class Sessions:
         突发/配额/周期毫秒/会话上限/排队优先级/超限”，周期毫秒 0 表示不重置，
         会话上限 0 表示不限并发占用，排队优先级 0..100 为推进老化提升的基础
         值；用户模板为按用户升序的 [user, 标识] 二元串列表；容量键序为
-        “队列上限/最大等待毫秒”，0 分别表示不限队长与不限等待；认证键序为
+        “队列上限/最大等待毫秒/队满策略”，队列上限 0 表示不限队长、最大
+        等待毫秒 0 表示不限等待，队满策略为“拒绝/替换”；认证键序为
         “最大失败/锁定毫秒”，取认证器当前两值。
         """
         return _compact_config(self._current_spec()) + "\n"
 
-    def upgrade_config(self, text, target=8):
-        """只读地将 v1..v8 配置文本升级到 target（仅支持 8），返回升级包 JSON。
+    def upgrade_config(self, text, target=9):
+        """只读地将 v1..v9 配置文本升级到 target（仅支持 9），返回升级包 JSON。
 
         text 须为 str、target 须为非 bool int，否则抛 TypeError；源版本限
-        1..8 且 target 只许 8；JSON 解析、重复键、键缺失或未知、结构、值、
+        1..9 且 target 只许 9；JSON 解析、重复键、键缺失或未知、结构、值、
         引用或版本非法均抛 ValueError。迁移沿既有规则：v1 单池改 default，
-        v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0)，v1-v4 以认证器
-        当前两值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒补 0，
-        v1-v7 模板排队优先级补 0，v8 只规范化。返回基线格式的 LF 尾紧凑 JSON：
+        v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0, 拒绝)，v1-v4 以
+        认证器当前两值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒
+        补 0，v1-v7 模板排队优先级补 0，v1-v8 容量队满策略补“拒绝”，v9 只
+        规范化。返回基线格式的 LF 尾紧凑 JSON：
         顶层序/型为“源版本:int、目标版本:int、改变:bool、摘要:str、配置:
-        object”，改变 = 源版本 != 8；配置逐层键序、类型与排序同
-        export_config() 的 v8；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
+        object”，改变 = 源版本 != 9；配置逐层键序、类型与排序同
+        export_config() 的 v9；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
         sha256 小写值。升级只读，不触碰任何实例状态；时/空上界 O(n log n)/
         O(n)。
         """
@@ -8960,7 +9053,7 @@ class Sessions:
             pool_specs,
             templates,
             user_templates,
-            (queue_limit, _max_wait_ms),
+            (queue_limit, _max_wait_ms, _queue_policy),
             _auth_policy,
         ) = spec
         total_count = 0
@@ -9075,7 +9168,7 @@ class Sessions:
             _pool_specs,
             templates,
             user_templates,
-            (queue_limit, max_wait_ms),
+            (queue_limit, max_wait_ms, queue_policy),
             (max_fail, lock_ms),
         ) = spec
         self._total = total
@@ -9094,6 +9187,7 @@ class Sessions:
         self._user_templates = dict(user_templates)
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
+        self._queue_policy = queue_policy
         # 认证策略随配置提交；认证记录（凭据、失败计数、锁定）保留。
         self._auth.set_policy(max_fail, lock_ms)
         # 计量账本：同标识原样保留 u/t/c；周期窗由 _meter/quota_stats 按新
@@ -9196,15 +9290,15 @@ class Sessions:
         return spec, self._build_pools(spec)
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v8 JSON。
+        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v9 JSON。
 
-        直载 v1..v8 配置，或加载 upgrade_config 产出的升级包；升级包须复核
+        直载 v1..v9 配置，或加载 upgrade_config 产出的升级包；升级包须复核
         键序、字段、配置规范形态与摘要，任一不符抛 ValueError。text 非 str
         抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、值、重复项或
         引用（用户模板引用未注册用户或未知模板标识）错抛 ValueError；上限、
         模板占用、租约或队长承载不满足抛 ResourceError。v1-v4 迁移时认证节
         补认证器当前两值，v1-v5 迁移时模板会话上限补 0，v1-v6 迁移时模板
-        周期毫秒补 0。全部校验通过后原子提交：失败不改配置、历史、回滚点、
+        周期毫秒补 0，v1-v8 迁移时容量队满策略补“拒绝”。全部校验通过后原子提交：失败不改配置、历史、回滚点、
         会话、租约与运行态；成功不老化，会话与租约不变，计量账本同标识原样
         保留 u/t/c 并自新模板周期毫秒 P 即时判窗，认证策略随配置替换但认证
         记录（凭据、失败计数、锁定）保留，新值仅作用于后续操作与查询。成功
@@ -9224,7 +9318,7 @@ class Sessions:
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v8 JSON。
+        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v9 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点、
         历史或运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，生成
@@ -9269,7 +9363,7 @@ class Sessions:
 
         left/right 须为非 bool 非负 int：类型错抛 TypeError，负值抛
         ValueError；校验后依 left、right 次序在保留窗口（最近 256 项）查找，
-        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v8
+        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v9
         配置：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或两侧节点
         JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再下探，
         同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer：
@@ -9310,7 +9404,7 @@ class Sessions:
             )
 
         def json_type(value):
-            # 规范 v8 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            # 规范 v9 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
             if value is None:
                 return "null"
             if isinstance(value, bool):
@@ -9392,14 +9486,14 @@ class Sessions:
         JSON；不老化、不缓存、不审计，不改配置、修订、历史、回滚点及任何运行
         态，同态同参逐字节相同。
 
-        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v8 配置或经
+        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v9 配置或经
         严格复核的升级包，解析、重键、键集/键序、结构、类型、值、排序或引用
         错抛 ValueError，当前会话上限、模板占用、队长或在租租约不能承载抛
         ResourceError；校验次序与 load_config 完全一致（共用 _parse_config_text：
         先解析/迁移并复核升级包，再校验用户模板引用，最后做承载校验），承载
         校验只构造临时池表、不触碰实例状态。
 
-        预检文本先规范化为 v8 spec，再与当前配置（_current_spec() 的规范 v8
+        预检文本先规范化为 v9 spec，再与当前配置（_current_spec() 的规范 v9
         形态）递归比较：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或
         两侧节点 JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再
         下探，同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer
@@ -9410,7 +9504,7 @@ class Sessions:
 
         顶层键序/型为“修订:int、当前摘要:str、目标摘要:str、改变:bool、
         变更:list、摘要:str”；修订与当前摘要沿 config_revision（修订号、当前
-        export 去 LF 的 sha256），目标摘要为规范 v8 对象紧凑编码 UTF-8 字节的
+        export 去 LF 的 sha256），目标摘要为规范 v9 对象紧凑编码 UTF-8 字节的
         sha256 小写值，摘要覆盖前五键（前五键同法编码之 UTF-8 字节 sha256），
         改变恰为变更列表非空。时间 O(n log n + S + Q + D log D)、辅助空间
         O(n + D)（外加两份规范配置），n 为配置规模、S/Q 为会话与等待队列规模、
@@ -9433,7 +9527,7 @@ class Sessions:
             )
 
         def json_type(value):
-            # 规范 v8 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            # 规范 v9 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
             if value is None:
                 return "null"
             if isinstance(value, bool):
@@ -9738,7 +9832,7 @@ class Sessions:
         回滚点未知。锚后逐项先按 config_history_verify 契约校验字段、修订链、
         操作/目标、快照摘要与哈希链（快照/哈希编码失败各归同名原因），再按提交
         语义演算：构造仅生成修订 0；加载/CAS 取本项快照为新当前态；回退须目标
-        快照在册且本项快照与其规范 v8 JSON 逐字节相同；加载/CAS/回退均保存前态
+        快照在册且本项快照与其规范 v9 JSON 逐字节相同；加载/CAS/回退均保存前态
         为回滚点；回滚须回滚点已知且本项快照与其逐字节相同，随后清除回滚点。
         演算依赖（回退目标快照、回滚点）随窗口淘汰而不可知时归“边界”。
 
@@ -9907,7 +10001,7 @@ class Sessions:
                         if same is None:
                             broken = (revision, "快照")
                         elif not same:
-                            # 本项快照与目标快照规范 v8 JSON 不逐字节相同。
+                            # 本项快照与目标快照规范 v9 JSON 不逐字节相同。
                             broken = (revision, "回退")
                         else:
                             new_current, new_rollback = spec, current
@@ -10016,7 +10110,7 @@ class Sessions:
         (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。候选按审计
         序号升序收集：仅取由同键索引指认的原序号 0 首次事件，且缓存原调为
         成功的加载/回滚（失败、升级、重放与未指认事件不入候选）；其首果配置
-        为缓存返回的 v8 JSON，摘要按 config_revision 既有口径（去尾 LF 的
+        为缓存返回的 v9 JSON，摘要按 config_revision 既有口径（去尾 LF 的
         UTF-8 字节 sha256）求。再按修订升序扫描在册“加载/回滚”记录做配对：
         候选仅允许丢弃一段连续前缀作为已淘汰边界（其数量不得超过已淘汰修订
         数，且由反向就近同 (操作, 摘要) 对齐定切点）；其余候选必须与记录形成
@@ -10159,7 +10253,7 @@ class Sessions:
         # 候选选取（审计序号升序；时间 O(A)、不在此步算配置摘要）：事务候选
         # 仅取 config_change 域“键 → 首次事件序号”索引指认
         # （cindex[事件键] == 序号）的原序号 0 事件，且该键缓存原调为成功的
-        # 加载/回滚（首果 ("ok", v8 JSON 文本)）；失败、升级、重放与未被同键
+        # 加载/回滚（首果 ("ok", v9 JSON 文本)）；失败、升级、重放与未被同键
         # 索引指认的事件一律不是候选。每个在册修订至多消费一个候选，故事务候
         # 选与在册 load/rollback 记录的保序配对所用候选必为候选序列的一个后缀
         # （更早的成功首调皆对应已淘汰修订，为可信边界前缀）：自链尾反向仅收
@@ -10215,7 +10309,7 @@ class Sessions:
         # 早于末 R 个候选的事务首调必对应已淘汰修订（在册记录至多消费 R 个，
         # 且配对候选为候选序列后缀）：其数量即不经哈希即采信的淘汰前缀。
         pre_eliminated = max(0, total_candidates - pair_cap)
-        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v8 配置 JSON 去尾 LF 后
+        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v9 配置 JSON 去尾 LF 后
         # 的 UTF-8 字节 sha256 小写值（同 config_revision/历史摘要）。
         candidates = []
         for fseq, ckey, cache in window_rev:
@@ -10741,7 +10835,7 @@ class Sessions:
         缓存但不审计。
 
         首次合法调用分别执行既有 load_config(text)/rollback_config()/
-        upgrade_config(text, 8)：成功原样返回其 JSON；加载时配置非法抛
+        upgrade_config(text, 9)：成功原样返回其 JSON；加载时配置非法抛
         ValueError、承载冲突抛 ResourceError、无回滚点抛 StateError，升级只读
         （不触碰配置、运行态与回滚点），异常类型与 args 一并缓存。除缓存、
         审计外，失败不得改变配置、回滚点、用户、会话、租约、队列、统计或故障态。
