@@ -184,7 +184,7 @@ class UserStatsFailureTest(unittest.TestCase):
             s.capacity("c1", "取消", "s1", None, 10)
         # 队满：队列上限 1，per 满使申请入队，第二项队满计资源（bob 名下）。
         doc = json.loads(s.export_config())
-        doc["容量"] = {"队列上限": 1, "最大等待毫秒": 0}
+        doc["容量"] = {"队列上限": 1, "最大等待毫秒": 0, "队满策略": "拒绝"}
         s.load_config(json.dumps(doc, ensure_ascii=False))
         s.capacity("c2", "申请", "q1", ("bob", "pw", 100), 20)
         with self.assertRaises(ResourceError):

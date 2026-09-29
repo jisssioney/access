@@ -302,7 +302,7 @@ class CapacityBackendCheckTest(unittest.TestCase):
     def test_max_wait_error_precedes_backend_check(self):
         _auth, s = make()
         doc = json.loads(s.export_config())
-        doc["容量"] = {"队列上限": 1024, "最大等待毫秒": 100}
+        doc["容量"] = {"队列上限": 1024, "最大等待毫秒": 100, "队满策略": "拒绝"}
         s.load_config(json.dumps(doc, ensure_ascii=False))
         s.fault("fi", "注入", 1000, 0)
         with self.assertRaises(ValueError):
