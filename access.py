@@ -6,7 +6,12 @@
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、只读审计窗口快照
   audit_snapshot/verify_audit_snapshot（版本 1，锚哈希取锚项、摘要盖前六键，
-  校验结构错抛 ValueError、与当前链不符返 False）、配置导出/升级/加载/回滚
+  校验结构错抛 ValueError、与当前链不符返 False）与 audit_restore 分页原子
+  接入（版本 1 规范快照全验后一次追加到链尾，锚须恰为链尾否则
+  StateError(锚序号,当前末序号)，原序号/键序/类型沿用快照，不恢复会话/
+  配置/缓存且操作本身不写审计；独立域只缓存成功，同型同 text 重放原字节
+  不追加、异参 ValueError；返回 追加/末序号/末哈希/摘要 LF 尾紧凑 JSON，
+  空页追加 0，O(limit)/O(limit)）、配置导出/升级/加载/回滚
   export_config/upgrade_config/load_config/rollback_config、修订查询/CAS 提交/
   历史回退 config_revision/config_cas/config_revert（构造态为修订 0，保留最近
   256 个配置修订供回退）、防篡改配置历史 config_history（构造即记录修订 0，
@@ -1626,6 +1631,10 @@ class Sessions:
         # （含参数错）不占 key。
         self._fault_restore_cache = {}
         self._fault_restore_chain_index = {}
+        # audit_restore 审计快照恢复的重放缓存，与其余各域独立：
+        # key -> (text, 结果 JSON)；仅首次成功缓存，失败（含参数错与锚不符）
+        # 不占 key。恢复本身不写审计：接入的仅为快照页事件原负载。
+        self._audit_restore_cache = {}
         # timeout_sweep 超时清扫的重放缓存，与其余各域独立：
         # key -> (now_ms, limit, 结果 JSON)；仅首次成功缓存，失败不占 key。
         self._timeout_sweep_cache = {}
@@ -10255,6 +10264,217 @@ class Sessions:
                 return False
             prev_hash = given_digest
         return True
+
+    def audit_restore(self, key, text):
+        """把版本 1 审计快照分页结果原子接入当前防篡改审计链尾，返回结果 JSON。
+
+        key 沿用凭据约束（型/值错抛 TypeError/ValueError），text 非 str 抛
+        TypeError。text 须为版本 1 规范快照：逐层键序/类型、事件九键序与
+        LF 尾紧凑 JSON 沿用 audit_snapshot 契约。JSON 解析或重键、非规范
+        编码（摘要不符或非 audit_snapshot 的 LF 尾紧凑字节）、取值范围、
+        版本、事件数超过上限、序号不连续、游标不等于空窗锚或末项序号、
+        原序号非 0 且不小于本项序号、前哈希衔接或事件哈希错误均抛
+        ValueError。当前链末尾须恰等于快照锚序号/锚哈希，否则抛
+        StateError(锚序号, 当前末序号)。
+
+        全部校验通过后一次性把页内事件按原负载接入：锚序号即当前末序号，
+        故页内事件接入后的序号位、前哈希与哈希均与快照原值逐字段一致
+        （页内衔接已核对、锚哈希已等于链尾），原序号字段沿用快照原值
+        （不恢复链 key 首次序号索引）；不恢复会话、配置或业务缓存，恢复
+        操作本身不写审计。任何失败此前已抛出，绝不产生追加。空页追加 0。
+
+        重放缓存与各域独立且只缓存成功：同型同 text 重放直接返回首次结果
+        原字节且不追加，异参抛 ValueError，失败（含参数错与锚不符）不占
+        key。返回 LF 尾紧凑 JSON（ensure_ascii=False、separators=(',',':')），
+        键序/型为“追加:int/末序号:int/末哈希:str/摘要:str”，摘要为前三键
+        同法编码的 UTF-8 字节 sha256 小写值。不老化。时间 O(limit)、
+        辅助空间 O(limit)。
+        """
+        _check_credential("key", key)
+
+        cached = self._audit_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不追加、不老化，仅核对同型同 text，返回缓存原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        anchor_seq, anchor_hash, events = self._parse_audit_snapshot_page(text)
+
+        # 锚点必须恰为当前链末：锚序号等于末项序号且锚哈希等于末项哈希；
+        # 空链末序号为 0、末哈希为 64 个 0。
+        total = len(self._chain_events)
+        if anchor_seq != total or anchor_hash != self._chain_tail:
+            raise StateError(anchor_seq, total)
+
+        # 全验后一次性接入：锚点即链尾，页内事件接入后的序号位、前哈希与
+        # 哈希均与快照原值逐字段一致（锚前哈希已衔接、哈希已重算核对），
+        # 故直接以解析元组整体 extend 并翻尾哈希；本处之前的任何失败都不
+        # 触碰链状态。原序号字段原样保留，且不登记任何 key 首次序号索引。
+        self._chain_events.extend(events)
+        if events:
+            self._chain_tail = events[-1][8]
+
+        appended = len(events)
+        rendered = self._render_audit_restore(
+            appended, total + appended, self._chain_tail
+        )
+        self._audit_restore_cache[key] = (text, rendered)
+        return rendered
+
+    def _parse_audit_snapshot_page(self, text):
+        """解析并自校验版本 1 审计快照分页文本，返回
+        (锚序号, 锚哈希, 事件九元组列表)；任何文本非法均抛 ValueError。
+
+        逐层键集/键序、类型、范围、版本、事件数超上限、序号自锚序号连续、
+        游标（空窗等于锚序号、否则等于末项序号）、原序号关系（非 0 时须
+        小于本项序号）、前哈希衔接、事件哈希、顶层摘要（前六键规范紧凑
+        JSON 的 sha256）及整体逐字节规范性（恰为 audit_snapshot 的 LF 尾
+        紧凑 JSON）逐项校验。仅做快照自洽校验，锚点与当前链是否相符由
+        调用方判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"audit snapshot is not valid JSON: {exc}") from exc
+        top_keys = ["版本", "锚序号", "锚哈希", "上限", "下个序号", "事件", "摘要"]
+        if not isinstance(doc, dict) or list(doc) != top_keys:
+            raise ValueError(
+                "audit snapshot top-level keys must be "
+                "版本/锚序号/锚哈希/上限/下个序号/事件/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        anchor_seq = self._cp_int(doc["锚序号"], "锚序号", 0)
+        anchor_hash = self._cp_hex64(doc["锚哈希"], "锚哈希")
+        limit = self._cp_int(doc["上限"], "上限", 1)
+        if limit > 1000:
+            raise ValueError(f"上限 must be <= 1000, got {limit}")
+        next_seq = self._cp_int(doc["下个序号"], "下个序号", 0)
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        event_keys = [
+            "序号",
+            "时刻",
+            "键",
+            "操作",
+            "会话",
+            "结果",
+            "原序号",
+            "前哈希",
+            "哈希",
+        ]
+        raw_events = doc["事件"]
+        if not isinstance(raw_events, list):
+            raise ValueError("事件 must be a list")
+        events = []
+        prev_hash = anchor_hash
+        expect_seq = anchor_seq + 1
+        for index, item in enumerate(raw_events, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    f"snapshot event {index} keys must be "
+                    "序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(item["序号"], "事件.序号", 1)
+            now_ms = self._cp_int(item["时刻"], "事件.时刻", 0)
+            ekey = item["键"]
+            op = item["操作"]
+            sid = item["会话"]
+            result = item["结果"]
+            for label, value in (
+                ("事件.键", ekey),
+                ("事件.操作", op),
+                ("事件.会话", sid),
+                ("事件.结果", result),
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"{label} must be a str, got {type(value).__name__}"
+                    )
+            origin = self._cp_int(item["原序号"], "事件.原序号", 0)
+            given_prev = self._cp_hex64(item["前哈希"], "事件.前哈希")
+            given_digest = self._cp_hex64(item["哈希"], "事件.哈希")
+            if seq != expect_seq:
+                raise ValueError(
+                    f"snapshot event {index} 序号 must be consecutive from "
+                    f"{anchor_seq + 1}, got {seq}"
+                )
+            expect_seq += 1
+            if given_prev != prev_hash:
+                raise ValueError(
+                    f"snapshot event {index} 前哈希 does not chain to anchor"
+                )
+            if (
+                self._chain_hash(
+                    seq, now_ms, ekey, op, sid, result, origin, given_prev
+                )
+                != given_digest
+            ):
+                raise ValueError(f"snapshot event {index} 哈希 does not match")
+            if origin != 0 and origin >= seq:
+                raise ValueError(
+                    f"snapshot event {index} 原序号 must be 0 or < 序号, "
+                    f"got {origin} >= {seq}"
+                )
+            events.append(
+                (seq, now_ms, ekey, op, sid, result, origin, given_prev,
+                 given_digest)
+            )
+            prev_hash = given_digest
+
+        if len(events) > limit:
+            raise ValueError(
+                f"事件 count {len(events)} must be <= 上限 {limit}"
+            )
+        expected_next = events[-1][0] if events else anchor_seq
+        if next_seq != expected_next:
+            raise ValueError(
+                f"下个序号 must equal "
+                f"{'the anchor for an empty window' if not events else 'the last event 序号'}, "
+                f"got {next_seq}, expected {expected_next}"
+            )
+        # 摘要盖前六键：规范紧凑重排与生成端逐字节一致。text 须为版本 1
+        # 规范快照（LF 尾紧凑 JSON，沿用 audit_snapshot 契约）：除摘要须吻合
+        # 外，再以前六键重排并补上摘要做逐字节比对，任何排版/空白/转义/尾
+        # LF 差异等非规范编码均判 ValueError。
+        head = {
+            "版本": version,
+            "锚序号": anchor_seq,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": raw_events,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical audit snapshot")
+        canonical = (
+            json.dumps(
+                {**head, "摘要": summary},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        if text != canonical:
+            raise ValueError("audit snapshot must be the canonical compact JSON with LF")
+        return anchor_seq, anchor_hash, events
+
+    @staticmethod
+    def _render_audit_restore(appended, tail_seq, tail_hash):
+        # 键序：追加/末序号/末哈希/摘要；摘要盖前三键紧凑 JSON 的 UTF-8 字节。
+        head = {"追加": appended, "末序号": tail_seq, "末哈希": tail_hash}
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        head["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(head, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
     def _render_meter(sid, now_ms, size, result, used):
