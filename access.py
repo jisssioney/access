@@ -6,7 +6,10 @@
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、只读审计窗口快照
   audit_snapshot/verify_audit_snapshot（版本 1，锚哈希取锚项、摘要盖前六键，
-  校验结构错抛 ValueError、与当前链不符返 False）、配置导出/升级/加载/回滚
+  校验结构错抛 ValueError、与当前链不符返 False）、审计快照原子接尾恢复
+  audit_restore（版本 1 规范快照严格全验，锚点不符 StateError(锚序号,末序号)，
+  全验后一次追加且不恢复幂等索引、恢复不写审计，仅缓存成功、同参重放原字节，
+  返回 追加/末序号/末哈希/摘要）、配置导出/升级/加载/回滚
   export_config/upgrade_config/load_config/rollback_config、修订查询/CAS 提交/
   历史回退 config_revision/config_cas/config_revert（构造态为修订 0，保留最近
   256 个配置修订供回退）、防篡改配置历史 config_history（构造即记录修订 0，
@@ -1447,6 +1450,19 @@ class Sessions:
     紧凑 JSON UTF-8 字节的 sha256 小写值；ensure_ascii=False、
     separators=(',',':')、LF 结尾，同态同参同字节。O(S+Q+K+CP+P log P)
     时间、O(CP+K) 辅助空间，C/P/K 为场景数/池并集数/步骤总数。
+    audit_restore(key, text) 将 audit_snapshot 分页结果原子接入防篡改审计链：
+    key 沿用凭据约束，text 非 str 抛 TypeError；text 须为版本 1 规范快照
+    （逐层键集/键序与类型、事件九键序、LF 尾紧凑 JSON 沿用现有契约），解析或
+    重键、非规范编码、范围、事件数超过上限、序号不连续、游标不等于空窗锚或
+    末项、原序号非 0 且不小于本项序号、前哈希/哈希/摘要错误均抛 ValueError。
+    结构全验后当前链末尾须恰等于快照锚序号/锚哈希，否则抛
+    StateError(锚序号, 当前末序号)。全验后一次追加窗口事件；不恢复会话、配置、
+    业务缓存或操作幂等（原序号）索引，恢复不写审计，失败不追加。不老化。
+    验 key 后以独立缓存且仅缓存成功：同型同 text 重放原字节且不追加，异参
+    ValueError，失败不占 key。成功返回 LF 尾紧凑 JSON（ensure_ascii=False、
+    separators=(',',':')），键序/型 追加:int/末序号:int/末哈希:str/摘要:str，
+    摘要为前三键同法编码 UTF-8 字节的 sha256 小写值；空页追加 0。
+    O(limit) 时间、O(limit) 空间。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1639,6 +1655,10 @@ class Sessions:
         # 参数错不占 key。预检永不缓存。
         self._fault_plan_cache = {}
         self._fault_plan_chain_index = {}
+        # audit_restore 审计窗口快照恢复的重放缓存，与其余各域独立：
+        # key -> (text, 结果 JSON)；仅首次成功缓存，失败（含参数错与
+        # StateError）不占 key。恢复不写审计链，故无原序号索引。
+        self._audit_restore_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -10255,6 +10275,237 @@ class Sessions:
                 return False
             prev_hash = given_digest
         return True
+
+    def audit_restore(self, key, text):
+        """将版本 1 审计窗口快照分页结果原子接入当前防篡改审计链尾，返回
+        LF 结尾紧凑 JSON。
+
+        key 沿用凭据约束（型/值错 TypeError/ValueError），text 须为 str
+        （非 str 抛 TypeError）。text 须为版本 1 规范快照：逐层键集/键序与
+        类型、事件九键序、范围、事件数不超过上限、序号自锚序号起逐项连续、
+        游标等于末项序号（空窗等于锚序号）、原序号非 0 时须小于本项序号、
+        事件前哈希衔接且哈希、顶层摘要均须正确，且整体须为与 audit_snapshot
+        同法（ensure_ascii=False、separators=(',',':')、单个 LF 结尾）的
+        规范编码；解析或重键及以上任一不符抛 ValueError。
+
+        结构全验后核对锚点：当前链末尾须恰等于快照锚序号/锚哈希，否则抛
+        StateError(锚序号, 当前末序号) 且不追加。通过后一次性把窗口事件按
+        原九元组（含原序号、键、时刻、前哈希/哈希）接到链尾；不恢复会话、
+        配置、业务缓存或任何操作幂等（原序号）索引，恢复动作本身不写审计，
+        任何失败均不追加。不老化。
+
+        验 key 后以独立缓存域且仅缓存成功：同型同 text 重放不解析、不重验、
+        不追加，直接返回首次结果原字节，异参抛 ValueError；失败（含参数错与
+        StateError）不占 key。返回键序“追加/末序号/末哈希/摘要”：追加:int、
+        末序号:int、末哈希:str，摘要为前三键同法紧凑编码 UTF-8 字节的
+        sha256 小写值；空页追加 0。O(limit) 时间、O(limit) 空间。
+        """
+        _check_credential("key", key)
+
+        cached = self._audit_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不重验、不追加，仅核对同型同 text 后返回原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        anchor_seq, anchor_hash, events = self._parse_audit_restore_snapshot(text)
+
+        # 锚点：当前链末尾（空链为序号 0、64 个 0）须恰为快照锚；不符即
+        # StateError(锚序号, 当前末序号)，发生在任何追加之前。
+        tail_seq = len(self._chain_events)
+        tail_hash = self._chain_tail if tail_seq else "0" * 64
+        if anchor_seq != tail_seq or anchor_hash != tail_hash:
+            raise StateError(anchor_seq, tail_seq)
+
+        # 全验后一次追加：事件九元组原样接尾（序号即锚后连续位置），仅推进
+        # 链序列与末哈希；不动任何原序号索引（操作幂等不恢复），恢复不入审计。
+        self._chain_events.extend(events)
+        if events:
+            self._chain_tail = events[-1][8]
+
+        appended = len(events)
+        result = self._render_audit_restore(
+            appended, tail_seq + appended, self._chain_tail
+        )
+        self._audit_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_audit_restore_snapshot(self, text):
+        """解析并严格全量校验版本 1 审计窗口快照文本，返回
+        (锚序号, 锚哈希, 事件九元组列表)；任何不符规范契约处均抛 ValueError。
+
+        与 verify_audit_snapshot 的“与当前链不符返 False”不同，本校验供
+        audit_restore 使用，一切不符（含非规范编码）皆为 ValueError：
+        JSON 解析或重键失败；顶层非恰为
+        版本/锚序号/锚哈希/上限/下个序号/事件/摘要且键序如此；版本非 1；
+        锚序号/上限/下个序号非非 bool int 或越界（锚序号>=0、上限 1..1000、
+        下个序号>=0），锚哈希/摘要非 64 位小写十六进制；事件非列表或项数超过
+        上限；事件项非恰为九键序，序号/时刻/原序号非非 bool int 或越界
+        （序号>=1、时刻>=0、原序号>=0），四个负载字段非 str；序号须自锚序号
+        +1 起逐项连续；原序号非 0 时须小于本项序号；前哈希须逐项衔接锚哈希、
+        哈希须重算相符；下个序号须等于末项序号、空窗等于锚序号；摘要须等于
+        前六键规范化紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值。最后以解析
+        值按 audit_snapshot 基线重建完整文档（单个 LF 结尾），与原文逐字节
+        不一致即非规范编码 ValueError。仅做快照自洽校验，不读当前链。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"audit snapshot is not valid JSON: {exc}") from exc
+        top_keys = ["版本", "锚序号", "锚哈希", "上限", "下个序号", "事件", "摘要"]
+        if not isinstance(doc, dict) or list(doc) != top_keys:
+            raise ValueError(
+                "audit snapshot top-level keys must be "
+                "版本/锚序号/锚哈希/上限/下个序号/事件/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        anchor_seq = self._cp_int(doc["锚序号"], "锚序号", 0)
+        anchor_hash = self._cp_hex64(doc["锚哈希"], "锚哈希")
+        limit = self._cp_int(doc["上限"], "上限", 1)
+        if limit > 1000:
+            raise ValueError(f"上限 must be <= 1000, got {limit}")
+        next_seq = self._cp_int(doc["下个序号"], "下个序号", 0)
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        event_keys = [
+            "序号",
+            "时刻",
+            "键",
+            "操作",
+            "会话",
+            "结果",
+            "原序号",
+            "前哈希",
+            "哈希",
+        ]
+        raw_events = doc["事件"]
+        if not isinstance(raw_events, list):
+            raise ValueError("事件 must be a list")
+        if len(raw_events) > limit:
+            raise ValueError(
+                f"事件 count {len(raw_events)} exceeds 上限 {limit}"
+            )
+
+        events = []
+        prev_hash = anchor_hash
+        expect_seq = anchor_seq + 1
+        for index, item in enumerate(raw_events, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    f"snapshot event {index} keys must be "
+                    "序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(item["序号"], "事件.序号", 1)
+            now_ms = self._cp_int(item["时刻"], "事件.时刻", 0)
+            key = item["键"]
+            op = item["操作"]
+            sid = item["会话"]
+            result = item["结果"]
+            for label, value in (
+                ("事件.键", key),
+                ("事件.操作", op),
+                ("事件.会话", sid),
+                ("事件.结果", result),
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"{label} must be a str, got {type(value).__name__}"
+                    )
+            origin = self._cp_int(item["原序号"], "事件.原序号", 0)
+            given_prev = self._cp_hex64(item["前哈希"], "事件.前哈希")
+            digest = self._cp_hex64(item["哈希"], "事件.哈希")
+
+            if seq != expect_seq:
+                raise ValueError(
+                    f"snapshot event seq must be contiguous from the anchor: "
+                    f"want {expect_seq}, got {seq}"
+                )
+            if origin != 0 and origin >= seq:
+                raise ValueError(
+                    f"snapshot event {seq} 原序号 must be 0 or < {seq}, got {origin}"
+                )
+            if given_prev != prev_hash:
+                raise ValueError(
+                    f"snapshot event {seq} 前哈希 does not link to the prior hash"
+                )
+            if (
+                self._chain_hash(
+                    seq, now_ms, key, op, sid, result, origin, given_prev
+                )
+                != digest
+            ):
+                raise ValueError(f"snapshot event {seq} 哈希 does not match")
+            events.append(
+                (seq, now_ms, key, op, sid, result, origin, given_prev, digest)
+            )
+            prev_hash = digest
+            expect_seq += 1
+
+        expected_next = events[-1][0] if events else anchor_seq
+        if next_seq != expected_next:
+            raise ValueError(
+                f"下个序号 must equal the last event seq (or 锚序号 for an empty "
+                f"window): want {expected_next}, got {next_seq}"
+            )
+
+        # 摘要：以解析值规范化重建前六键（数值/结构相等即与生成端基线逐字节
+        # 一致），重算 sha256。
+        head = {
+            "版本": 1,
+            "锚序号": anchor_seq,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": [
+                {
+                    "序号": seq,
+                    "时刻": now_ms,
+                    "键": key,
+                    "操作": op,
+                    "会话": sid,
+                    "结果": result,
+                    "原序号": origin,
+                    "前哈希": given_prev,
+                    "哈希": digest,
+                }
+                for seq, now_ms, key, op, sid, result, origin, given_prev, digest in (
+                    events
+                )
+            ],
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical audit snapshot")
+
+        # 非规范编码：完整七键文档（单个 LF 结尾）须与原文逐字节一致；
+        # 任何排版差异（空白、Unicode 转义、键序、数值写法、多余/缺失 LF）
+        # 皆拒绝。
+        canonical = json.dumps(
+            {**head, "摘要": summary},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n"
+        if canonical != text:
+            raise ValueError("audit snapshot is not canonical compact JSON")
+        return anchor_seq, anchor_hash, events
+
+    @staticmethod
+    def _render_audit_restore(appended, tail_seq, tail_hash):
+        # 键序：追加、末序号、末哈希（int/int/str），摘要盖前三键同法编码的
+        # UTF-8 字节 sha256 小写值；LF 尾紧凑 JSON。
+        head = {"追加": appended, "末序号": tail_seq, "末哈希": tail_hash}
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        head["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(head, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
     def _render_meter(sid, now_ms, size, result, used):
