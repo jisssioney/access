@@ -17,7 +17,10 @@
   快照同寿命 256 项、淘汰不缝合前哈希）、QoS 模板查询 qos、按
   (用户,模板) 共享账本计量的 meter、配额只读快照 quota_stats、共享账本检查点
   quota_checkpoint 与按 key 原子恢复 quota_restore、按用户/模板分组的
-  计量统计 meter_stats、容量申请
+  计量统计 meter_stats、统计检查点 stats_checkpoint 与按 key 原子恢复
+  stats_restore（版本 1，覆盖建立计数、按用户失败与用户/模板计量，摘要盖
+  前五键；未知用户引用 ResourceError、模板不验引用，仅缓存成功、同参重放
+  原字节，不老化不审计）、容量申请
   capacity：可配置队列上限与最大等待的申请/取消/推进，截止超时与按有效
   优先级（QoS 模板排队优先级随等待老化）确定性晋升、
   capacity_events 事件查询与 capacity_stats 容量统计）；clog/cverify/
@@ -1629,6 +1632,9 @@ class Sessions:
         # quota_restore 共享 QoS 账本恢复的重放缓存，与其余各域独立：
         # key -> (text, outcome)；仅首次成功缓存，失败（含参数错）不占 key。
         self._quota_restore_cache = {}
+        # stats_restore 统计检查点恢复的重放缓存，与其余各域独立：
+        # key -> (text, 检查点)；仅首次成功缓存，失败（含参数错）不占 key。
+        self._stats_restore_cache = {}
         # runtime_restore 运行态检查点恢复的重放缓存，与其余各域独立：
         # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错）不占 key。
         self._runtime_restore_cache = {}
@@ -2821,6 +2827,210 @@ class Sessions:
                 )
             last_key = ledger_key
             rows.append((user, template_id, used, last, tokens))
+        return rows
+
+    def _stats_checkpoint_text(self):
+        """导出统计检查点文本（不老化、不建账、不改账、不审计）。
+
+        顶层依次为“版本/建立/用户失败/用户计量/模板计量/摘要”，版本 1；
+        建立键序“总数/成功”；用户失败项为 [用户,认证,资源,状态,后端]，
+        用户/模板计量项为 [标识,通过,拒绝,下线,通过字节]；三类列表各按首
+        字段 Unicode 码点严格升序。摘要为前五键紧凑 JSON（无 LF）UTF-8
+        字节的 sha256 小写值；整体 LF 结尾。
+        """
+        user_fail_rows = [
+            [user, counts[0], counts[1], counts[2], counts[3]]
+            for user, counts in sorted(self._user_fail.items())
+        ]
+        user_meter_rows = [
+            [ident, values[0], values[1], values[2], values[3]]
+            for ident, values in sorted(self._meter_stats_user.items())
+        ]
+        template_meter_rows = [
+            [ident, values[0], values[1], values[2], values[3]]
+            for ident, values in sorted(self._meter_stats_template.items())
+        ]
+        doc = {
+            "版本": 1,
+            "建立": {"总数": self._establish_total, "成功": self._establish_success},
+            "用户失败": user_fail_rows,
+            "用户计量": user_meter_rows,
+            "模板计量": template_meter_rows,
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def stats_checkpoint(self):
+        """返回统计检查点的 LF 结尾紧凑 JSON，O(n log n) 时间、O(n) 空间；
+        查询不老化、不审计、不改任何统计与各域缓存。
+
+        顶层依次为“版本/建立/用户失败/用户计量/模板计量/摘要”，版本为 1：
+        建立键序“总数/成功”；用户失败项依次为
+        [用户,认证,资源,状态,后端]；用户计量、模板计量项依次为
+        [标识,通过,拒绝,下线,通过字节]。列表各按首字段 Unicode 码点升序、
+        无重复；数值均为非 bool 非负 int，成功 <= 总数。摘要为前五键紧凑
+        JSON（无 LF）UTF-8 字节的 sha256 小写值。同状态查询逐字节相同。
+        """
+        return self._stats_checkpoint_text()
+
+    def stats_restore(self, key, text):
+        """按检查点原子替换建立计数、按用户失败与用户/模板计量统计，返回
+        替换后的规范检查点（LF 结尾基线 JSON）。
+
+        key 沿用凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
+        text 非 str 抛 TypeError。JSON 解析、重键、键序/键集/结构/类型/取值、
+        排序/重复、版本或摘要错均抛 ValueError；用户失败与用户计量引用未注册
+        用户抛 ResourceError，模板计量不验引用。全部校验通过后原子替换四类
+        统计；任何失败不改统计与缓存，不老化、不审计。
+
+        重放缓存与各域独立且仅缓存成功：同 key 同型同 text 重放不解析、不
+        替换，直接返回首次检查点原字节，异参抛 ValueError；失败（含参数错与
+        ResourceError）不占 key。首次 O(n log n) 时间、O(n) 空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._stats_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text 后返回缓存原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        (
+            total,
+            success,
+            fail_rows,
+            user_meter_rows,
+            template_meter_rows,
+        ) = self._parse_stats_checkpoint(text)
+
+        # 用户引用：用户失败与用户计量的首字段须为已注册用户；模板不验引用。
+        for user, _a, _r, _s, _b in fail_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"stats checkpoint references unregistered user: {user!r}"
+                )
+        for ident, _p, _d, _o, _pb in user_meter_rows:
+            if ident not in self._auth:
+                raise ResourceError(
+                    f"stats checkpoint references unregistered user: {ident!r}"
+                )
+
+        # 全验后原子替换四类统计（无行的类别清空）。
+        self._establish_total = total
+        self._establish_success = success
+        self._user_fail = {
+            user: [auth_c, resource_c, state_c, backend_c]
+            for user, auth_c, resource_c, state_c, backend_c in fail_rows
+        }
+        self._meter_stats_user = {
+            ident: [passed, denied, offlined, passed_bytes]
+            for ident, passed, denied, offlined, passed_bytes in user_meter_rows
+        }
+        self._meter_stats_template = {
+            ident: [passed, denied, offlined, passed_bytes]
+            for ident, passed, denied, offlined, passed_bytes in template_meter_rows
+        }
+
+        result = self._stats_checkpoint_text()
+        self._stats_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_stats_checkpoint(self, text):
+        """解析并全量校验统计检查点文本，返回
+        (总数, 成功, 用户失败行, 用户计量行, 模板计量行)；
+        用户失败行为 (用户,认证,资源,状态,后端)，计量行为
+        (标识,通过,拒绝,下线,通过字节)。任何文本非法均抛 ValueError。
+
+        顶层须恰含“版本/建立/用户失败/用户计量/模板计量/摘要”且键序如此；
+        版本为 1；建立键序“总数/成功”，均非 bool 非负 int 且成功 <= 总数；
+        用户失败项为五元列表，用户满足凭据约束，四项计数为非 bool 非负 int，
+        按用户严格升序无重复；用户/模板计量项标识同凭据约束，四项计数均为
+        非 bool 非负 int，两类各按标识严格升序无重复；摘要须为规范化前五键
+        紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值。仅做结构自洽校验；
+        用户注册由调用方判定（ResourceError），模板不验引用。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"stats checkpoint is not valid JSON: {exc}") from exc
+        top_keys = ["版本", "建立", "用户失败", "用户计量", "模板计量", "摘要"]
+        if not isinstance(doc, dict) or list(doc) != top_keys:
+            raise ValueError(
+                "stats checkpoint top-level keys must be "
+                "版本/建立/用户失败/用户计量/模板计量/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+
+        establish = doc["建立"]
+        if not isinstance(establish, dict) or list(establish) != ["总数", "成功"]:
+            raise ValueError("建立 keys must be 总数/成功 in order")
+        total = self._cp_int(establish["总数"], "建立.总数", 0)
+        success = self._cp_int(establish["成功"], "建立.成功", 0)
+        if success > total:
+            raise ValueError(f"建立.成功 must be <= 总数, got {success} > {total}")
+
+        fail_rows = self._parse_stats_rows(
+            doc["用户失败"], "用户失败", ("认证", "资源", "状态", "后端")
+        )
+        user_meter_rows = self._parse_stats_rows(
+            doc["用户计量"], "用户计量", ("通过", "拒绝", "下线", "通过字节")
+        )
+        template_meter_rows = self._parse_stats_rows(
+            doc["模板计量"], "模板计量", ("通过", "拒绝", "下线", "通过字节")
+        )
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        # 摘要：用规范化值重建前五键（数值/结构相等即与生成方基线逐字节一致）。
+        canonical_head = {
+            "版本": 1,
+            "建立": {"总数": total, "成功": success},
+            "用户失败": [list(row) for row in fail_rows],
+            "用户计量": [list(row) for row in user_meter_rows],
+            "模板计量": [list(row) for row in template_meter_rows],
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical stats checkpoint")
+        return total, success, fail_rows, user_meter_rows, template_meter_rows
+
+    def _parse_stats_rows(self, raw, label, fields):
+        """解析一类统计列表，每项为五元列表 [标识, *fields]，严格按标识
+        Unicode 码点升序、无重复；标识满足凭据约束，四个数值均为非 bool
+        非负 int。不符抛 ValueError。"""
+        if not isinstance(raw, list):
+            raise ValueError(f"{label} must be a list")
+        rows = []
+        last_ident = None
+        for index, item in enumerate(raw, start=1):
+            if not isinstance(item, list) or len(item) != 5:
+                raise ValueError(
+                    f"{label} {index} must be a list of 5 elements "
+                    f"[标识, {', '.join(fields)}]"
+                )
+            ident = item[0]
+            self._cp_str(ident, f"{label}.标识")
+            nums = [
+                self._cp_int(item[j], f"{label}.{field}", 0)
+                for j, field in enumerate(fields, start=1)
+            ]
+            if last_ident is not None and ident <= last_ident:
+                raise ValueError(
+                    f"{label} rows must be strictly sorted by the first field "
+                    f"ascending with no duplicates"
+                )
+            last_ident = ident
+            rows.append((ident, *nums))
         return rows
 
     def fault(self, key, op, ms, now_ms):
