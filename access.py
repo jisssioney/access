@@ -61,7 +61,15 @@
   省略；用户失败或用户计量引用未注册用户 ResourceError、模板不验引用；全验后
   原子替换五类统计，返回 stats_checkpoint() 的 LF 尾 JSON，失败不改统计与缓存；
   独立 key 仅缓存成功，同型同四参重放原字节、异参 ValueError，不老化、不认证、
-  不审计、不改其他状态。sessions(now_ms,
+  不审计、不改其他状态。stats_delta(base,current) 只读算两份版本 1 检查点的
+  逐计数增量 current-base：两参须 str（否则 TypeError），按版本 1 契约解析
+  （违约 ValueError），用户失败或用户计量引用未注册用户 ResourceError、模板
+  不验引用；按标识并集、缺标识计 0，任一增量为负或成功增量大于总数增量抛
+  StateError("current")；返回 LF 尾紧凑 JSON，顶层依次基线摘要/当前摘要/建立/
+  用户失败/用户计量/模板计量/摘要，前两值取输入摘要原文，建立为总数/成功/
+  成功率万分比（总数增量 0 率为 0，否则 floor(成功*10000/总数)），三类列表
+  码点升序、全 0 项省略，末摘要为前六键紧凑 JSON UTF-8 字节 sha256 小写值；
+  不老化、不认证、不审计、不改状态，同参同字节，O(n log n)/O(n)。sessions(now_ms,
   after="", limit=100) 只读游标列出会话与未到期队项（不老化、不认证、
   不回收租约、不写审计/事件/缓存、不改计数）：按 now_ms 取视图，标识
   Unicode 码点升序、sid>after 的前 limit 项，顶层时刻/下个/剩余/项目，
@@ -5916,7 +5924,7 @@ class Sessions:
             raise TypeError(f"text must be a str, got {type(text).__name__}")
 
         # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
-        total, success, fail_rows, user_rows, template_rows = (
+        total, success, fail_rows, user_rows, template_rows, _digest = (
             self._parse_stats_checkpoint(text)
         )
         for user, _a, _r, _st, _b in fail_rows:
@@ -5996,7 +6004,7 @@ class Sessions:
         # 三份文本全部解析（ValueError 先于引用与合并语义校验）。
         parsed = {}
         for label, text in (("base", base), ("left", left), ("right", right)):
-            total, success, fail_rows, user_rows, template_rows = (
+            total, success, fail_rows, user_rows, template_rows, _digest = (
                 self._parse_stats_checkpoint(text)
             )
             parsed[label] = (
@@ -6083,11 +6091,134 @@ class Sessions:
         self._stats_merge_cache[key] = ((base, left, right), result)
         return result
 
+    def stats_delta(self, base, current):
+        """只读计算 current 相对 base 的逐计数增量（current-base），返回 LF 结尾
+        紧凑 JSON；纯函数：不老化、不认证、不审计、不动缓存与任何计数，同参
+        同字节。
+
+        base/current 须为 str，否则抛 TypeError；两文本按 stats_checkpoint
+        版本 1 契约解析（JSON/重键/键序结构类型值/排序重复/版本/摘要），任一
+        非法抛 ValueError；任一文本的用户失败行或用户计量行引用未注册用户抛
+        ResourceError，模板计量不验模板引用。全部解析与引用校验先于增量语义
+        校验。
+
+        按标识并集逐计数相减，标识缺失按计数 0 计：建立总数/成功任一增量为负、
+        建立成功增量大于建立总数增量，或任一失败/计量计数增量为负，均抛
+        StateError("current")。输出顶层依次为“基线摘要/当前摘要/建立/用户失败/
+        用户计量/模板计量/摘要”：前两值取两输入的“摘要”原文；建立键序
+        “总数/成功/成功率万分比”，均为 int，总数增量为 0 时率为 0，否则
+        floor(成功增量*10000/总数增量)；失败项键序“用户/认证/资源/状态/后端”，
+        计量项键序“标识/通过/拒绝/下线/通过字节”，三项之差均为非负 int；三类
+        列表按标识 Unicode 码点升序，四项全 0 的行省略；末摘要为前六键紧凑
+        JSON（无 LF）UTF-8 字节的 sha256 小写值。
+        O(n log n) 时间、O(n) 空间（n 为两文本行数之和）。
+        """
+        for name, value in (("base", base), ("current", current)):
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"{name} must be a str, got {type(value).__name__}"
+                )
+
+        # 两份文本全部解析（ValueError 先于引用与增量语义校验）。
+        parsed = {}
+        for label, text in (("base", base), ("current", current)):
+            total, success, fail_rows, user_rows, template_rows, digest = (
+                self._parse_stats_checkpoint(text)
+            )
+            parsed[label] = (
+                total,
+                success,
+                digest,
+                {user: (a, r, st, b) for user, a, r, st, b in fail_rows},
+                {ident: (p, d, o, byt) for ident, p, d, o, byt in user_rows},
+                {ident: (p, d, o, byt) for ident, p, d, o, byt in template_rows},
+            )
+
+        # 引用校验：两份文本的用户失败与用户计量标识均须已注册；模板不验。
+        for label in ("base", "current"):
+            _t, _s, _dg, fail_map, user_map, _tm = parsed[label]
+            for ident in fail_map:
+                if ident not in self._auth:
+                    raise ResourceError(
+                        f"stats checkpoint references unregistered user: {ident!r}"
+                    )
+            for ident in user_map:
+                if ident not in self._auth:
+                    raise ResourceError(
+                        f"stats checkpoint references unregistered user: {ident!r}"
+                    )
+
+        b_total, b_success, b_digest, b_fail, b_user, b_template = parsed["base"]
+        c_total, c_success, c_digest, c_fail, c_user, c_template = parsed["current"]
+
+        d_total = c_total - b_total
+        d_success = c_success - b_success
+        if d_total < 0 or d_success < 0 or d_success > d_total:
+            raise StateError("current")
+        rate = 0 if d_total == 0 else d_success * 10000 // d_total
+
+        def diff_map(b_map, c_map):
+            """标识并集逐计数 current-base；缺失计 0，负增量 StateError，
+            全 0 行省略；按标识 Unicode 码点升序。"""
+            diff = {}
+            for ident in sorted(set(b_map) | set(c_map)):
+                b_values = b_map.get(ident, (0, 0, 0, 0))
+                c_values = c_map.get(ident, (0, 0, 0, 0))
+                values = [c_values[i] - b_values[i] for i in range(4)]
+                if any(value < 0 for value in values):
+                    raise StateError("current")
+                if any(values):
+                    diff[ident] = values
+            return diff
+
+        fail_diff = diff_map(b_fail, c_fail)
+        user_diff = diff_map(b_user, c_user)
+        template_diff = diff_map(b_template, c_template)
+
+        doc = {
+            "基线摘要": b_digest,
+            "当前摘要": c_digest,
+            "建立": {"总数": d_total, "成功": d_success, "成功率万分比": rate},
+            "用户失败": [
+                {
+                    "用户": ident,
+                    "认证": values[0],
+                    "资源": values[1],
+                    "状态": values[2],
+                    "后端": values[3],
+                }
+                for ident, values in sorted(fail_diff.items())
+            ],
+            "用户计量": [
+                {
+                    "标识": ident,
+                    "通过": values[0],
+                    "拒绝": values[1],
+                    "下线": values[2],
+                    "通过字节": values[3],
+                }
+                for ident, values in sorted(user_diff.items())
+            ],
+            "模板计量": [
+                {
+                    "标识": ident,
+                    "通过": values[0],
+                    "拒绝": values[1],
+                    "下线": values[2],
+                    "通过字节": values[3],
+                }
+                for ident, values in sorted(template_diff.items())
+            ],
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _parse_stats_checkpoint(self, text):
         """解析并全量校验统计快照检查点文本，返回
         (建立总数, 建立成功, 用户失败行五元组列表 (用户,认证,资源,状态,后端),
         用户计量行五元组列表 (标识,通过,拒绝,下线,通过字节), 模板计量行五元组
-        列表)；任何文本非法均抛 ValueError。
+        列表, 摘要)；任何文本非法均抛 ValueError。
 
         顶层须恰含“版本/建立/用户失败/用户计量/模板计量/摘要”且键序如此；
         版本为 1；建立键序“总数/成功”，均为非 bool 非负 int 且成功 <= 总数；
@@ -6207,7 +6338,7 @@ class Sessions:
         blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
         if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
             raise ValueError("摘要 does not match the canonical stats checkpoint")
-        return total, success, fail_rows, user_rows, template_rows
+        return total, success, fail_rows, user_rows, template_rows, summary
 
     def sessions(self, now_ms, after="", limit=100):
         """返回会话与排队项的只读游标列表 JSON；查询不老化、不认证、不回收
