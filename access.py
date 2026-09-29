@@ -84,17 +84,35 @@
   LF 尾紧凑 JSON，O((S+Q) log(S+Q))/O(S+Q)。
 - Sessions.batch_offline 批量下线：按 key 独立重放缓存，首果（含参数异常）
   永久缓存；首次合法先老化，非原子逐项下线/未知、原子全存在才提交否则整批
-  回滚（保留老化），不记审计或容量事件。
+  回滚（保留老化），不写既有 audit 链或容量事件。合法首果与同参重放另写
+  批量防篡改审计链 batch_audit（操作“批量下线”）：按输入序逐项追加，首次
+  结果取项目结果、原序号 0，重放结果“重放”、原序号指认对应首次事件；参数
+  错与异参重放不记。
 - Sessions.batch_online 批量建立：按 key 独立重放缓存，首果（含参数异常）
   永久缓存；首次合法先老化，逐项经后端、认证、容量、default 池与静态址
   规则建立，业务异常不抛而记项结果类名；非原子逐项提交，原子演算全部、
-  任一失败整批回滚（保留老化、认证计数与退避），不记审计或容量事件。
+  任一失败整批回滚（保留老化、认证计数与退避），不写既有 audit 链或容量
+  事件。合法首果与同参重放写批量防篡改审计链 batch_audit（操作“批量
+  上线”），逐项记法同批量下线。
+- Sessions.batch_migrate 批量迁移：按 key 独立重放缓存，首果（含参数异常）
+  永久缓存；首次合法先老化，逐项沿用 do 迁移规则，业务异常记项结果类名，
+  非原子逐项提交、原子预演全过才提交否则整批回滚（认证计数、锁定与退避
+  保留），不写既有 audit 链或容量事件。合法首果与同参重放写批量防篡改
+  审计链 batch_audit（操作“批量迁移”），逐项记法同上。
 - Sessions.keepalive 批量保活：按 key 独立重放缓存，首果（含参数异常）
   永久缓存；首次合法先老化（期限到的在线项挂起退租，老化不回滚），非原子
   依序把在线项空闲期限改为 now_ms+idle_ms 记“保活”，未知记“未知”、挂起/
   下线墓碑记“状态”；原子先查快照，全在线才提交，否则失败项记未知/状态、
-  在线项记“回滚”且不延长期限。保活只改期限，不续租、不分址、不审计、不记
-  容量事件或统计。
+  在线项记“回滚”且不延长期限。保活只改期限，不续租、不分址、不写既有
+  audit 链、不记容量事件或统计。合法首果与同参重放写批量防篡改审计链
+  batch_audit（操作“批量保活”），逐项记法同批量下线。
+- Sessions.batch_audit 批量四操作专用防篡改审计链的只读查询
+  (after=0, limit=100)：after/limit 须非 bool int，类型错 TypeError，
+  after<0 或 limit∉[1,1000] 抛 ValueError；取序号>after 的前 limit 项，
+  只读不老化，O(limit) 时空。LF 尾紧凑 JSON，顶层“下个序号/事件”，空页
+  游标为 after；事件十键“序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/
+  哈希”，首项前哈希 64 个 0、余项承前项，哈希为前九键紧凑 JSON 的 UTF-8
+  字节 sha256 小写值。与 audit 链分链。
 - Sessions.credential_change 凭据轮换：按 key 独立重放缓存，首果（含参数
   异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked 抛
   AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
@@ -1086,6 +1104,16 @@ _BATCH_ITEM_MIGRATE = "迁移"
 _KEEPALIVE_OK = "保活"
 _KEEPALIVE_STATE = "状态"
 
+# 批量操作（batch_online/batch_offline/batch_migrate/keepalive）入批量防篡改
+# 审计链（batch_audit）的操作名；与既有 audit 链分链，签名、校验、返回与
+# 各域重放缓存均不变。
+_BATCH_ONLINE_OP = "批量上线"
+_BATCH_OFFLINE_OP = "批量下线"
+_BATCH_MIGRATE_OP = "批量迁移"
+_KEEPALIVE_OP = "批量保活"
+# 同参重放逐项事件的结果串。
+_BATCH_REPLAY = "重放"
+
 # credential_change 凭据轮换：入防篡改审计链的操作名与返回 JSON 的结果串。
 _CREDENTIAL_OP = "凭据轮换"
 _CREDENTIAL_ROTATED = "已轮换"
@@ -1336,10 +1364,13 @@ class Sessions:
     异参 ValueError。首次合法先老化；非原子逐项处理，现存项（在线/挂起/
     下线墓碑）置下线、期限 0、释放地址租约并记“下线”，未知记“未知”不影响
     后项；原子先查老化后快照，有未知则未知记“未知”、其余记“回滚”且不执行
-    （保留老化），全存在才提交。未知不抛异常；不记审计或容量事件。返回键序
-    时刻/原子/结果/项目的 LF 尾紧凑 JSON，结果仅提交/部分/回滚，项为
-    会话/结果（下线/未知/回滚）。首次 O(S+B log A) 时间、O(B) 辅助空间，
-    S/B/A 为会话/批项/池地址数。
+    （保留老化），全存在才提交。未知不抛异常；不写既有 audit 链或容量事件。
+    返回键序时刻/原子/结果/项目的 LF 尾紧凑 JSON，结果仅提交/部分/回滚，
+    项为会话/结果（下线/未知/回滚）。首次 O(S+B log A) 时间、O(B) 辅助
+    空间，S/B/A 为会话/批项/池地址数。合法首果与同参重放另写批量防篡改
+    审计链 batch_audit（操作“批量下线”）：首果按输入序逐项追加、结果取
+    项目结果、原序号 0，重放逐项记“重放”、原序号指认对应首次事件；参数错
+    与异参重放不记。
     batch_online(key, items, now_ms, atomic=False) 批量建立：key 及三项
     串沿用凭据约束，items 为 1..1000 个 (sid, user, password) 三元组的
     tuple，sid 互异；now_ms 为非 bool 非负 int，atomic 为 bool；类型错
@@ -1352,11 +1383,24 @@ class Sessions:
     StateError/BackendError/KeyError）不抛，项结果记其类名。非原子
     逐项提交，失败不影响后项；原子演算全部项，任一失败则批内不建
     会话/租约（已建者回滚释址），失败项记异常类名、余项记回滚；
-    老化、认证计数与退避保留。不记审计或容量事件，不计建立/失败/
-    后端故障统计。返回键序时刻/原子/结果/项目的 LF 尾紧凑 JSON，
+    老化、认证计数与退避保留。不写既有 audit 链或容量事件，不计建立/
+    失败/后端故障统计。返回键序时刻/原子/结果/项目的 LF 尾紧凑 JSON，
     结果仅提交（全上线）/部分（非原子有失败）/回滚（原子有失败），
     项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务异常类名/
-    回滚。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+    回滚。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。合法首果
+    与同参重放另写批量防篡改审计链 batch_audit（操作“批量上线”）：首果
+    按输入序逐项追加、结果取项目结果、原序号 0，重放逐项记“重放”、原序号
+    指认对应首次事件；参数错与异参重放不记。
+    batch_migrate(key, items, now_ms, atomic=False) 批量迁移：key 及三
+    项串沿用凭据约束，items 为 1..1000 个 (sid, target, password) 三元组
+    tuple，sid 互异；类型/取值/长度/重复错与 batch_online 同序。验 key
+    后以独立域永久缓存首果（含参数异常），同型同参重放不老化、不改态，异参
+    ValueError。首次合法先老化，逐项沿用 do 迁移规则；业务异常不抛而记项
+    结果类名。非原子逐项提交；原子预演全部、任一失败整批回滚（认证计数、
+    锁定与退避保留）。不写既有 audit 链或容量事件。返回键序时刻/原子/
+    结果/项目的 LF 尾紧凑 JSON，项键序“会话/结果”，项结果仅迁移/业务
+    异常类名/回滚。合法首果与同参重放另写批量防篡改审计链 batch_audit
+    （操作“批量迁移”），逐项记法同批量上线。
     keepalive(key, sids, now_ms, atomic=False) 批量保活：key/sid 沿用
     凭据约束，sids 为 1..1000 个互异 sid 的 tuple，now_ms 为非 bool 非负
     int，atomic 为 bool；类型错 TypeError，取值/长度/重复错 ValueError。
@@ -1366,12 +1410,21 @@ class Sessions:
     的在线项挂起、清期限退租且不回滚。非原子依序将在线项空闲期限改为
     now_ms+idle_ms 并记“保活”，未知记“未知”，其余现存项（挂起/下线墓碑）
     记“状态”；原子先查老化后快照，全在线才提交，否则失败项记未知/状态、
-    在线项记“回滚”且不延长期限。保活只改空闲期限，不续租、不分址、不审计、
-    不记容量事件或统计。返回键序时刻/原子/结果/项目的 LF 尾紧凑 JSON，
-    结果仅提交（全保活）/部分（非原子有失败）/回滚（原子有失败），项目依
-    输入顺序，项键序“会话/结果/期限”，项结果仅保活/未知/状态/回滚，保活项
-    期限取改后新值、余项期限为 0。首次 O(S+B log A) 时间、O(B) 辅助空间，
-    重放 O(B)。
+    在线项记“回滚”且不延长期限。保活只改空闲期限，不续租、不分址、不写
+    既有 audit 链、不记容量事件或统计。返回键序时刻/原子/结果/项目的 LF
+    尾紧凑 JSON，结果仅提交（全保活）/部分（非原子有失败）/回滚（原子有
+    失败），项目依输入顺序，项键序“会话/结果/期限”，项结果仅保活/未知/
+    状态/回滚，保活项期限取改后新值、余项期限为 0。首次 O(S+B log A)
+    时间、O(B) 辅助空间，重放 O(B)。合法首果与同参重放另写批量防篡改
+    审计链 batch_audit（操作“批量保活”），逐项记法同批量下线。
+    batch_audit(after=0, limit=100) 只读查询批量四操作专用防篡改审计链：
+    after/limit 须为非 bool int，类型错 TypeError，after<0 或 limit
+    ∉ [1,1000] 抛 ValueError；取序号 > after 的前 limit 项，查询不老化，
+    O(limit) 时空。返回 LF 尾紧凑 JSON（ensure_ascii=False、
+    separators=(',',':')），顶层键序“下个序号/事件”，空页游标为 after；
+    事件键序“序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/哈希”，首项
+    前哈希为 64 个 0、余项承前项，哈希为前九键紧凑 JSON 的 UTF-8 字节
+    sha256 小写值。该链与 audit 链分链，互不影响。
     runtime_checkpoint(now_ms) 先验参再老化一次，输出运行态检查点基线
     JSON（LF 尾）：顶层键序版本/时刻/容量/配额/摘要，版本 1，容量沿用
     同刻 clog 对象契约（时刻等于顶层）、配额沿用同刻 quota_checkpoint
@@ -1631,6 +1684,22 @@ class Sessions:
         # pool_fault/timeout_fault/batch_offline/batch_online/keepalive
         # 分域：key -> (items, now_ms, atomic, outcome)。
         self._batch_migrate_cache = {}
+        # 批量四操作（batch_online/batch_offline/batch_migrate/keepalive）
+        # 专用的防篡改审计链，与现有 audit 链（_chain_events）分链：既有四
+        # 接口不写 audit 链的约定不变，批量事件仅经 batch_audit 查询。
+        # 事件为十元组（序号自 1）：
+        # (序号, 时刻, 键, 操作, 原子, 会话, 结果, 原序号, 前哈希, 哈希)；
+        # 末项哈希（空链为 64 个 0，即首项前哈希）。
+        self._batch_chain_events = []
+        self._batch_chain_tail = "0" * 64
+        # 批量链按“操作域 + key”指认首次逐项事件：每个合法首果按输入序逐项
+        # 追加，索引存 (首次事件序号起始,) 即该 key 首次首批的首项序号；逐项
+        # 重放事件的原序号 = 起始 + 项下标。四个操作各持独立索引，避免同名字符
+        # 串 key 跨操作互相指认。索引键为操作名，值为 key -> 首批首项序号。
+        self._batch_online_chain_index = {}
+        self._batch_offline_chain_index = {}
+        self._batch_migrate_chain_index = {}
+        self._keepalive_chain_index = {}
         # config_change 配置加载/回滚/升级事务的重放缓存，与 do/meter/
         # capacity/fault/pool_fault/timeout_fault/batch_offline 分域：
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
@@ -4971,21 +5040,33 @@ class Sessions:
         地址租约，记“下线”；未知 sid 记“未知”，不影响后项。原子时基于老化
         后快照先查全部项：有未知项则未知项记“未知”、其余现存项记“回滚”，
         不执行任何下线（但保留老化结果）；全部存在才逐项提交下线。未知不抛
-        异常。不记审计或容量事件。返回顶层键序“时刻/原子/结果/项目”：结果
-        仅提交（全部项处理成功）、部分（非原子含未知）、回滚（原子含未知）；
-        项目依输入顺序，项键序“会话/结果”，项结果仅下线/未知/回滚。首次
-        调用 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+        异常。不写既有防篡改 audit 链或容量事件。返回顶层键序“时刻/原子/
+        结果/项目”：结果仅提交（全部项处理成功）、部分（非原子含未知）、
+        回滚（原子含未知）；项目依输入顺序，项键序“会话/结果”，项结果仅
+        下线/未知/回滚。首次调用 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+
+        合法首果与同参重放另写批量防篡改审计链（batch_audit，与 audit 链
+        分链）：首果按输入序逐项追加，操作“批量下线”，逐项结果取项目结果、
+        原序号 0；同参重放不老化、不改态，按输入序逐项记结果“重放”、原序号
+        指认对应首次事件。参数错（缓存但无首果）与异参重放不记。
         """
         _check_credential("key", key)
 
         cached = self._batch_offline_cache.get(key)
         if cached is not None:
-            # 重放：不老化、不下线、不记审计/事件，仅按缓存返回或重抛。
+            # 重放：不老化、不下线、不记容量事件，仅按缓存返回或重抛。批量
+            # 防篡改链按输入序逐项记“重放”（参数错首果未入索引，自然跳过）。
             c_sids, c_now_ms, c_atomic, outcome = cached
             if not _strict_equal(
                 (sids, now_ms, atomic), (c_sids, c_now_ms, c_atomic)
             ):
                 raise ValueError(f"key {key!r} reused with different parameters")
+            origin_start = self._batch_offline_chain_index.get(key)
+            if origin_start is not None:
+                self._batch_chain_record_replay(
+                    key, _BATCH_OFFLINE_OP, c_atomic, c_sids, c_now_ms,
+                    origin_start,
+                )
             if outcome[0] == "ok":
                 return outcome[1]
             exc_class, exc_args = outcome[1]
@@ -5020,6 +5101,11 @@ class Sessions:
             now_ms,
             atomic,
             ("ok", output),
+        )
+        # 合法首果按输入序逐项写入批量防篡改链：结果取项目结果、原序号 0。
+        self._batch_chain_append_first(
+            key, _BATCH_OFFLINE_OP, atomic, items, now_ms,
+            self._batch_offline_chain_index,
         )
         return output
 
@@ -5132,23 +5218,35 @@ class Sessions:
         ResourceError/StateError/BackendError/KeyError）不抛，项结果记
         其类名。非原子逐项提交，失败项不影响后项；原子演算全部项，任一
         失败则批内不建会话/租约（已建者回滚、释放地址租约），失败项记
-        异常类名、余项记“回滚”；老化、认证计数与退避保留。不记审计或
-        容量事件，不计建立/失败统计。返回顶层键序“时刻/原子/结果/项目”：
-        结果仅提交（全部上线）、部分（非原子有失败）、回滚（原子有
-        失败）；项目依输入顺序，项键序“会话/结果”，项结果仅上线/业务
-        异常类名/回滚。首次调用 O(S+B log A) 时间、O(B) 辅助空间，
+        异常类名、余项记“回滚”；老化、认证计数与退避保留。不写既有防篡改
+        audit 链或容量事件，不计建立/失败统计。返回顶层键序“时刻/原子/
+        结果/项目”：结果仅提交（全部上线）、部分（非原子有失败）、回滚
+        （原子有失败）；项目依输入顺序，项键序“会话/结果”，项结果仅上线/
+        业务异常类名/回滚。首次调用 O(S+B log A) 时间、O(B) 辅助空间，
         重放 O(B)。
+
+        合法首果与同参重放另写批量防篡改审计链（batch_audit，与 audit 链
+        分链）：首果按输入序逐项追加，操作“批量上线”，逐项结果取项目结果、
+        原序号 0；同参重放不老化、不改态，按输入序逐项记结果“重放”、原序号
+        指认对应首次事件。参数错（缓存但无首果）与异参重放不记。
         """
         _check_credential("key", key)
 
         cached = self._batch_online_cache.get(key)
         if cached is not None:
-            # 重放：不老化、不建立、不记审计/事件，仅按缓存返回或重抛。
+            # 重放：不老化、不建立、不记容量事件，仅按缓存返回或重抛。批量
+            # 防篡改链按输入序逐项记“重放”（参数错首果未入索引，自然跳过）。
             c_items, c_now_ms, c_atomic, outcome = cached
             if not _strict_equal(
                 (items, now_ms, atomic), (c_items, c_now_ms, c_atomic)
             ):
                 raise ValueError(f"key {key!r} reused with different parameters")
+            origin_start = self._batch_online_chain_index.get(key)
+            if origin_start is not None:
+                self._batch_chain_record_replay(
+                    key, _BATCH_ONLINE_OP, c_atomic,
+                    [entry[0] for entry in c_items], c_now_ms, origin_start,
+                )
             if outcome[0] == "ok":
                 return outcome[1]
             exc_class, exc_args = outcome[1]
@@ -5212,6 +5310,11 @@ class Sessions:
             result = _BATCH_ROLLBACK if atomic else _BATCH_PARTIAL
         output = self._render_batch_online(now_ms, atomic, result, results)
         self._batch_online_cache[key] = (items, now_ms, atomic, ("ok", output))
+        # 合法首果按输入序逐项写入批量防篡改链：结果取项目结果、原序号 0。
+        self._batch_chain_append_first(
+            key, _BATCH_ONLINE_OP, atomic, results, now_ms,
+            self._batch_online_chain_index,
+        )
         return output
 
     @staticmethod
@@ -5346,22 +5449,34 @@ class Sessions:
         变化影响后项取址；每个失败项保留自身异常类名，仅预演成功项记“回滚”，
         任一失败即把会话、池空闲地址与租约恢复至老化后快照（认证失败计数、
         锁定与退避保留），全成功才提交并记“迁移”。失败不计 user_stats/
-        runtime_stats/fault_stats；不记审计或容量事件。返回顶层键序
-        “时刻/原子/结果/项目”：结果仅提交（全部迁移）、部分（非原子有
-        失败）、回滚（原子有失败）；项目依输入顺序，项键序“会话/结果”，
-        项结果仅迁移/业务异常类名/回滚。首次调用 O(S+B log A) 时间、O(B)
-        辅助空间，重放 O(1)。
+        runtime_stats/fault_stats；不写既有防篡改 audit 链或容量事件。返回
+        顶层键序“时刻/原子/结果/项目”：结果仅提交（全部迁移）、部分（非
+        原子有失败）、回滚（原子有失败）；项目依输入顺序，项键序“会话/
+        结果”，项结果仅迁移/业务异常类名/回滚。首次调用 O(S+B log A)
+        时间、O(B) 辅助空间，重放 O(B)（逐项记重放）。
+
+        合法首果与同参重放另写批量防篡改审计链（batch_audit，与 audit 链
+        分链）：首果按输入序逐项追加，操作“批量迁移”，逐项结果取项目结果、
+        原序号 0；同参重放不老化、不改态，按输入序逐项记结果“重放”、原序号
+        指认对应首次事件。参数错（缓存但无首果）与异参重放不记。
         """
         _check_credential("key", key)
 
         cached = self._batch_migrate_cache.get(key)
         if cached is not None:
-            # 重放：不老化、不迁移、不记审计/事件，仅按缓存返回或重抛。
+            # 重放：不老化、不迁移、不记容量事件，仅按缓存返回或重抛。批量
+            # 防篡改链按输入序逐项记“重放”（参数错首果未入索引，自然跳过）。
             c_items, c_now_ms, c_atomic, outcome = cached
             if not _strict_equal(
                 (items, now_ms, atomic), (c_items, c_now_ms, c_atomic)
             ):
                 raise ValueError(f"key {key!r} reused with different parameters")
+            origin_start = self._batch_migrate_chain_index.get(key)
+            if origin_start is not None:
+                self._batch_chain_record_replay(
+                    key, _BATCH_MIGRATE_OP, c_atomic,
+                    [entry[0] for entry in c_items], c_now_ms, origin_start,
+                )
             if outcome[0] == "ok":
                 return outcome[1]
             exc_class, exc_args = outcome[1]
@@ -5393,6 +5508,11 @@ class Sessions:
             result = _BATCH_ROLLBACK if atomic else _BATCH_PARTIAL
         output = self._render_batch_migrate(now_ms, atomic, result, results)
         self._batch_migrate_cache[key] = (items, now_ms, atomic, ("ok", output))
+        # 合法首果按输入序逐项写入批量防篡改链：结果取项目结果、原序号 0。
+        self._batch_chain_append_first(
+            key, _BATCH_MIGRATE_OP, atomic, results, now_ms,
+            self._batch_migrate_chain_index,
+        )
         return output
 
     @staticmethod
@@ -5678,25 +5798,37 @@ class Sessions:
         首次合法调用先老化（期限 <= now_ms 的在线项挂起、清期限并释放地址
         租约，老化不回滚）。非原子时依输入顺序逐项处理：在线项（老化后仍
         在线）把空闲期限改为 now_ms+idle_ms 并记“保活”（只改期限，不续租、
-        不分址、不审计、不记容量事件、不计统计）；未知 sid 记“未知”，其余
-        现存项（挂起/下线墓碑）记“状态”，失败项不影响后项。原子时基于老化
-        后快照先查全部项：全部在线才逐项提交保活；否则失败项记“未知”/“状态”、
-        在线项记“回滚”，不延长任何期限（老化保留）。返回顶层键序
-        “时刻/原子/结果/项目”：结果仅提交（全部保活）、部分（非原子有失败
-        项）、回滚（原子有失败项）；项目依输入顺序，项键序“会话/结果/期限”，
-        项结果仅保活/未知/状态/回滚，保活项期限取改后的新值，余项期限恒为 0。
-        首次调用 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
+        不分址、不写既有 audit 链、不记容量事件、不计统计）；未知 sid 记
+        “未知”，其余现存项（挂起/下线墓碑）记“状态”，失败项不影响后项。
+        原子时基于老化后快照先查全部项：全部在线才逐项提交保活；否则失败项
+        记“未知”/“状态”、在线项记“回滚”，不延长任何期限（老化保留）。返回
+        顶层键序“时刻/原子/结果/项目”：结果仅提交（全部保活）、部分（非
+        原子有失败项）、回滚（原子有失败项）；项目依输入顺序，项键序
+        “会话/结果/期限”，项结果仅保活/未知/状态/回滚，保活项期限取改后的
+        新值，余项期限恒为 0。首次调用 O(S+B log A) 时间、O(B) 辅助空间，
+        重放 O(B)。
+
+        合法首果与同参重放另写批量防篡改审计链（batch_audit，与 audit 链
+        分链）：首果按输入序逐项追加，操作“批量保活”，逐项结果取项目结果、
+        原序号 0；同参重放不老化、不改态，按输入序逐项记结果“重放”、原序号
+        指认对应首次事件。参数错（缓存但无首果）与异参重放不记。
         """
         _check_credential("key", key)
 
         cached = self._keepalive_cache.get(key)
         if cached is not None:
-            # 重放：不老化、不保活、不记审计/事件，仅按缓存返回或重抛。
+            # 重放：不老化、不保活、不记容量事件，仅按缓存返回或重抛。批量
+            # 防篡改链按输入序逐项记“重放”（参数错首果未入索引，自然跳过）。
             c_sids, c_now_ms, c_atomic, outcome = cached
             if not _strict_equal(
                 (sids, now_ms, atomic), (c_sids, c_now_ms, c_atomic)
             ):
                 raise ValueError(f"key {key!r} reused with different parameters")
+            origin_start = self._keepalive_chain_index.get(key)
+            if origin_start is not None:
+                self._batch_chain_record_replay(
+                    key, _KEEPALIVE_OP, c_atomic, c_sids, c_now_ms, origin_start,
+                )
             if outcome[0] == "ok":
                 return outcome[1]
             exc_class, exc_args = outcome[1]
@@ -5728,6 +5860,11 @@ class Sessions:
             result = _BATCH_PARTIAL if not atomic else _BATCH_ROLLBACK
         output = self._render_keepalive(now_ms, atomic, result, items)
         self._keepalive_cache[key] = (sids, now_ms, atomic, ("ok", output))
+        # 合法首果按输入序逐项写入批量防篡改链：结果取项目结果、原序号 0。
+        self._batch_chain_append_first(
+            key, _KEEPALIVE_OP, atomic, items, now_ms,
+            self._keepalive_chain_index,
+        )
         return output
 
     def _keepalive_sequential(self, sids, now_ms):
@@ -10800,6 +10937,123 @@ class Sessions:
             (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
         )
         self._chain_tail = digest
+
+    @staticmethod
+    def _batch_chain_hash(
+        seq, now_ms, key, op, atomic, sid, result, origin, prev_hash
+    ):
+        """批量审计链：由前九字段（键序固定）的紧凑 JSON 之 UTF-8 字节算
+        sha256 十六进制串；原子为 bool，余字段契约同事件本身。
+        """
+        head = {
+            "序号": seq,
+            "时刻": now_ms,
+            "键": key,
+            "操作": op,
+            "原子": atomic,
+            "会话": sid,
+            "结果": result,
+            "原序号": origin,
+            "前哈希": prev_hash,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _batch_chain_append_one(
+        self, key, op, atomic, sid, result, now_ms, origin
+    ):
+        """追加一条批量防篡改审计事件并返回其序号，O(1) 时空。
+
+        序号自 1 递增；前哈希首项为 64 个 0，余取前项哈希。
+        """
+        seq = len(self._batch_chain_events) + 1
+        prev_hash = self._batch_chain_tail
+        digest = self._batch_chain_hash(
+            seq, now_ms, key, op, atomic, sid, result, origin, prev_hash
+        )
+        self._batch_chain_events.append(
+            (seq, now_ms, key, op, atomic, sid, result, origin, prev_hash, digest)
+        )
+        self._batch_chain_tail = digest
+        return seq
+
+    def _batch_chain_append_first(self, key, op, atomic, items, now_ms, index):
+        """合法首果按输入序逐项追加首次事件（结果取项目结果、原序号 0），并
+        把首批首项序号登记到本操作域的 key -> 序号索引，供同参重放逐项指认；
+        O(B) 时间、O(1) 辅助空间（事件本身除外）。
+
+        items 为返回 JSON 的项目列表，每项必含“会话/结果”（keepalive 另含
+        “期限”，此处不读）。
+        """
+        index[key] = len(self._batch_chain_events) + 1
+        for entry in items:
+            self._batch_chain_append_one(
+                key, op, atomic, entry["会话"], entry["结果"], now_ms, 0
+            )
+
+    def _batch_chain_record_replay(
+        self, key, op, atomic, sids, now_ms, origin_start
+    ):
+        """同参重放按输入序逐项追加重放事件：结果恒“重放”，原序号指认该位
+        置项对应的首次事件（origin_start 加项下标）；O(B) 时间、O(1) 辅助
+        空间。不老化、不改态。
+        """
+        for offset, sid in enumerate(sids):
+            self._batch_chain_append_one(
+                key, op, atomic, sid, _BATCH_REPLAY, now_ms,
+                origin_start + offset,
+            )
+
+    def batch_audit(self, after=0, limit=100):
+        """返回批量四操作（batch_online/batch_offline/batch_migrate/
+        keepalive）专用防篡改审计链的事件 JSON；只读、查询不老化，O(limit)
+        时空。
+
+        取序号 > after 的前 limit 项。after/limit 须为非 bool 的 int：类型
+        不符抛 TypeError，after<0 或 limit ∉ [1,1000] 抛 ValueError。顶层
+        键序为“下个序号/事件”，游标为末项序号、空页为 after；事件键序为
+        “序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/哈希”，序号/时刻/
+        原序号为 int、原子为 bool、余为 str。首项前哈希为 64 个 0，余项承
+        前项；哈希为前九键紧凑 JSON（ensure_ascii=False、
+        separators=(',',':')）UTF-8 字节的 sha256 小写值，输出末尾加 LF。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        # 序号即位置+1，序号 > after 的事件自下标 after 起，直接切片。
+        window = self._batch_chain_events[after : after + limit]
+        events = [
+            {
+                "序号": seq,
+                "时刻": now_ms,
+                "键": key,
+                "操作": op,
+                "原子": atomic,
+                "会话": sid,
+                "结果": result,
+                "原序号": origin,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for (
+                seq,
+                now_ms,
+                key,
+                op,
+                atomic,
+                sid,
+                result,
+                origin,
+                prev_hash,
+                digest,
+            ) in window
+        ]
+        # 有项取下一序号为末项序号，无项取 after。
+        next_seq = window[-1][0] if window else after
+        payload = {"下个序号": next_seq, "事件": events}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def audit(self, after=0, limit=100):
         """返回防篡改审计事件 JSON；查询不老化，O(limit) 时空。
