@@ -262,9 +262,10 @@ class StatsRestoreTest(unittest.TestCase):
         with self.assertRaises(ResourceError):
             s.stats_restore("r1", wrap(doc))
 
-    def test_meter_rows_do_not_check_references(self):
+    def test_user_meter_unknown_user_is_resource_error(self):
         s = make()
-        # 用户计量允许未注册用户；模板计量允许当前不存在（含已删）模板标识。
+        # 用户计量标识亦须为已注册用户；未知者抛 ResourceError，且统计与
+        # 成功缓存均不变。
         doc = {
             "版本": 1,
             "建立": {"总数": 0, "成功": 0},
@@ -272,12 +273,26 @@ class StatsRestoreTest(unittest.TestCase):
             "用户计量": [
                 {"标识": "ghost", "通过": 1, "拒绝": 2, "下线": 3, "通过字节": 40}
             ],
+            "模板计量": [],
+        }
+        with self.assertRaises(ResourceError):
+            s.stats_restore("r1", wrap(doc))
+        # 失败不占 key：同 key 随即首次成功。
+        self.assertEqual(s.stats_restore("r1", self.EMPTY), self.EMPTY)
+
+    def test_template_meter_rows_do_not_check_references(self):
+        s = make()
+        # 模板计量允许当前不存在（含已删）模板标识。
+        doc = {
+            "版本": 1,
+            "建立": {"总数": 0, "成功": 0},
+            "用户失败": [],
+            "用户计量": [],
             "模板计量": [
                 {"标识": "bronze", "通过": 0, "拒绝": 0, "下线": 1, "通过字节": 0}
             ],
         }
         out = parse(s.stats_restore("r1", wrap(doc)))
-        self.assertEqual(out["用户计量"][0]["标识"], "ghost")
         self.assertEqual(out["模板计量"][0]["标识"], "bronze")
 
     def test_success_greater_than_total_is_value_error(self):
