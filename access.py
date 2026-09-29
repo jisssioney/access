@@ -112,6 +112,18 @@
   紧凑 JSON（ensure_ascii=False、separators=(',',':')）UTF-8 字节 sha256
   小写值，输出加 LF。首调结果取项目结果、原序号 0；重放结果“重放”、原序号
   指认对应首次事件；参数错、异参 key 不记。查询 O(limit) 时空、不老化不改态。
+- Sessions.batch_audit_restore(key,text) 将 batch_audit 分页结果原子接入批量
+  防篡改审计链：key 沿凭据约束，text 非 str 抛 TypeError；JSON、重键、编码、
+  结构、范围或事件超过 1000 项错均 ValueError；顶层“下个序号/事件”及事件
+  十键“序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/哈希”键序/类型沿
+  batch_audit 基线；非空页序号连续、游标等于末序号，自第 2 项起前哈希衔接，
+  每项哈希按前九键复算，原序号为 0 或指向同键/操作/原子/会话的更早首次项；
+  空页游标即页锚。非空页锚为首序号减 1、首项前哈希，空页锚为游标；当前链尾
+  不符（首序号≠当前末序号+1、首项前哈希≠当前末哈希，或空页游标≠当前末序号）
+  抛 StateError(页锚,当前末序号)，余不符 ValueError。全验后原子追加十元组，
+  失败不改链；不恢复业务态、缓存或幂等索引，接入不写链。独立缓存仅成功占位，
+  同参重放原字节且不追加，异参 ValueError。返回 追加/末序号/末哈希/摘要，
+  摘要为前三键紧凑 JSON UTF-8 字节 sha256 小写值，LF 尾；O(事件数) 时空。
 - Sessions.credential_change 凭据轮换：按 key 独立重放缓存，首果（含参数
   异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked 抛
   AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
@@ -1423,6 +1435,18 @@ class Sessions:
     输出加 LF。合法首调逐项结果取项目结果、原序号 0；同参重放逐项结果“重放”、
     原序号指认对应首次事件；参数错与异参 key 不记。与 audit 的 do/接管链及
     verify_audit 互不影响。
+    batch_audit_restore(key, text) 将 batch_audit 分页结果原子接入批量链尾：
+    key 沿用凭据约束，text 非 str 抛 TypeError；JSON、重键、编码、结构、范围
+    或事件超过 1000 项错均 ValueError。非空页序号须连续、游标等于末序号，
+    自第 2 项起前哈希衔接，每项哈希按前九键复算，原序号为 0 或指向同
+    （键,操作,原子,会话）的更早首次项；空页游标即页锚。非空页锚为首序号减 1、
+    首项前哈希，空页锚为游标；当前链尾不符（首序号≠末序号+1、首项前哈希≠
+    当前末哈希，或空页游标≠末序号）抛 StateError(页锚, 当前末序号)。全验后
+    原子追加十元组，失败不改链；不恢复业务态、缓存或幂等索引，接入不写链、
+    不老化。独立缓存仅成功占位，同型同 text 重放原字节且不追加，异参
+    ValueError。返回 LF 尾紧凑 JSON：追加:int/末序号:int/末哈希:str/摘要:str，
+    摘要为前三键同法编码 UTF-8 字节的 sha256 小写值，空页追加 0。O(事件数)
+    时空。
     runtime_checkpoint(now_ms) 先验参再老化一次，输出运行态检查点基线
     JSON（LF 尾）：顶层键序版本/时刻/容量/配额/摘要，版本 1，容量沿用
     同刻 clog 对象契约（时刻等于顶层）、配额沿用同刻 quota_checkpoint
@@ -1694,6 +1718,9 @@ class Sessions:
         self._batch_migrate_chain_index = {}
         self._batch_keepalive_chain_index = {}
         self._batch_chain_tail = "0" * 64
+        # 链内各（键,操作,原子,会话）签名的全局首次序号，供 batch_audit_restore
+        # O(1) 指认原序号；随 _batch_chain_record 与接入追加按序 setdefault。
+        self._batch_chain_sig_first = {}
         # config_change 配置加载/回滚/升级事务的重放缓存，与 do/meter/
         # capacity/fault/pool_fault/timeout_fault/batch_offline 分域：
         # key -> (op, text, now_ms, outcome)；原序号索引亦独立分域。
@@ -1756,6 +1783,10 @@ class Sessions:
         # key -> (text, 结果 JSON)；仅首次成功缓存，失败（含参数错与
         # StateError）不占 key。恢复不写审计链，故无原序号索引。
         self._audit_restore_cache = {}
+        # batch_audit_restore 批量审计页接入的重放缓存，与其余各域独立：
+        # key -> (text, 结果 JSON)；仅首次成功缓存，失败（含参数错与
+        # StateError）不占 key。接入不写批量链幂等（原序号）索引。
+        self._batch_audit_restore_cache = {}
         # stats_restore 统计快照恢复的重放缓存，与其余各域独立：
         # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错与
         # ResourceError）不占 key。恢复不写审计链，故无原序号索引。
@@ -6012,6 +6043,9 @@ class Sessions:
                 (seq, now_ms, key, op, atomic, sid, result, item_origin,
                  prev_hash, digest)
             )
+            self._batch_chain_sig_first.setdefault(
+                (key, op, atomic, sid), seq
+            )
             self._batch_chain_tail = digest
         if origin == 0:
             index[key] = first_seq
@@ -6054,6 +6088,263 @@ class Sessions:
         next_seq = window[-1][0] if window else after
         payload = {"下个序号": next_seq, "事件": events}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def batch_audit_restore(self, key, text):
+        """将 batch_audit 分页结果原子接入批量防篡改审计链尾，返回 LF 结尾紧凑 JSON。
+
+        key 沿用凭据约束（型/值错 TypeError/ValueError），text 须为 str
+        （非 str 抛 TypeError）。text 须为 batch_audit 同法的规范页：JSON、
+        重键、编码、结构、范围或事件超过 1000 项错均抛 ValueError；顶层恰为
+        “下个序号/事件”且键序如此，事件项恰为十键
+        “序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/哈希”且键序如此，
+        键序/类型沿 batch_audit 基线（原子为 bool，序号/时刻/原序号为非 bool
+        int，余为 str，前哈希/哈希为 64 位小写十六进制）。非空页序号须逐项
+        连续、游标（下个序号）等于末项序号，自第 2 项起前哈希须等于上项哈希，
+        每项哈希按前九键规则复算相符，原序号为 0 或指向同（键,操作,原子,
+        会话）的更早首次项；空页游标须为页锚。整体须为与 batch_audit 同法
+        （ensure_ascii=False、separators=(',',':')、单个 LF 结尾）的规范编码。
+
+        页锚：非空页锚序号为首序号减 1、锚哈希为首项前哈希；空页锚序号为
+        游标（无锚哈希）。接入前当前批量链末尾须恰为页锚：非空页要求首序号
+        等于当前末序号 +1 且首项前哈希等于当前末哈希，空页要求游标等于当前
+        末序号；任一不符抛 StateError(页锚序号, 当前末序号)，发生在任何追加
+        之前。结构与锚点全验后一次性把事件按原十元组接到批量链尾，失败不改
+        链；不恢复业务态、缓存或任何操作幂等（原序号）索引，接入本身不写链。
+        不老化。
+
+        验 key 后以独立缓存域且仅缓存成功：同型同 text 重放不解析、不重验、
+        不追加，直接返回首次结果原字节，异参抛 ValueError；失败（含参数错与
+        StateError）不占 key。返回键序“追加/末序号/末哈希/摘要”：追加:int、
+        末序号:int、末哈希:str，摘要为前三键同法紧凑编码 UTF-8 字节的
+        sha256 小写值；空页追加 0。O(事件数) 时间、O(事件数) 空间。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_audit_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不重验、不追加，仅核对同型同 text 后返回原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        anchor_seq, anchor_hash, events = self._parse_batch_audit_restore_page(text)
+
+        # 锚点：当前批量链末尾（空链为序号 0、64 个 0）须恰为页锚；不符即
+        # StateError(页锚序号, 当前末序号)，发生在任何追加之前。空页不携带
+        # 锚哈希，仅核对游标序号。
+        tail_seq = len(self._batch_chain_events)
+        tail_hash = self._batch_chain_tail if tail_seq else "0" * 64
+        if events:
+            if anchor_seq != tail_seq or anchor_hash != tail_hash:
+                raise StateError(anchor_seq, tail_seq)
+        elif anchor_seq != tail_seq:
+            raise StateError(anchor_seq, tail_seq)
+
+        # 全验后一次追加：事件十元组原样接尾，仅推进批量链序列与末哈希及链
+        # 内（键,操作,原子,会话）首次序号校验视图；不动业务态、各缓存与四类
+        # 操作幂等（原序号）索引，接入不入链。
+        self._batch_chain_events.extend(events)
+        if events:
+            self._batch_chain_tail = events[-1][9]
+            for seq, _now, bkey, op, atomic, sid, _r, _o, _p, _h in events:
+                self._batch_chain_sig_first.setdefault(
+                    (bkey, op, atomic, sid), seq
+                )
+
+        appended = len(events)
+        result = self._render_audit_restore(
+            appended, tail_seq + appended, self._batch_chain_tail
+        )
+        self._batch_audit_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_batch_audit_restore_page(self, text):
+        """解析并严格全量校验 batch_audit 分页文本，返回
+        (锚序号, 锚哈希, 事件十元组列表)；空页锚哈希为 None。任何不符契约
+        （含非规范编码）处均抛 ValueError，且不读不改当前批量链。
+
+        JSON 解析或重键失败；顶层非恰为“下个序号/事件”且键序如此；
+        下个序号非非 bool 非负 int；事件非列表或项数超过 1000；事件项非恰
+        为十键序，原子非 bool，序号/时刻/原序号非非 bool int 或越界
+        （序号>=1、时刻>=0、原序号>=0），四个负载字段非 str，前哈希/哈希
+        非 64 位小写十六进制；非空页序号不逐项连续、游标不等于末项序号，
+        自第 2 项起前哈希不衔接、哈希复算不符，原序号非 0 且不小于本项序号
+        或未指向同（键,操作,原子,会话）的更早首次项，皆 ValueError。最后以
+        解析值按 batch_audit 基线重建完整页（单个 LF 结尾），与原文逐字节
+        不一致即非规范编码 ValueError。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"batch audit page is not valid JSON: {exc}") from exc
+        top_keys = ["下个序号", "事件"]
+        if not isinstance(doc, dict) or list(doc) != top_keys:
+            raise ValueError(
+                "batch audit page top-level keys must be 下个序号/事件 in order"
+            )
+        next_seq = self._cp_int(doc["下个序号"], "下个序号", 0)
+        raw_events = doc["事件"]
+        if not isinstance(raw_events, list):
+            raise ValueError("事件 must be a list")
+        if len(raw_events) > 1000:
+            raise ValueError(f"事件 count {len(raw_events)} exceeds 1000")
+
+        event_keys = [
+            "序号",
+            "时刻",
+            "键",
+            "操作",
+            "原子",
+            "会话",
+            "结果",
+            "原序号",
+            "前哈希",
+            "哈希",
+        ]
+        events = []
+        # 本页内各（键,操作,原子,会话）的首次序号；更早历史的首次序号查实例
+        # 链签名视图 _batch_chain_sig_first（O(1)），整页校验 O(事件数)。
+        page_first = {}
+        prev_hash = None
+        first_seq = None
+        for index, item in enumerate(raw_events, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    f"batch audit event {index} keys must be "
+                    "序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(item["序号"], "事件.序号", 1)
+            now_ms = self._cp_int(item["时刻"], "事件.时刻", 0)
+            bkey = item["键"]
+            op = item["操作"]
+            atomic = item["原子"]
+            sid = item["会话"]
+            result = item["结果"]
+            if not isinstance(atomic, bool):
+                raise ValueError(
+                    f"事件.原子 must be a bool, got {type(atomic).__name__}"
+                )
+            for label, value in (
+                ("事件.键", bkey),
+                ("事件.操作", op),
+                ("事件.会话", sid),
+                ("事件.结果", result),
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"{label} must be a str, got {type(value).__name__}"
+                    )
+            origin = self._cp_int(item["原序号"], "事件.原序号", 0)
+            given_prev = self._cp_hex64(item["前哈希"], "事件.前哈希")
+            digest = self._cp_hex64(item["哈希"], "事件.哈希")
+
+            if first_seq is None:
+                first_seq = seq
+            elif seq != first_seq + index - 1:
+                raise ValueError(
+                    "batch audit event seq must be contiguous: "
+                    f"want {first_seq + index - 1}, got {seq}"
+                )
+            if index > 1 and given_prev != prev_hash:
+                raise ValueError(
+                    f"batch audit event {seq} 前哈希 does not link to the prior hash"
+                )
+            sig = (bkey, op, atomic, sid)
+            if origin:
+                if origin >= seq:
+                    raise ValueError(
+                        f"batch audit event {seq} 原序号 must be 0 or < {seq}, "
+                        f"got {origin}"
+                    )
+                # 原序号须指向同签名的更早首次项：序号在已入链历史则取链上
+                # 十元组，否则取本页已解析前缀（连续序号直接定位）。锚点核对
+                # 在解析之后，此处历史可能尚短，越界一律 ValueError。
+                if origin < first_seq:
+                    chain_events = self._batch_chain_events
+                    if origin > len(chain_events):
+                        raise ValueError(
+                            f"batch audit event {seq} 原序号 {origin} is beyond "
+                            "the events currently on the chain"
+                        )
+                    target = chain_events[origin - 1]
+                else:
+                    target = events[origin - first_seq]
+                target_sig = (target[2], target[3], target[4], target[5])
+                if target_sig != sig:
+                    raise ValueError(
+                        f"batch audit event {seq} 原序号 must point to an earlier "
+                        "first event with the same 键/操作/原子/会话"
+                    )
+                # 全局首次：历史在册取历史首序号，否则取本页已见首序号。
+                hist_first = self._batch_chain_sig_first.get(sig)
+                want_first = (
+                    hist_first if hist_first is not None else page_first.get(sig)
+                )
+                if want_first != origin:
+                    raise ValueError(
+                        f"batch audit event {seq} 原序号 must point to the first "
+                        f"occurrence seq {want_first}, got {origin}"
+                    )
+            if (
+                self._batch_chain_hash(
+                    seq, now_ms, bkey, op, atomic, sid, result, origin, given_prev
+                )
+                != digest
+            ):
+                raise ValueError(f"batch audit event {seq} 哈希 does not match")
+
+            events.append(
+                (seq, now_ms, bkey, op, atomic, sid, result, origin,
+                 given_prev, digest)
+            )
+            page_first.setdefault(sig, seq)
+            prev_hash = digest
+
+        if events:
+            anchor_seq = first_seq - 1
+            anchor_hash = events[0][8]
+            if next_seq != events[-1][0]:
+                raise ValueError(
+                    "下个序号 must equal the last event seq: "
+                    f"want {events[-1][0]}, got {next_seq}"
+                )
+        else:
+            # 空页锚即游标；无事件可校，锚哈希缺省。
+            anchor_seq = next_seq
+            anchor_hash = None
+
+        # 非规范编码：完整二键页（单个 LF 结尾）须与原文逐字节一致；任何排版
+        # 差异（空白、Unicode 转义、键序、多余/缺失 LF）皆拒绝。
+        canonical = json.dumps(
+            {
+                "下个序号": next_seq,
+                "事件": [
+                    {
+                        "序号": seq,
+                        "时刻": now_ms,
+                        "键": bkey,
+                        "操作": op,
+                        "原子": atomic,
+                        "会话": sid,
+                        "结果": result,
+                        "原序号": origin,
+                        "前哈希": given_prev,
+                        "哈希": digest,
+                    }
+                    for seq, now_ms, bkey, op, atomic, sid, result, origin,
+                    given_prev, digest in events
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n"
+        if canonical != text:
+            raise ValueError("batch audit page is not canonical compact JSON")
+        return anchor_seq, anchor_hash, events
 
     def fault_stats(self, now_ms):
         """返回后端故障统计 JSON；查询不认证、不老化、不改退避、不审计、
