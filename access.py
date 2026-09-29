@@ -52,9 +52,16 @@
   stats_restore 提供建立计数、按用户失败计数与按用户/模板计量计数的
   统计快照检查点（版本 1，摘要覆盖前五键）与按 key 原子恢复：检查点
   只读、不老化，恢复严格全验（JSON/重键/键序结构类型值/排序重复/版本
-  摘要错 ValueError，用户失败引用未注册用户 ResourceError，计量不验
-  引用）后原子替换五类统计，任何失败不改统计与缓存；仅缓存首次成功、
-  同型同 text 重放原字节、异参 ValueError，不老化、不审计。sessions(now_ms,
+  摘要错 ValueError，用户失败与用户计量引用未注册用户 ResourceError，
+  模板计量不验引用）后原子替换五类统计，任何失败不改统计与缓存；仅缓存首次成功、
+  同型同 text 重放原字节、异参 ValueError，不老化、不审计。stats_merge 提供
+  base/left/right 三份版本 1 检查点的三方合并：缺标识计 0，先 left 后 right
+  逐计数验分支不回退（低于 base）且成功增量不超总数增量（违者 StateError 标
+  "left"/"right"），结果计数 left+right-base、列表取并集码点升序且全 0 项
+  省略；用户失败或用户计量引用未注册用户 ResourceError、模板不验引用；全验后
+  原子替换五类统计，返回 stats_checkpoint() 的 LF 尾 JSON，失败不改统计与缓存；
+  独立 key 仅缓存成功，同型同四参重放原字节、异参 ValueError，不老化、不认证、
+  不审计、不改其他状态。sessions(now_ms,
   after="", limit=100) 只读游标列出会话与未到期队项（不老化、不认证、
   不回收租约、不写审计/事件/缓存、不改计数）：按 now_ms 取视图，标识
   Unicode 码点升序、sid>after 的前 limit 项，顶层时刻/下个/剩余/项目，
@@ -1669,6 +1676,11 @@ class Sessions:
         # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错与
         # ResourceError）不占 key。恢复不写审计链，故无原序号索引。
         self._stats_restore_cache = {}
+        # stats_merge 统计快照三方合并的重放缓存，与其余各域独立：
+        # key -> ((base, left, right), 结果 JSON)；仅首次成功缓存，失败
+        # （含参数错、ResourceError、StateError）不占 key。合并不写审计链，
+        # 故无原序号索引。
+        self._stats_merge_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -5879,10 +5891,10 @@ class Sessions:
         key 沿凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
         text 非 str 抛 TypeError。JSON 解析、重键、键集/键序、结构、类型、
         取值范围（含成功 > 总数）、排序或重复、版本或摘要错均抛 ValueError；
-        用户失败行引用未注册用户抛 ResourceError，用户计量行不验用户引用、
-        模板计量行不验模板引用（均允许历史/已删标识）。全部校验通过后原子
-        替换五类统计（认证器、会话、租约、队列、配置及各域缓存均不变）；
-        任何失败不改实例统计与缓存，不老化、不审计。
+        用户失败行与用户计量行引用未注册用户抛 ResourceError，模板计量行不验
+        模板引用（允许历史/已删标识）。全部校验通过后原子替换五类统计
+        （认证器、会话、租约、队列、配置及各域缓存均不变）；任何失败不改
+        实例统计与缓存，不老化、不审计。
 
         重放缓存与各域独立：仅缓存首次成功，同 key 同型同 text 重放不解析、
         不重验、不替换，直接返回首次规范包原字节；异参（含异型）抛
@@ -5911,6 +5923,11 @@ class Sessions:
                 raise ResourceError(
                     f"stats checkpoint references unregistered user: {user!r}"
                 )
+        for ident, _p, _d, _o, _by in user_rows:
+            if ident not in self._auth:
+                raise ResourceError(
+                    f"stats checkpoint references unregistered user: {ident!r}"
+                )
 
         # 全验后原子替换五类统计；计数值存活储为 list，沿用既有 += 更新路径。
         self._establish_total = total
@@ -5927,6 +5944,144 @@ class Sessions:
         self._stats_restore_cache[key] = (text, result)
         return result
 
+    def stats_merge(self, key, base, left, right):
+        """按 base/left/right 三份版本 1 统计快照检查点做同源分支三方合并，
+        原子替换五类统计后返回 stats_checkpoint() 的 LF 尾基线 JSON。
+
+        key 沿凭据约束，base/left/right 须为 str：key 型/值错抛
+        TypeError/ValueError，三文本型错抛 TypeError。三文本按
+        stats_checkpoint 版本 1 契约解析（JSON/重键/键序结构类型值/排序
+        重复/版本/摘要），任一非法抛 ValueError；任一文本的用户失败行或
+        用户计量行引用未注册用户抛 ResourceError，模板计量不验模板引用。
+        全部解析与引用校验先于合并语义校验，任何失败不改实例统计与缓存。
+
+        合并逐计数进行，标识缺失按计数 0 计：先验 left 再验 right，分支
+        任一计数低于 base（含建立总数/成功）抛 StateError("left")/
+        StateError("right")；建立成功增量大于建立总数增量同样抛对应侧
+        StateError。结果建立计数为 left+right-base；用户失败、用户计量、
+        模板计量各取三文本标识并集、按 Unicode 码点升序，结果计数同为
+        left+right-base，四项全 0 的行省略。全验后原子替换五类统计
+        （认证器、会话、租约、队列、配置及各域缓存均不变），不老化、
+        不认证、不审计、不改其他状态。
+
+        重放缓存与各域独立：仅缓存首次成功，同 key 同型同四参重放不解析、
+        不重验、不替换，直接返回首次结果原字节；异参（含异型）抛
+        ValueError；失败（含参数错、ResourceError 与 StateError）不占
+        key。首次 O(n log n) 时间、O(n) 空间（n 为三文本行数之和），
+        重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._stats_merge_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同四参后返回缓存原字节。
+            c_params, result = cached
+            params = (base, left, right)
+            if any(
+                type(value) is not type(c_value) or value != c_value
+                for value, c_value in zip(params, c_params)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        for name, value in (
+            ("base", base), ("left", left), ("right", right),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"{name} must be a str, got {type(value).__name__}"
+                )
+
+        # 三份文本全部解析（ValueError 先于引用与合并语义校验）。
+        parsed = {}
+        for label, text in (("base", base), ("left", left), ("right", right)):
+            total, success, fail_rows, user_rows, template_rows = (
+                self._parse_stats_checkpoint(text)
+            )
+            parsed[label] = (
+                total,
+                success,
+                {user: (a, r, st, b) for user, a, r, st, b in fail_rows},
+                {ident: (p, d, o, by) for ident, p, d, o, by in user_rows},
+                {ident: (p, d, o, by) for ident, p, d, o, by in template_rows},
+            )
+
+        # 引用校验：三份文本的用户失败与用户计量标识均须已注册；模板不验。
+        for label in ("base", "left", "right"):
+            _t, _s, fail_map, user_map, _tm = parsed[label]
+            for ident in fail_map:
+                if ident not in self._auth:
+                    raise ResourceError(
+                        f"stats checkpoint references unregistered user: {ident!r}"
+                    )
+            for ident in user_map:
+                if ident not in self._auth:
+                    raise ResourceError(
+                        f"stats checkpoint references unregistered user: {ident!r}"
+                    )
+
+        # 逐计数分支校验，先 left 后 right；缺失标识计 0。
+        def check_side(label):
+            b_total, b_success, b_fail, b_user, b_template = parsed["base"]
+            s_total, s_success, s_fail, s_user, s_template = parsed[label]
+            if s_total < b_total or s_success < b_success:
+                raise StateError(label)
+            if s_success - b_success > s_total - b_total:
+                raise StateError(label)
+            for b_map, s_map in (
+                (b_fail, s_fail), (b_user, s_user), (b_template, s_template),
+            ):
+                for ident in sorted(set(b_map) | set(s_map)):
+                    b_values = b_map.get(ident, (0, 0, 0, 0))
+                    s_values = s_map.get(ident, (0, 0, 0, 0))
+                    if any(
+                        s_values[i] < b_values[i] for i in range(4)
+                    ):
+                        raise StateError(label)
+
+        check_side("left")
+        check_side("right")
+
+        b_total, b_success, b_fail, b_user, b_template = parsed["base"]
+        l_total, l_success, l_fail, l_user, l_template = parsed["left"]
+        r_total, r_success, r_fail, r_user, r_template = parsed["right"]
+
+        def merge_map(b_map, l_map, r_map):
+            merged = {}
+            for ident in sorted(set(b_map) | set(l_map) | set(r_map)):
+                b_values = b_map.get(ident, (0, 0, 0, 0))
+                l_values = l_map.get(ident, (0, 0, 0, 0))
+                r_values = r_map.get(ident, (0, 0, 0, 0))
+                values = [
+                    l_values[i] + r_values[i] - b_values[i] for i in range(4)
+                ]
+                if any(values):
+                    merged[ident] = values
+            return merged
+
+        total = l_total + r_total - b_total
+        success = l_success + r_success - b_success
+        fail_merged = merge_map(b_fail, l_fail, r_fail)
+        user_merged = merge_map(b_user, l_user, r_user)
+        template_merged = merge_map(b_template, l_template, r_template)
+
+        # 全验后原子替换五类统计；计数值存活储为 list，沿用既有 += 更新路径。
+        self._establish_total = total
+        self._establish_success = success
+        self._user_fail = {
+            ident: list(values) for ident, values in fail_merged.items()
+        }
+        self._meter_stats_user = {
+            ident: list(values) for ident, values in user_merged.items()
+        }
+        self._meter_stats_template = {
+            ident: list(values) for ident, values in template_merged.items()
+        }
+
+        result = self._stats_checkpoint_text()
+        self._stats_merge_cache[key] = ((base, left, right), result)
+        return result
+
     def _parse_stats_checkpoint(self, text):
         """解析并全量校验统计快照检查点文本，返回
         (建立总数, 建立成功, 用户失败行五元组列表 (用户,认证,资源,状态,后端),
@@ -5940,8 +6095,8 @@ class Sessions:
         键序“标识/通过/拒绝/下线/通过字节”，标识为凭据约束串，四项为
         非 bool 非负 int，行按标识 Unicode 码点严格升序、无重复；摘要须为
         规范化前五键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值（与原文
-        排版无关）。仅做结构自洽校验；用户失败的用户注册由调用方判定，
-        用户计量与模板计量不验引用。
+        排版无关）。仅做结构自洽校验；用户失败的用户与用户计量标识的注册由
+        调用方判定，模板计量不验引用。
         """
         try:
             doc = json.loads(text, object_pairs_hook=_unique_object)
