@@ -12492,19 +12492,31 @@ class Sessions:
 # ---------------------------------------------------------------------------
 # 命令行入口：python access.py <子命令>
 #
-# 目前仅一个子命令 stats-merge：stdin 读入 UTF-8 JSON 请求对象（尾部仅许
-# 空白），临时实例注册 users 后调用 Sessions.stats_merge；成功把返回值原
-# 字节写 stdout（退出 0、stderr 空），失败 stdout 空、stderr 写 LF 尾紧凑
-# JSON {"错误":"stats-merge","类型":<异常类名>}，TypeError/ValueError
-# 退出 2、ResourceError 退出 3、StateError 退出 4；缺失或未知子命令按
-# ValueError（退出 2）。同输入逐字节同结果，时间 O(L+n log n)、空间
-# O(L+n)，L 为输入字节长度、n 为 users 总数。
+# 子命令 stats-merge：stdin 读入 UTF-8 JSON 请求对象（尾部仅许空白），临时
+# 实例注册 users 后调用 Sessions.stats_merge；成功把返回值原字节写 stdout
+# （退出 0、stderr 空），失败 stdout 空、stderr 写 LF 尾紧凑 JSON
+# {"错误":"stats-merge","类型":<异常类名>}，TypeError/ValueError 退出 2、
+# ResourceError 退出 3、StateError 退出 4；缺失或未知子命令按 ValueError
+# （退出 2，信封仍写 stats-merge）。同输入逐字节同结果，时间 O(L+n log n)、
+# 空间 O(L+n)，L 为输入字节长度、n 为 users 总数。
+#
+# 子命令 stats-delta：stdin 读入 UTF-8 JSON 请求对象，键依次且仅为
+# users/base/current（users 约束同 stats-merge，base/current 为版本 1 统计
+# 检查点文本），临时实例注册 users 后调用只读的 Sessions.stats_delta；
+# 成功 stdout 仅写其返回的 LF 尾紧凑 JSON，失败信封为
+# {"错误":"stats-delta","类型":<异常类名>}，退出码同上。两子命令均不带
+# 额外参数。
 # ---------------------------------------------------------------------------
 
 _CLI_MERGE_COMMAND = "stats-merge"
+_CLI_DELTA_COMMAND = "stats-delta"
 _CLI_REQUEST_KEYS = ("key", "users", "base", "left", "right")
+_CLI_DELTA_REQUEST_KEYS = ("users", "base", "current")
 _CLI_USERS_MIN = 1
 _CLI_USERS_MAX = 10000
+# 已知子命令；缺失（无参数）或未知子命令均按 ValueError，信封沿用基线
+# 值 stats-merge，保持历史逐字节行为。
+_CLI_COMMANDS = (_CLI_MERGE_COMMAND, _CLI_DELTA_COMMAND)
 # 失败信封的退出码：参数类错误 2、资源错误 3、状态错误 4。
 _CLI_EXIT_CODES = {
     TypeError: 2,
@@ -12514,52 +12526,12 @@ _CLI_EXIT_CODES = {
 }
 
 
-def _parse_cli_request(raw):
-    """解析 stats-merge 请求字节，返回 (key, users, base, left, right)。
-
-    raw 须为 UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许
-    空白；编码、JSON、重键、顶层形态、键集或键序错抛 ValueError。
-    key/base/left/right 字段类型错抛 TypeError，users 字段非 list 抛
-    TypeError；users 须 1..10000 个 str，元素沿凭据约束（1..256 UTF-8
-    字节、不含 U+0000），按 Unicode 码点严格升序且互异，长度、取值、
-    排序或重复错抛 ValueError，元素型错抛 TypeError。
+def _parse_cli_users(users):
+    """校验并返回 users 列表：须为 list，含 1..10000 个 str，元素沿凭据
+    约束（1..256 UTF-8 字节、不含 U+0000），按 Unicode 码点严格升序且
+    互异；非 list 或元素型错抛 TypeError，长度、取值、排序或重复错抛
+    ValueError。
     """
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"stdin must be valid UTF-8: {exc}") from exc
-    # 仅 JSON 定义的空白（空格/制表/换行/回车）；对象前后均不得有其他字符，
-    # 对象前连合法空白也不允许。
-    if text[:1] in " \t\r\n":
-        raise ValueError("request must start directly with the JSON object")
-    try:
-        doc, end = json.JSONDecoder(
-            object_pairs_hook=_unique_object
-        ).raw_decode(text)
-    except ValueError as exc:
-        raise ValueError(f"request is not valid JSON: {exc}") from exc
-    tail = text[end:]
-    if any(char not in " \t\r\n" for char in tail):
-        raise ValueError("request may only have whitespace after the JSON object")
-    if not isinstance(doc, dict):
-        raise ValueError("request top level must be a JSON object")
-    if list(doc) != list(_CLI_REQUEST_KEYS):
-        raise ValueError(
-            "request keys must be exactly and in order: "
-            "key, users, base, left, right"
-        )
-    key = doc["key"]
-    users = doc["users"]
-    base = doc["base"]
-    left = doc["left"]
-    right = doc["right"]
-    for name, value in (
-        ("key", key), ("base", base), ("left", left), ("right", right),
-    ):
-        if not isinstance(value, str):
-            raise TypeError(
-                f"{name} must be a string, got {type(value).__name__}"
-            )
     if not isinstance(users, list):
         raise TypeError(
             f"users must be an array, got {type(users).__name__}"
@@ -12584,27 +12556,126 @@ def _parse_cli_request(raw):
                     "users must be sorted by Unicode codepoint"
                 )
         previous = user
+    return users
+
+
+def _decode_cli_request(raw):
+    """stdin 字节 → 顶层 JSON 值：UTF-8 解码（失败 ValueError），对象前不
+    得有空白、对象后仅许 JSON 空白，重键与 JSON 语法错抛 ValueError。"""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"stdin must be valid UTF-8: {exc}") from exc
+    # 仅 JSON 定义的空白（空格/制表/换行/回车）；对象前后均不得有其他字符，
+    # 对象前连合法空白也不允许。
+    if text[:1] in " \t\r\n":
+        raise ValueError("request must start directly with the JSON object")
+    try:
+        doc, end = json.JSONDecoder(
+            object_pairs_hook=_unique_object
+        ).raw_decode(text)
+    except ValueError as exc:
+        raise ValueError(f"request is not valid JSON: {exc}") from exc
+    tail = text[end:]
+    if any(char not in " \t\r\n" for char in tail):
+        raise ValueError("request may only have whitespace after the JSON object")
+    if not isinstance(doc, dict):
+        raise ValueError("request top level must be a JSON object")
+    return doc
+
+
+def _parse_cli_request(raw):
+    """解析 stats-merge 请求字节，返回 (key, users, base, left, right)。
+
+    raw 须为 UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许
+    空白；编码、JSON、重键、顶层形态、键集或键序错抛 ValueError。
+    key/base/left/right 字段类型错抛 TypeError，users 字段非 list 抛
+    TypeError；users 须 1..10000 个 str，元素沿凭据约束（1..256 UTF-8
+    字节、不含 U+0000），按 Unicode 码点严格升序且互异，长度、取值、
+    排序或重复错抛 ValueError，元素型错抛 TypeError。
+    """
+    doc = _decode_cli_request(raw)
+    if list(doc) != list(_CLI_REQUEST_KEYS):
+        raise ValueError(
+            "request keys must be exactly and in order: "
+            "key, users, base, left, right"
+        )
+    key = doc["key"]
+    users = doc["users"]
+    base = doc["base"]
+    left = doc["left"]
+    right = doc["right"]
+    for name, value in (
+        ("key", key), ("base", base), ("left", left), ("right", right),
+    ):
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{name} must be a string, got {type(value).__name__}"
+            )
+    _parse_cli_users(users)
     return key, users, base, left, right
 
 
-def _run_stats_merge(key, users, base, left, right):
-    """建临时实例：注册全部 users 为已认证用户，直接执行一次 stats_merge。
+def _parse_cli_delta_request(raw):
+    """解析 stats-delta 请求字节，返回 (users, base, current)。
 
-    不加载任何配置（无地址池、无模板、容量取默认值），stats_merge
-    不老化、不认证、不审计、不碰其他状态，实例仅存活于本次调用。
+    与 stats-merge 同一条 stdin 契约（UTF-8、对象前无空白、尾部仅许 JSON
+    空白、重键/顶层形态/键序全验），区别仅在顶层键依次且仅为
+    users/base/current：base/current 非 str 抛 TypeError，users 约束同
+    stats-merge。
     """
+    doc = _decode_cli_request(raw)
+    if list(doc) != list(_CLI_DELTA_REQUEST_KEYS):
+        raise ValueError(
+            "request keys must be exactly and in order: users, base, current"
+        )
+    users = doc["users"]
+    base = doc["base"]
+    current = doc["current"]
+    for name, value in (("base", base), ("current", current)):
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{name} must be a string, got {type(value).__name__}"
+            )
+    _parse_cli_users(users)
+    return users, base, current
+
+
+def _temporary_sessions(users):
+    """建临时实例：注册全部 users 为已认证用户。不加载任何配置（无地址池、
+    无模板、容量取默认值），不触发认证/老化/审计/计数，实例仅存活于本次
+    调用。"""
     auth = Authenticator(1, 0)
     for user in users:
-        # 固定占位密码：仅完成注册，stats_merge 不认证，逐次结果不受影响。
+        # 固定占位密码：仅完成注册，下游接口不认证，逐次结果不受影响。
         auth.add(user, "x")
-    sessions = Sessions(auth, 1, 1, 0, lease_ms=1)
+    return Sessions(auth, 1, 1, 0, lease_ms=1)
+
+
+def _run_stats_merge(key, users, base, left, right):
+    """临时实例注册 users 后执行一次 stats_merge。
+
+    stats_merge 不老化、不认证、不审计、不碰其他状态，实例仅存活于本次
+    调用。
+    """
+    sessions = _temporary_sessions(users)
     return sessions.stats_merge(key, base, left, right)
 
 
-def _write_cli_error(exc):
+def _run_stats_delta(users, base, current):
+    """临时实例注册 users 后调用一次只读的 stats_delta。
+
+    不加载任何配置（无地址池、无模板、无持久状态），stats_delta 不老化、
+    不认证、不审计、不改任何计数，实例仅存活于本次调用。
+    """
+    sessions = _temporary_sessions(users)
+    return sessions.stats_delta(base, current)
+
+
+def _write_cli_error(exc, command=_CLI_MERGE_COMMAND):
     """向 stderr 写 LF 尾紧凑 JSON 信封，键序“错误/类型”，UTF-8 字节。"""
     envelope = json.dumps(
-        {"错误": _CLI_MERGE_COMMAND, "类型": type(exc).__name__},
+        {"错误": command, "类型": type(exc).__name__},
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -12613,17 +12684,24 @@ def _write_cli_error(exc):
 
 
 def main(argv):
-    """命令行分派：只受理 `python access.py stats-merge`，无额外参数。"""
-    if len(argv) != 2 or argv[1] != _CLI_MERGE_COMMAND:
+    """命令行分派：受理 `python access.py stats-merge` 与
+    `python access.py stats-delta`，均无额外参数。缺失或未知子命令沿用
+    基线行为：按 ValueError 写 stats-merge 信封并退出 2。"""
+    if len(argv) != 2 or argv[1] not in _CLI_COMMANDS:
         _write_cli_error(ValueError("missing or unknown subcommand"))
         return 2
+    command = argv[1]
     raw = sys.stdin.buffer.read()
     try:
-        key, users, base, left, right = _parse_cli_request(raw)
-        result = _run_stats_merge(key, users, base, left, right)
+        if command == _CLI_MERGE_COMMAND:
+            key, users, base, left, right = _parse_cli_request(raw)
+            result = _run_stats_merge(key, users, base, left, right)
+        else:
+            users, base, current = _parse_cli_delta_request(raw)
+            result = _run_stats_delta(users, base, current)
     except (TypeError, ValueError, ResourceError, StateError) as exc:
         # 失败：stdout 保持空，信封仅含命令名与异常类名。
-        _write_cli_error(exc)
+        _write_cli_error(exc, command)
         return _CLI_EXIT_CODES[type(exc)]
     sys.stdout.buffer.write(result.encode("utf-8"))
     sys.stdout.buffer.flush()
