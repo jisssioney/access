@@ -124,6 +124,23 @@
   失败不改链；不恢复业务态、缓存或幂等索引，接入不写链。独立缓存仅成功占位，
   同参重放原字节且不追加，异参 ValueError。返回 追加/末序号/末哈希/摘要，
   摘要为前三键紧凑 JSON UTF-8 字节 sha256 小写值，LF 尾；O(事件数) 时空。
+- Sessions.compliance_events/compliance_snapshot/compliance_restore 提供把
+  audit、batch_audit、capacity_events 三条源链每条源事件按真实追加先后同步
+  投影到同一条全局合规链的可续接运行态记录：此后每条源事件原子投影为六字段
+  全局序号/来源/来源序号/载荷/前哈希/哈希（来源仅 审计/批量/容量，载荷为
+  对应公开源事件按既有键序的紧凑 JSON 字符串，首项前哈希 64 个 0、哈希盖
+  前五字段），全局序号只按追加序连续分配、不按可回拨时刻重排，批量项目保持
+  输入序，容量推进仍先超时后晋升；源事件与其投影原子追加，源未产生不写全局
+  链。compliance_events 沿用 audit 的 after/limit（1..1000）语义，返回固定
+  键序 LF 尾紧凑 JSON、空页游标保持 after；compliance_snapshot 返回
+  版本/锚序号/锚哈希/上限/下个序号/事件/摘要，支持离线校验锚点、顺序、逐项
+  哈希与摘要。compliance_restore 以独立幂等 key 将规范版本 1 快照原子接到
+  全局链尾，只恢复合规事件：结构/键序/类型/范围/摘要/链衔接或载荷形态非法
+  ValueError，锚与当前链尾不符 StateError，text 非 str TypeError，同 key
+  同文本重放原字节且不重复追加、异参 ValueError，失败不改链不占 key，恢复不
+  生成自身事件。audit_restore/batch_audit_restore/creplay（含
+  runtime_restore）导入或替换源事件不倒灌历史事件；三入口不触发认证、老化或
+  统计，查询/快照 O(limit)、恢复 O(事件数) 时空，同状态同参逐字节一致。
 - Sessions.credential_change 凭据轮换：按 key 独立重放缓存，首果（含参数
   异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked 抛
   AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
@@ -1161,6 +1178,19 @@ _BATCH_AUDIT_KEEPALIVE = "批量保活"
 # 批量审计首次事件结果取项目结果（提交/部分/回滚），重放事件结果恒为“重放”。
 _BATCH_AUDIT_REPLAY = "重放"
 
+# 全局合规链：三条源链的来源标识（仅审计/批量/容量），其余链（接管审计、
+# 配置历史等）不入合规链。合规事件六键序 全局序号/来源/来源序号/载荷/前哈希/
+# 哈希，载荷为对应公开源事件（audit 九键、batch_audit 十键、capacity_events
+# 五键）按既有键序生成的紧凑 JSON 字符串，哈希盖前五字段。
+_COMPLIANCE_SOURCE_AUDIT = "审计"
+_COMPLIANCE_SOURCE_BATCH = "批量"
+_COMPLIANCE_SOURCE_CAPACITY = "容量"
+_COMPLIANCE_SOURCES = (
+    _COMPLIANCE_SOURCE_AUDIT,
+    _COMPLIANCE_SOURCE_BATCH,
+    _COMPLIANCE_SOURCE_CAPACITY,
+)
+
 # credential_change 凭据轮换：入防篡改审计链的操作名与返回 JSON 的结果串。
 _CREDENTIAL_OP = "凭据轮换"
 _CREDENTIAL_ROTATED = "已轮换"
@@ -1609,6 +1639,29 @@ class Sessions:
     separators=(',',':')），键序/型 追加:int/末序号:int/末哈希:str/摘要:str，
     摘要为前三键同法编码 UTF-8 字节的 sha256 小写值；空页追加 0。
     O(limit) 时间、O(limit) 空间。
+    compliance_events(after=0,limit=100) 只读返回 audit、batch_audit、
+    capacity_events 三条源链同步投影的全局合规链页：每条由运行态入口新产生的
+    源事件（restore 直接改存储不经投影入口）与源事件原子追加为六字段全局事件
+    全局序号/来源/来源序号/载荷/前哈希/哈希，来源仅审计/批量/容量，载荷为
+    对应公开源事件（audit 九键、batch_audit 十键、capacity_events 五键）按
+    既有键序的紧凑 JSON 字符串，全局序号按追加序连续、不按可回拨时刻重排，
+    批量项目保持输入顺序，容量推进先记超时再记晋升。after/limit 沿 audit 语义
+    （非 bool int，after<0 或 limit∉1..1000 分别 TypeError/ValueError），
+    顶层下个序号/事件、事件六键序及类型、LF 尾紧凑 JSON、空页游标保持 after，
+    O(limit) 时空。compliance_snapshot(after=0,limit=100) 返回版本 1、锚序号、
+    锚哈希、上限、下个序号、事件和摘要（键序及摘要盖前六键沿 audit_snapshot
+    契约），after 大于当前末全局序号（空链 0）抛 KeyError(after)，可离线校验
+    锚点、顺序、逐项哈希与摘要。compliance_restore(key,text) 以独立幂等 key
+    将版本 1 规范快照原子接到全局链尾，只恢复合规事件：key 沿凭据约束、text
+    非 str 抛 TypeError；载荷须为对应来源公开事件规范形态（审计/批量源哈希
+    自洽、容量判定/入队序合法、载荷内序号等于来源序号、紧凑编码逐字节规范），
+    快照结构/键序/类型/范围/摘要/链内衔接或载荷形态非法抛 ValueError；锚与
+    当前链尾不符抛 StateError(锚序号,当前末序号)；全验后一次追加六元组，
+    失败不改链、不占 key；同 key 同型同 text 重放原字节且不重复追加，异参
+    ValueError；恢复不生成自身事件，不恢复源链/业务态/缓存，audit_restore、
+    batch_audit_restore 与 creplay（含 runtime_restore）导入或替换源事件均
+    不倒灌合规历史；三入口不触发认证、老化或统计，恢复 O(事件数) 时空，
+    同状态同参逐字节同结果。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -1706,6 +1759,17 @@ class Sessions:
         # 取消保留原入队序；事件时刻可早于前事件（显式时钟允许回拨）。
         self._capacity_events = []
         self._capacity_tail = "0" * 64
+
+        # 全局合规链：三条源链（audit 防篡改审计链、batch_audit 批量审计链、
+        # capacity_events 容量事件链）每条源事件按追加先后同步投影为六元组
+        # （全局序号, 来源, 来源序号, 载荷, 前哈希, 哈希），序号自 1 连续；
+        # 全局序号只认追加序、不按可回拨时刻重排。载荷为对应公开源事件按既有
+        # 键序生成的紧凑 JSON 字符串。首项前哈希为 64 个 0，余承前项；哈希盖
+        # 前五字段。源事件经 audit_restore/batch_audit_restore/creplay 导入或
+        # 替换时不倒灌合规链，compliance_restore 只恢复合规事件本身且不生成
+        # 自身事件。
+        self._compliance_events = []
+        self._compliance_tail = "0" * 64
 
         # 后端故障：截至时刻（0 表示无故障）与按用户退避 (n, retry_at)；
         # fault 的重放缓存与 do/meter/capacity 分域：
@@ -1835,6 +1899,10 @@ class Sessions:
         # key -> (text, 结果 JSON)；仅首次成功缓存，失败（含参数错与
         # StateError）不占 key。接入不写批量链幂等（原序号）索引。
         self._batch_audit_restore_cache = {}
+        # compliance_restore 全局合规快照恢复的重放缓存，与其余各域独立：
+        # key -> (text, 结果 JSON)；仅首次成功缓存，失败（含参数错与
+        # StateError）不占 key。恢复只接合规事件、不生成自身事件。
+        self._compliance_restore_cache = {}
         # stats_restore 统计快照恢复的重放缓存，与其余各域独立：
         # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错与
         # ResourceError）不占 key。恢复不写审计链，故无原序号索引。
@@ -6088,6 +6156,7 @@ class Sessions:
         结果恒“重放”、原序号指认对应首次事件 origin+i（results 不用）。四类
         操作各持 index（同名 key 跨操作不互相指认），事件始终追加到同一条链。
         首项前哈希为 64 个 0，余项承前项。仅追加链事件，不改其余任何状态。
+        每条批量源事件落链同时按输入序同步投影到全局合规链（来源“批量”）。
         """
         first_seq = len(self._batch_chain_events) + 1
         for i, sid in enumerate(sids):
@@ -6102,14 +6171,15 @@ class Sessions:
             digest = self._batch_chain_hash(
                 seq, now_ms, key, op, atomic, sid, result, item_origin, prev_hash
             )
-            self._batch_chain_events.append(
-                (seq, now_ms, key, op, atomic, sid, result, item_origin,
-                 prev_hash, digest)
-            )
+            record = (seq, now_ms, key, op, atomic, sid, result, item_origin,
+                      prev_hash, digest)
+            self._batch_chain_events.append(record)
             self._batch_chain_sig_first.setdefault(
                 (key, op, atomic, sid), seq
             )
             self._batch_chain_tail = digest
+            # 按输入序逐项投影：合规链全局序即批量项目输入序。
+            self._compliance_append(_COMPLIANCE_SOURCE_BATCH, record)
         if origin == 0:
             index[key] = first_seq
 
@@ -7672,15 +7742,16 @@ class Sessions:
 
         同一推进产生的超时/晋升按入队序追加（先超时后晋升）；取消沿用原入队
         序；无入队序者（申请立即结果与各类失败）入队序为 0。前哈希首项为
-        64 个 0，余取前项哈希；事件时刻可回拨，链接只认追加序。
+        64 个 0，余取前项哈希；事件时刻可回拨，链接只认追加序。源事件落链
+        同时同步投影到全局合规链（来源“容量”），creplay 直接改存储不经此路。
         """
         seq = len(self._capacity_events) + 1
         prev_hash = self._capacity_tail
         digest = self._cap_hash(seq, now_ms, sid, verdict, order, prev_hash)
-        self._capacity_events.append(
-            (seq, now_ms, sid, verdict, order, prev_hash, digest)
-        )
+        record = (seq, now_ms, sid, verdict, order, prev_hash, digest)
+        self._capacity_events.append(record)
         self._capacity_tail = digest
+        self._compliance_append(_COMPLIANCE_SOURCE_CAPACITY, record)
 
     def capacity_events(self, after=0, limit=100):
         """返回 capacity 事件 JSON；查询不老化，O(limit) 时空。
@@ -7712,6 +7783,428 @@ class Sessions:
         next_seq = window[-1][0] if window else after
         payload = {"下个序号": next_seq, "事件": events}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def compliance_events(self, after=0, limit=100):
+        """返回全局合规事件 JSON；只读、查询不触发认证/老化/统计，O(limit) 时空。
+
+        after/limit 语义沿 audit：均须为非 bool int，类型不符抛 TypeError，
+        after<0 或 limit ∉ [1,1000] 抛 ValueError。取全局序号 > after 的前
+        limit 项，空页游标保持 after。顶层键序“下个序号/事件”；事件六键序为
+        “全局序号/来源/来源序号/载荷/前哈希/哈希”，全局序号/来源序号为 int，
+        余为 str；来源仅“审计/批量/容量”，载荷为对应公开源事件按既有键序生成
+        的紧凑 JSON 字符串（无 LF）；首项前哈希 64 个 0、余项承前项，哈希为
+        前五字段紧凑 JSON（ensure_ascii=False、无空白）UTF-8 字节 sha256
+        小写值。输出 LF 尾紧凑 JSON，同状态同参逐字节一致。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        # 全局序号即位置+1，序号 > after 的事件自下标 after 起，直接切片。
+        window = self._compliance_events[after : after + limit]
+        events = [
+            {
+                "全局序号": global_seq,
+                "来源": source,
+                "来源序号": source_seq,
+                "载荷": payload,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for global_seq, source, source_seq, payload, prev_hash, digest in window
+        ]
+        # 有项取下一序号为末项序号，无项取 after（空页游标保持 after）。
+        next_seq = window[-1][0] if window else after
+        result = {"下个序号": next_seq, "事件": events}
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def compliance_snapshot(self, after=0, limit=100):
+        """返回全局合规窗口快照 JSON；只读、不认证/老化/统计，O(limit) 时空。
+
+        after/limit 语义沿 audit_snapshot：非 bool int，after<0 或 limit ∉
+        [1,1000] 抛 ValueError（型错 TypeError）；after 大于当前末全局序号
+        （空链为 0）抛 KeyError(after)。顶层键序为
+        “版本/锚序号/锚哈希/上限/下个序号/事件/摘要”：版本恒 1，锚序号=after，
+        after=0 锚哈希为 64 个 0、否则取第 after 项哈希，上限=limit，下个序号
+        取末项全局序号、空窗取 after；事件沿用 compliance_events 六键序及类型。
+        摘要为前六键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值，使页面能够
+        离线校验锚点、顺序、逐项哈希与摘要；输出末尾加 LF。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+        total = len(self._compliance_events)
+        if after > total:
+            raise KeyError(after)
+
+        # 全局序号即位置+1：锚哈希取第 after 项（下标 after-1），窗口自下标
+        # after 起。
+        anchor_hash = (
+            "0" * 64 if after == 0 else self._compliance_events[after - 1][5]
+        )
+        window = self._compliance_events[after : after + limit]
+        events = [
+            {
+                "全局序号": global_seq,
+                "来源": source,
+                "来源序号": source_seq,
+                "载荷": payload,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for global_seq, source, source_seq, payload, prev_hash, digest in window
+        ]
+        next_seq = window[-1][0] if window else after
+        head = {
+            "版本": 1,
+            "锚序号": after,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": events,
+        }
+        # 摘要只盖前六键：先对无摘要的头算 sha256，再补末键输出。
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        head["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return json.dumps(head, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def compliance_restore(self, key, text):
+        """将版本 1 全局合规窗口快照原子接入合规链尾，只恢复合规事件，返回
+        LF 结尾紧凑 JSON。
+
+        key 沿用凭据约束（型/值错 TypeError/ValueError），text 须为 str
+        （非 str 抛 TypeError）。text 须为版本 1 规范快照（顶层
+        版本/锚序号/锚哈希/上限/下个序号/事件/摘要七键序、事件六键序，类型、
+        范围、事件数不超过上限、全局序号自锚序号起逐项连续、游标等于末项或锚
+        序号、前哈希衔接、逐项哈希与顶层摘要正确），且每个载荷须为对应来源的
+        公开源事件紧凑 JSON（审计九键、批量十键、容量五键，键序/类型/范围
+        合法，审计与批量的源哈希复算相符、容量结果为合法判定且入队序规则相符，
+        载荷内序号等于来源序号，整体须与公开查询同法的规范编码）；整体须为与
+        compliance_snapshot 同法（ensure_ascii=False、separators=(',',':')、
+        单个 LF 结尾）的规范编码。解析、重键及以上任一不符抛 ValueError。
+
+        结构全验后当前合规链末尾须恰等于快照锚序号/锚哈希，否则抛
+        StateError(锚序号, 当前末序号) 且不追加。全验后一次把六元组接到链尾；
+        只恢复合规事件，不恢复三条源链、会话、配置、缓存或任何业务/幂等索引，
+        恢复动作本身不生成合规事件，不触发认证、老化或统计，失败不改链。
+        验 key 后以独立幂等缓存且仅缓存成功：同 key 同型同 text 重放不解析、
+        不重验、不追加，直接返回首次结果原字节，异参抛 ValueError；失败
+        （含参数错与 StateError）不占 key。返回键序“追加/末序号/末哈希/摘要”
+        （与 audit_restore 同契约），空页追加 0。O(事件数) 时间与空间。
+        """
+        _check_credential("key", key)
+
+        cached = self._compliance_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不重验、不追加，仅核对同型同 text 后返回原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        anchor_seq, anchor_hash, events = (
+            self._parse_compliance_restore_snapshot(text)
+        )
+
+        # 锚点：当前合规链末尾（空链为序号 0、64 个 0）须恰为快照锚；不符即
+        # StateError(锚序号, 当前末序号)，发生在任何追加之前。
+        tail_seq = len(self._compliance_events)
+        tail_hash = self._compliance_tail if tail_seq else "0" * 64
+        if anchor_seq != tail_seq or anchor_hash != tail_hash:
+            raise StateError(anchor_seq, tail_seq)
+
+        # 全验后一次追加：六元组原样接尾，仅推进合规链序列与末哈希；不动任何
+        # 源链、业务态与缓存，恢复不生成自身事件。
+        self._compliance_events.extend(events)
+        if events:
+            self._compliance_tail = events[-1][5]
+
+        appended = len(events)
+        result = self._render_audit_restore(
+            appended, tail_seq + appended, self._compliance_tail
+        )
+        self._compliance_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_compliance_restore_snapshot(self, text):
+        """解析并严格全量校验版本 1 全局合规窗口快照文本，返回
+        (锚序号, 锚哈希, 事件六元组列表)；任何不符规范契约处均抛 ValueError，
+        且不读不改当前合规链。
+
+        JSON 解析或重键失败；顶层非恰为
+        版本/锚序号/锚哈希/上限/下个序号/事件/摘要且键序如此；版本非 1；
+        锚序号/上限/下个序号非非 bool int 或越界（锚序号>=0、上限 1..1000、
+        下个序号>=0），锚哈希/摘要非 64 位小写十六进制；事件非列表或项数超过
+        上限；事件项非恰为六键序，全局序号/来源序号非非 bool int 或 <1，来源
+        非“审计/批量/容量”，载荷/前哈希/哈希非 str，前哈希/哈希非 64 位
+        小写十六进制；全局序号须自锚序号+1 起逐项连续，前哈希须自锚哈希逐项
+        衔接，哈希按前五字段复算相符；载荷须为对应来源公开事件的规范紧凑 JSON
+        （键集/键序、类型、范围、源内序号等于来源序号、源哈希自洽）；下个序号
+        须等于末项全局序号、空窗等于锚序号；摘要须等于前六键规范化紧凑 JSON
+        （无 LF）UTF-8 字节的 sha256 小写值。最后按 compliance_snapshot 基线
+        重建完整文档（单个 LF 结尾），与原文逐字节不一致即非规范编码。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"compliance snapshot is not valid JSON: {exc}") from exc
+        top_keys = ["版本", "锚序号", "锚哈希", "上限", "下个序号", "事件", "摘要"]
+        if not isinstance(doc, dict) or list(doc) != top_keys:
+            raise ValueError(
+                "compliance snapshot top-level keys must be "
+                "版本/锚序号/锚哈希/上限/下个序号/事件/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        anchor_seq = self._cp_int(doc["锚序号"], "锚序号", 0)
+        anchor_hash = self._cp_hex64(doc["锚哈希"], "锚哈希")
+        limit = self._cp_int(doc["上限"], "上限", 1)
+        if limit > 1000:
+            raise ValueError(f"上限 must be <= 1000, got {limit}")
+        next_seq = self._cp_int(doc["下个序号"], "下个序号", 0)
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+
+        raw_events = doc["事件"]
+        if not isinstance(raw_events, list):
+            raise ValueError("事件 must be a list")
+        if len(raw_events) > limit:
+            raise ValueError(f"事件 count {len(raw_events)} exceeds 上限 {limit}")
+
+        event_keys = ["全局序号", "来源", "来源序号", "载荷", "前哈希", "哈希"]
+        events = []
+        prev_hash = anchor_hash
+        expect_seq = anchor_seq + 1
+        for index, item in enumerate(raw_events, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    f"compliance event {index} keys must be "
+                    "全局序号/来源/来源序号/载荷/前哈希/哈希 in order"
+                )
+            global_seq = self._cp_int(item["全局序号"], "事件.全局序号", 1)
+            source = item["来源"]
+            if not isinstance(source, str):
+                raise ValueError(
+                    f"事件.来源 must be a str, got {type(source).__name__}"
+                )
+            if source not in _COMPLIANCE_SOURCES:
+                raise ValueError(
+                    "事件.来源 must be one of 审计/批量/容量, got "
+                    f"{source!r}"
+                )
+            source_seq = self._cp_int(item["来源序号"], "事件.来源序号", 1)
+            payload = item["载荷"]
+            if not isinstance(payload, str):
+                raise ValueError(
+                    f"事件.载荷 must be a str, got {type(payload).__name__}"
+                )
+            given_prev = self._cp_hex64(item["前哈希"], "事件.前哈希")
+            digest = self._cp_hex64(item["哈希"], "事件.哈希")
+
+            if global_seq != expect_seq:
+                raise ValueError(
+                    "compliance event seq must be contiguous from the anchor: "
+                    f"want {expect_seq}, got {global_seq}"
+                )
+            # 载荷须为该来源公开源事件的规范形态，且载荷内序号等于来源序号。
+            self._parse_compliance_payload(source, source_seq, payload)
+            if given_prev != prev_hash:
+                raise ValueError(
+                    f"compliance event {global_seq} 前哈希 does not link to the "
+                    "prior hash"
+                )
+            if (
+                self._compliance_hash(
+                    global_seq, source, source_seq, payload, given_prev
+                )
+                != digest
+            ):
+                raise ValueError(f"compliance event {global_seq} 哈希 does not match")
+
+            events.append(
+                (global_seq, source, source_seq, payload, given_prev, digest)
+            )
+            prev_hash = digest
+            expect_seq += 1
+
+        expected_next = events[-1][0] if events else anchor_seq
+        if next_seq != expected_next:
+            raise ValueError(
+                "下个序号 must equal the last event seq (or 锚序号 for an empty "
+                f"window): want {expected_next}, got {next_seq}"
+            )
+
+        # 摘要：以解析值规范化重建前六键，重算 sha256。载荷已验证为规范串，
+        # 原样嵌入即与生成端基线逐字节一致。
+        head = {
+            "版本": 1,
+            "锚序号": anchor_seq,
+            "锚哈希": anchor_hash,
+            "上限": limit,
+            "下个序号": next_seq,
+            "事件": [
+                {
+                    "全局序号": global_seq,
+                    "来源": source,
+                    "来源序号": source_seq,
+                    "载荷": payload,
+                    "前哈希": given_prev,
+                    "哈希": digest,
+                }
+                for global_seq, source, source_seq, payload, given_prev, digest in (
+                    events
+                )
+            ],
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical compliance snapshot")
+
+        # 非规范编码：完整七键文档（单个 LF 结尾）须与原文逐字节一致。
+        canonical = json.dumps(
+            {**head, "摘要": summary},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n"
+        if canonical != text:
+            raise ValueError("compliance snapshot is not canonical compact JSON")
+        return anchor_seq, anchor_hash, events
+
+    def _parse_compliance_payload(self, source, source_seq, payload):
+        """校验单个载荷为对应来源公开源事件的规范紧凑 JSON；任何形态不符抛
+        ValueError。不读当前任何链，仅做载荷自洽校验。
+
+        审计：九键 序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希，余三个
+        负载字段为 str，原序号为 0 或小于本项序号，源哈希按前八字段复算相符；
+        批量：十键（多 bool 原子），源哈希按前九字段复算相符；容量：五键
+        序号/时刻/会话/结果/入队序，结果须为合法判定且入队序规则相符
+        （排队/取消/超时/晋升/淘汰为正，余为 0）。三者载荷内序号均须等于
+        source_seq，且整串须为与公开查询同法的规范紧凑 JSON。
+        """
+        try:
+            obj = json.loads(payload, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"compliance payload is not valid JSON: {exc}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError("compliance payload must be a JSON object")
+
+        if source == _COMPLIANCE_SOURCE_AUDIT:
+            keys = ["序号", "时刻", "键", "操作", "会话", "结果", "原序号",
+                    "前哈希", "哈希"]
+            if list(obj) != keys:
+                raise ValueError(
+                    "审计 payload keys must be "
+                    "序号/时刻/键/操作/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(obj["序号"], "载荷.序号", 1)
+            now_ms = self._cp_int(obj["时刻"], "载荷.时刻", 0)
+            bkey, op, sid, result = (obj["键"], obj["操作"], obj["会话"], obj["结果"])
+            for label, value in (
+                ("载荷.键", bkey), ("载荷.操作", op),
+                ("载荷.会话", sid), ("载荷.结果", result),
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(f"{label} must be a str")
+            origin = self._cp_int(obj["原序号"], "载荷.原序号", 0)
+            src_prev = self._cp_hex64(obj["前哈希"], "载荷.前哈希")
+            src_digest = self._cp_hex64(obj["哈希"], "载荷.哈希")
+            if origin and origin >= seq:
+                raise ValueError("审计 payload 原序号 must be 0 or < 序号")
+            if self._chain_hash(
+                seq, now_ms, bkey, op, sid, result, origin, src_prev
+            ) != src_digest:
+                raise ValueError("审计 payload 哈希 does not match")
+            canonical = json.dumps(
+                {
+                    "序号": seq, "时刻": now_ms, "键": bkey, "操作": op,
+                    "会话": sid, "结果": result, "原序号": origin,
+                    "前哈希": src_prev, "哈希": src_digest,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        elif source == _COMPLIANCE_SOURCE_BATCH:
+            keys = ["序号", "时刻", "键", "操作", "原子", "会话", "结果",
+                    "原序号", "前哈希", "哈希"]
+            if list(obj) != keys:
+                raise ValueError(
+                    "批量 payload keys must be "
+                    "序号/时刻/键/操作/原子/会话/结果/原序号/前哈希/哈希 in order"
+                )
+            seq = self._cp_int(obj["序号"], "载荷.序号", 1)
+            now_ms = self._cp_int(obj["时刻"], "载荷.时刻", 0)
+            bkey, op, sid, result = (obj["键"], obj["操作"], obj["会话"], obj["结果"])
+            atomic = obj["原子"]
+            if not isinstance(atomic, bool):
+                raise ValueError("载荷.原子 must be a bool")
+            for label, value in (
+                ("载荷.键", bkey), ("载荷.操作", op),
+                ("载荷.会话", sid), ("载荷.结果", result),
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(f"{label} must be a str")
+            origin = self._cp_int(obj["原序号"], "载荷.原序号", 0)
+            src_prev = self._cp_hex64(obj["前哈希"], "载荷.前哈希")
+            src_digest = self._cp_hex64(obj["哈希"], "载荷.哈希")
+            if origin and origin >= seq:
+                raise ValueError("批量 payload 原序号 must be 0 or < 序号")
+            if self._batch_chain_hash(
+                seq, now_ms, bkey, op, atomic, sid, result, origin, src_prev
+            ) != src_digest:
+                raise ValueError("批量 payload 哈希 does not match")
+            canonical = json.dumps(
+                {
+                    "序号": seq, "时刻": now_ms, "键": bkey, "操作": op,
+                    "原子": atomic, "会话": sid, "结果": result, "原序号": origin,
+                    "前哈希": src_prev, "哈希": src_digest,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        else:
+            keys = ["序号", "时刻", "会话", "结果", "入队序"]
+            if list(obj) != keys:
+                raise ValueError(
+                    "容量 payload keys must be 序号/时刻/会话/结果/入队序 in order"
+                )
+            seq = self._cp_int(obj["序号"], "载荷.序号", 1)
+            now_ms = self._cp_int(obj["时刻"], "载荷.时刻", 0)
+            sid = obj["会话"]
+            verdict = obj["结果"]
+            order = self._cp_int(obj["入队序"], "载荷.入队序", 0)
+            if not isinstance(sid, str):
+                raise ValueError("载荷.会话 must be a str")
+            if not isinstance(verdict, str) or verdict not in _CAP_VERDICTS:
+                raise ValueError(f"载荷.结果 is not a valid verdict: {verdict!r}")
+            if verdict in _CAP_VERDICTS_WITH_ORDER:
+                if order < 1:
+                    raise ValueError(
+                        f"容量 payload verdict {verdict!r} needs 入队序 >= 1"
+                    )
+            elif order != 0:
+                raise ValueError(f"容量 payload verdict {verdict!r} needs 入队序 0")
+            canonical = json.dumps(
+                {
+                    "序号": seq, "时刻": now_ms, "会话": sid,
+                    "结果": verdict, "入队序": order,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        if seq != source_seq:
+            raise ValueError(
+                f"载荷.序号 {seq} must equal 来源序号 {source_seq}"
+            )
+        if canonical != payload:
+            raise ValueError("compliance payload is not canonical compact JSON")
 
     def capacity_stats(self, now_ms):
         """返回容量统计 JSON；先验参再按既有规则老化。
@@ -11919,13 +12412,107 @@ class Sessions:
         blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
+    # ---- 全局合规链：三源事件投影 ------------------------------------
+
+    @staticmethod
+    def _audit_event_obj(event):
+        """audit 公开事件对象（九键序），与 audit() 查询逐项逐字段一致。"""
+        seq, now_ms, key, op, sid, result, origin, prev_hash, digest = event
+        return {
+            "序号": seq,
+            "时刻": now_ms,
+            "键": key,
+            "操作": op,
+            "会话": sid,
+            "结果": result,
+            "原序号": origin,
+            "前哈希": prev_hash,
+            "哈希": digest,
+        }
+
+    @staticmethod
+    def _batch_event_obj(event):
+        """batch_audit 公开事件对象（十键序），原子为 bool。"""
+        (seq, now_ms, key, op, atomic, sid, result, origin,
+         prev_hash, digest) = event
+        return {
+            "序号": seq,
+            "时刻": now_ms,
+            "键": key,
+            "操作": op,
+            "原子": atomic,
+            "会话": sid,
+            "结果": result,
+            "原序号": origin,
+            "前哈希": prev_hash,
+            "哈希": digest,
+        }
+
+    @staticmethod
+    def _capacity_event_obj(event):
+        """capacity_events 公开事件对象（五键序），不含前哈希/哈希。"""
+        seq, now_ms, sid, verdict, order, _prev_hash, _digest = event
+        return {
+            "序号": seq,
+            "时刻": now_ms,
+            "会话": sid,
+            "结果": verdict,
+            "入队序": order,
+        }
+
+    def _compliance_payload(self, source, source_event):
+        """对应公开源事件按既有键序生成的紧凑 JSON 字符串（无 LF）。"""
+        if source == _COMPLIANCE_SOURCE_AUDIT:
+            obj = self._audit_event_obj(source_event)
+        elif source == _COMPLIANCE_SOURCE_BATCH:
+            obj = self._batch_event_obj(source_event)
+        else:
+            obj = self._capacity_event_obj(source_event)
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _compliance_hash(global_seq, source, source_seq, payload, prev_hash):
+        """由前五字段（全局序号/来源/来源序号/载荷/前哈希，键序固定）的紧凑
+        JSON 之 UTF-8 字节算 sha256 十六进制小写串。"""
+        head = {
+            "全局序号": global_seq,
+            "来源": source,
+            "来源序号": source_seq,
+            "载荷": payload,
+            "前哈希": prev_hash,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _compliance_append(self, source, source_event):
+        """把一条已落源链的源事件同步投影到全局合规链尾，O(1) 时空。
+
+        仅由三条源链各自的运行态追加入口（_chain_append/_batch_chain_record/
+        _cap_event）在同源事件落链的同一步调用；audit_restore、
+        batch_audit_restore、creplay（含 runtime_restore）直接改源链存储，
+        不经此入口，故导入或替换源事件均不倒灌合规链。全局序号只按投影追加
+        先后连续分配，不按可能回拨的源时刻重排。
+        """
+        source_seq = source_event[0]
+        payload = self._compliance_payload(source, source_event)
+        global_seq = len(self._compliance_events) + 1
+        prev_hash = self._compliance_tail
+        digest = self._compliance_hash(
+            global_seq, source, source_seq, payload, prev_hash
+        )
+        self._compliance_events.append(
+            (global_seq, source, source_seq, payload, prev_hash, digest)
+        )
+        self._compliance_tail = digest
+
     def _chain_append(self, key, op, sid, result, now_ms, origin=0, index=None):
         """追加一条防篡改审计事件，O(1) 时空。
 
         序号自 1 递增；首次事件登记 key -> 序号且原序号为 0，重放事件沿用
         首次结果、原序号指认首次事件序号。前哈希首项为 64 个 0，余取前项哈希。
         index 给定时写入该域的 key -> 首次序号索引（供 pool_fault 与 do 分域
-        指认），缺省用 do 的 _chain_index；事件始终追加到同一条链。
+        指认），缺省用 do 的 _chain_index；事件始终追加到同一条链。源事件落链
+        同时同步投影到全局合规链（来源“审计”），restore 直接改存储不经此路。
         """
         if index is None:
             index = self._chain_index
@@ -11936,10 +12523,11 @@ class Sessions:
         )
         if origin == 0:
             index[key] = seq
-        self._chain_events.append(
-            (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
-        )
+        record = (seq, now_ms, key, op, sid, result, origin, prev_hash, digest)
+        self._chain_events.append(record)
         self._chain_tail = digest
+        # 源事件落链后同步投影；投影只读已构造的源九元组，源未产生则不到此。
+        self._compliance_append(_COMPLIANCE_SOURCE_AUDIT, record)
 
     def audit(self, after=0, limit=100):
         """返回防篡改审计事件 JSON；查询不老化，O(limit) 时空。
