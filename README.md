@@ -36,6 +36,30 @@
   总数、建立成功或任一分类计数回退，或成功增量大于总数增量
   StateError("current") 退出 4。同输入逐字节同结果，单次处理 O(L+n log n)
   时间、O(L+n) 空间（L 为输入字节数，n 为 users 与两份检查点明细总数）。
+- `python access.py session-run`（不带额外参数、无落盘）：stdin 读入
+  UTF-8 JSON 对象，对象前不得有空白、尾部仅许空白，顶层键依次且仅为
+  `users,config,requests,query_ms`。`users` 为 1..10000 个按用户名
+  Unicode 码点升序且互异的凭据二元数组 `[用户名, 口令]`；`config` 为
+  版本 10 配置对象且地址池含 `default`（模板用户引用须在 users 内）；
+  `requests` 为 1..1000 个对象，键依次且仅为 `key,op,sid,args,now_ms`，
+  op 仅限建立/续租/迁移/接管/挂起/恢复/下线，args 数组转原接口元组，
+  无参数时为 null，now_ms 为非负 int；`query_ms` 为非负 int。命令先整体
+  校验输入（非法则不执行任何请求），再在全新实例中注册 users、加载配置
+  并依序调用 `Sessions.do`，时间只取各请求 now_ms；业务失败（含
+  认证/资源/状态/后端失败、未知 sid 与同 key 异参复用 ValueError）记录后
+  继续，老化、租约、认证、审计与幂等副作用沿用现有语义，失败不留半分配，
+  同 key 同参重放原结果。结束后按 query_ms 取会话全量查询与地址池统计。
+  成功 stdout 为 LF 尾紧凑 JSON，顶层键序 `版本,项目,会话,地址池,摘要`，
+  版本为 1；项目保持请求顺序，每项键序 `序号,结果,输出,类型`，结果为
+  布尔值，成功时输出为原返回对象、类型为空串，失败时输出为 null、类型为
+  异常类名；摘要是前四个顶层字段紧凑编码所得 UTF-8 字节的 SHA-256 小写
+  值。合法输入即使项目全部失败也退出 0；编码、JSON、重复键、键序、类型、
+  排序、数量、配置、操作或参数形态非法时不执行请求，stdout 为空，stderr
+  写键序 `错误,类型` 且错误值为 `session-run` 的 LF 尾紧凑 JSON：
+  TypeError、ValueError 退出 2，ResourceError 退出 3，StateError 退出 4。
+  相同输入逐字节同输出；L、U、R、S、A 为输入字节数、用户数、请求数、
+  会话数与地址总数时，时间上界 O(L+A+R(S+log A)+S log S)、空间上界
+  O(L+U+R+S+A)。
 
 ## 测试
 
