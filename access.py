@@ -182,6 +182,21 @@
   摘要规则换密并清零此三类限制，会话与已入队队项保留；首果（成功/
   AuthError/KeyError）及同参重放写防篡改审计链（凭据轮换，会话=user），
   参数错不审计。
+- Sessions.batch_credential_change 批量凭据轮换：items 为 1..1000 个
+  (user,old_password,new_password) 三元组、user 互异，三串沿凭据约束且
+  旧新相异，now_ms 为非 bool 非负 int、atomic 为 bool；型/值错分别
+  TypeError/ValueError，整批参数错不认证、不改态、不占 key、不审计。合法
+  批次逐项沿用 credential_change 停用检查与旧口令认证语义：未知用户记
+  KeyError、停用/denied/locked/backoff 记 AuthError，业务失败入结果不抛，
+  成功才换密并清零失败计数/锁定/退避。非原子依次提交成功项；原子校验全部、
+  全成才一次提交，任一失败则全部凭据保持批次前值、可成功项记回滚，认证的
+  失败计数、锁定、退避及成功的限制清零均保留；两模式均不老化，不改会话、
+  租约、容量队列、QoS 账本或停用状态。仅缓存合法首果（参数错不占 key），
+  同参重放逐字节返首果不认证、异参 ValueError；合法首调与同参重放逐项写
+  批量防篡改审计链（操作“批量凭据轮换”，会话字段取用户名）并投影合规链，
+  不写单操作 audit 链。返回时刻/原子/结果/项目 LF 尾紧凑 JSON，结果仅
+  成功/部分成功/失败/回滚，项键序 用户/结果，项结果仅 轮换/回滚/异常类名。
+  单批与重放均 O(B) 时间、O(B) 空间。
 - Sessions.user_admin 用户停用/启用：key/user 沿用凭据，op 仅停用/启用，
   now_ms 为非 bool 非负 int、force 为 bool，启用限 force=False；型/值错
   TypeError/ValueError，未知用户 KeyError。停用遇非下线会话或队项且
@@ -1326,6 +1341,15 @@ _BATCH_AUDIT_MIGRATE = "批量迁移"
 _BATCH_AUDIT_KEEPALIVE = "批量保活"
 # 批量审计首次事件结果取项目结果（提交/部分/回滚），重放事件结果恒为“重放”。
 _BATCH_AUDIT_REPLAY = "重放"
+# batch_credential_change 批量凭据轮换：入批量防篡改审计链的操作名（操作
+# 与既有四类批量操作并列于同一条链，“会话”字段取用户名）。
+_BATCH_AUDIT_CREDENTIAL = "批量凭据轮换"
+# 成功项结果“轮换”（区别于单操作 credential_change 返回的“已轮换”）；
+# 顶层结果仅 成功/部分成功/失败/回滚（区别于其余批量的 提交/部分/回滚）。
+_BATCH_CRED_ITEM_ROTATED = "轮换"
+_BATCH_CRED_SUCCESS = "成功"
+_BATCH_CRED_PARTIAL = "部分成功"
+_BATCH_CRED_FAILED = "失败"
 
 # 合规全局链：来源仅审计、批量、容量；事件六字段键序固定为
 # 全局序号/来源/来源序号/载荷/前哈希/哈希，哈希覆盖前五字段，首项前哈希
@@ -1755,6 +1779,25 @@ class Sessions:
     审计；首果（成功/AuthError/KeyError）及同参重放写现有防篡改审计链：操作
     “凭据轮换”、会话记 user，首次原序号 0、重放原序号指认首次且结果加“重放”
     前缀。O(1) 时空（凭据长度有界）。
+    batch_credential_change(key, items, now_ms, atomic=False) 批量凭据
+    轮换：key 沿凭据约束，items 为 1..1000 个
+    (user, old_password, new_password) 三元组的 tuple，三串均沿凭据约束、
+    旧新相异且 user 互异；now_ms 为非 bool 非负 int，atomic 为 bool；
+    容器/元素/字段类型错 TypeError，项长度/凭据值/旧新相同/负时刻/项数/
+    重复 user 错 ValueError。整批参数错不认证、不改态、不占 key、不审计。
+    合法批次逐项沿用 credential_change 停用检查与旧口令认证语义：未知用户
+    记 KeyError，停用/denied/locked/backoff 记 AuthError，业务失败入结果
+    不抛，成功才换密并清零失败计数/锁定截止/下次可试时刻。非原子依次提交
+    成功项、失败不影响后项；原子先校验全部项目（前项失败不阻止后项认证），
+    全成才一次提交，任一失败则全部凭据保持批次前值、可成功项记回滚，认证的
+    失败计数、锁定、退避及成功的限制清零均保留。两模式均不老化，不改会话、
+    租约、容量队列、QoS 账本或停用状态。仅缓存合法首果（参数错不占 key），
+    同参重放逐字节返首果、不认证不轮换，异参 ValueError。合法首调与同参重放
+    逐项写批量防篡改审计链 batch_audit（操作“批量凭据轮换”，会话字段取
+    用户名）并投影 compliance 链，不写单操作 audit 链。返回键序时刻/原子/
+    结果/项目的 LF 尾紧凑 JSON，结果仅成功/部分成功/失败/回滚，项键序
+    “用户/结果”，项结果仅轮换/回滚/实际异常类名。单批与重放均
+    O(B) 时间、O(B) 空间。
     user_admin(key, op, user, now_ms, force=False) 停用或启用用户：key/user
     沿用凭据约束，op 仅停用/启用，now_ms 为非 bool 非负 int，force 为 bool，
     启用限 force=False；型/值错分别抛 TypeError/ValueError，未知用户
@@ -2026,6 +2069,11 @@ class Sessions:
         # 索引亦独立分域。
         self._credential_change_cache = {}
         self._credential_change_chain_index = {}
+        # batch_credential_change 批量凭据轮换的重放缓存，与其余各域独立：
+        # key -> (items, now_ms, atomic, outcome)；仅缓存合法首果，参数错不占
+        # key。原序号索引亦独立分域。
+        self._batch_credential_cache = {}
+        self._batch_credential_chain_index = {}
         # user_admin 用户停用/启用管理：停用态用户集合（停用即先于后端与认证
         # 拒绝建立/迁移/接管、capacity 申请、batch_online 与 credential_change）。
         # 重放缓存与各域独立：key -> (op, user, now_ms, force, outcome)；
@@ -13524,6 +13572,250 @@ class Sessions:
     def _render_credential_change(user, now_ms):
         # 键序：用户、时刻、结果；用户/结果为 str，时刻为 int。
         payload = {"用户": user, "时刻": now_ms, "结果": _CREDENTIAL_ROTATED}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def batch_credential_change(self, key, items, now_ms, atomic=False):
+        """一次轮换多个用户的凭据，返回 LF 结尾的 JSON 字符串。
+
+        key 沿用凭据约束；items 为含 1..1000 个
+        (user, old_password, new_password) 三元组 tuple 的 tuple，三个串均
+        沿用凭据约束、旧新口令相异且 user 互异；now_ms 为非 bool 非负 int，
+        atomic 为 bool。依序校验：容器/元素/字段类型错 TypeError，项长度、
+        凭据取值、旧新相同、now_ms 负、项数、重复 user 错 ValueError。整批
+        参数错误不认证、不改态、不占幂等 key、不写审计。
+
+        合法批次逐项沿用 credential_change 的停用检查与旧口令认证语义：
+        停用先于认证记 AuthError（不认证、失败计数/锁定/退避不变），未知
+        用户记 KeyError，denied/locked/backoff 记 AuthError（失败计数、锁定
+        截止与下次可试时刻由 Authenticator 保留）；这些业务失败写入结果而
+        不从批量入口抛出。验证成功才切换新凭据并清零该用户失败次数、锁定
+        截止与下次可试时刻。非原子模式依输入序逐项验证、成功即提交，失败
+        项不影响后项；原子模式先校验全部项目（前项失败不阻止后项认证，认证
+        副作用全保留），全部成功才一次提交，任一失败则全部凭据保持批次前值、
+        可成功项（认证通过项）标“回滚”、失败项保留自身异常类名；认证产生的
+        失败计数、锁定、退避及成功验证造成的限制清零均保留。两种模式均不
+        老化，且不改会话、租约、容量队列、QoS 账本或停用状态。
+
+        key 有效后以独立域永久缓存合法首果：参数错不占 key；同型同参重放
+        不认证、不轮换，逐字节返回首果；异参复用抛 ValueError。合法首调及
+        同参重放均按输入序逐项写批量防篡改审计链 batch_audit（操作“批量
+        凭据轮换”，“会话”字段取用户名）：首调逐项结果取项目结果、原序号
+        0；重放逐项记“重放”、原序号指认对应首次事件，并沿既有规则投影到
+        compliance 链；不写单操作 audit 链。返回顶层键序“时刻/原子/结果/
+        项目”：结果仅 成功/部分成功/失败/回滚（非原子全成为成功、全败为
+        失败、余为部分成功；原子任一失败为回滚）；项目依输入顺序，项键序
+        “用户/结果”，项结果仅 轮换/回滚/实际异常类名。单批 O(B) 时间、
+        O(B) 辅助空间（B≤1000），重放 O(B)。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_credential_cache.get(key)
+        if cached is not None:
+            # 重放：不认证、不轮换、不改态；合法首果的同参重放按输入序逐项
+            # 记“重放”，原序号指认对应首次事件。
+            c_items, c_now_ms, c_atomic, outcome = cached
+            if not _strict_equal(
+                (items, now_ms, atomic), (c_items, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            origin = self._batch_credential_chain_index.get(key)
+            if origin is not None:
+                self._batch_chain_record(
+                    key,
+                    _BATCH_AUDIT_CREDENTIAL,
+                    [entry[0] for entry in c_items],
+                    c_atomic,
+                    now_ms,
+                    origin,
+                    self._batch_credential_chain_index,
+                )
+            return outcome[1]
+
+        # 新 key：参数错直接抛出，不认证、不改态、不占 key、不写审计。
+        self._validate_batch_credential_params(items, now_ms, atomic)
+
+        if atomic:
+            results, all_ok = self._batch_credential_atomic(items, now_ms)
+        else:
+            results, all_ok = self._batch_credential_sequential(items, now_ms)
+
+        if atomic:
+            result = _BATCH_CRED_SUCCESS if all_ok else _BATCH_ROLLBACK
+        elif all_ok:
+            result = _BATCH_CRED_SUCCESS
+        elif results and all(
+            entry["结果"] != _BATCH_CRED_ITEM_ROTATED for entry in results
+        ):
+            result = _BATCH_CRED_FAILED
+        else:
+            result = _BATCH_CRED_PARTIAL
+        output = self._render_batch_credential(now_ms, atomic, result, results)
+        self._batch_credential_cache[key] = (items, now_ms, atomic, ("ok", output))
+        # 合法首调：按输入序逐项追加首次事件，结果取各项目结果（原子回滚后
+        # 认证通过项已为“回滚”）、原序号 0；“会话”字段取用户名。
+        self._batch_chain_record(
+            key,
+            _BATCH_AUDIT_CREDENTIAL,
+            [entry[0] for entry in items],
+            atomic,
+            now_ms,
+            0,
+            self._batch_credential_chain_index,
+            [entry["结果"] for entry in results],
+        )
+        return output
+
+    @staticmethod
+    def _validate_batch_credential_params(items, now_ms, atomic):
+        """校验 batch_credential_change 三参数：类型错先于取值/长度/重复错。
+
+        items 须为 tuple，含 1..1000 个 (user, old_password, new_password)
+        三元组 tuple，三个串均满足凭据约束且旧新相异，user 互异；now_ms 为
+        非 bool 非负 int；atomic 为 bool。类型阶段先查容器/各项/各串/
+        now_ms/atomic 的类型；取值阶段依序查项长度与三串取值及旧新相异、
+        now_ms 下界、项数上下界、user 重复。
+        """
+        # 类型阶段：任一类型错先于任何取值错抛出。
+        if not isinstance(items, tuple):
+            raise TypeError(f"items must be a tuple, got {type(items).__name__}")
+        for item in items:
+            if not isinstance(item, tuple):
+                raise TypeError(
+                    f"item must be a tuple, got {type(item).__name__}"
+                )
+            for field in item:
+                if not isinstance(field, str):
+                    raise TypeError(
+                        f"item field must be a str, got {type(field).__name__}"
+                    )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
+
+        # 取值阶段：项长度、凭据值、旧新相异、下界、项数、重复用户。
+        for item in items:
+            if len(item) != 3:
+                raise ValueError(
+                    "item must be a 3-tuple (user, old_password, new_password), "
+                    f"got {len(item)} items"
+                )
+            _check_credential("user", item[0])
+            _check_credential("old_password", item[1])
+            _check_credential("new_password", item[2])
+            if item[1] == item[2]:
+                raise ValueError("old_password and new_password must be different")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(items) <= _BATCH_MAX_SIDS):
+            raise ValueError(
+                f"items must contain 1..{_BATCH_MAX_SIDS} items, got {len(items)}"
+            )
+        users = [item[0] for item in items]
+        if len(set(users)) != len(users):
+            raise ValueError("items must not contain duplicate user")
+
+    def _batch_credential_verify(self, user, old_password, new_password, now_ms):
+        """批内单项校验：沿用 credential_change 的停用检查与旧口令认证语义。
+
+        停用先于认证抛 AuthError（不认证、限制不变）；未知用户抛 KeyError；
+        认证非 ok（denied/locked/backoff）抛 AuthError（失败计数、锁定与退避
+        由 Authenticator 保留）；认证成功则按摘要规则切换新凭据，并重置失败
+        次数、锁定截止与下次可试时刻（成功清零本由 Authenticator 完成）。供
+        非原子逐项提交路径使用。
+        """
+        if user in self._disabled_users:
+            raise AuthError(f"user {user!r} is disabled")
+        _, status, _ = self._auth.authenticate(user, old_password, now_ms)
+        if status != "ok":
+            raise AuthError(
+                f"authentication not ok for user {user!r}: {status}"
+            )
+        record = self._auth._users[user]
+        record[0] = _digest(user, new_password)
+        record[1] = 0
+        record[2] = None
+        record[3] = 0
+
+    def _batch_credential_sequential(self, items, now_ms):
+        """非原子逐项轮换：依输入序验证一项即提交一项，失败项不影响后项。
+
+        业务异常不抛：未知用户记 KeyError、停用/认证非 ok 记 AuthError。
+        返回 (results, all_ok)。
+        """
+        results = []
+        all_ok = True
+        for user, old_password, new_password in items:
+            try:
+                self._batch_credential_verify(
+                    user, old_password, new_password, now_ms
+                )
+            except (AuthError, KeyError) as exc:
+                results.append({"用户": user, "结果": type(exc).__name__})
+                all_ok = False
+            else:
+                results.append({"用户": user, "结果": _BATCH_CRED_ITEM_ROTATED})
+        return results, all_ok
+
+    def _batch_credential_atomic(self, items, now_ms):
+        """原子批量：先依输入序校验全部项目，全部成功才一次提交。
+
+        前项失败不阻止后项认证：每项都真实经过停用检查与 Authenticator，
+        故认证副作用（失败计数、锁定、退避及成功的限制清零）全部保留。为使
+        回滚时凭据保持批次前值，预演先把各认证通过项的旧摘要存下、认证后
+        暂写新摘要；任一失败即按输入序恢复这些项的旧摘要（失败项本就未换
+        密），可成功项改记“回滚”，失败项保留自身异常类名。全部成功则新
+        摘要自然构成一次提交。返回 (results, all_ok)。
+        """
+        # 认证通过项的回滚信息：(user, 批次前摘要)。
+        verified = []
+        results = []
+        all_ok = True
+        for user, old_password, new_password in items:
+            try:
+                if user in self._disabled_users:
+                    raise AuthError(f"user {user!r} is disabled")
+                record = self._auth._users.get(user)
+                if record is None:
+                    # 与 Authenticator.authenticate 一致的未知用户异常。
+                    raise KeyError(f"unknown user: {user!r}")
+                old_digest = record[0]
+                _, status, _ = self._auth.authenticate(
+                    user, old_password, now_ms
+                )
+                if status != "ok":
+                    raise AuthError(
+                        f"authentication not ok for user {user!r}: {status}"
+                    )
+                # 认证成功（限制已清零）：暂存旧摘要并预写新摘要；回滚时
+                # 恢复旧摘要，限制清零保留。
+                record[0] = _digest(user, new_password)
+                verified.append((user, old_digest))
+            except (AuthError, KeyError) as exc:
+                results.append({"用户": user, "结果": type(exc).__name__})
+                all_ok = False
+            else:
+                results.append({"用户": user, "结果": _BATCH_CRED_ITEM_ROTATED})
+        if not all_ok:
+            # 仅可成功项（认证通过、已预写新摘要）恢复批次前摘要并记“回滚”；
+            # 认证的失败计数、锁定、退避及成功的限制清零一律保留。
+            for user, old_digest in verified:
+                self._auth._users[user][0] = old_digest
+            for entry in results:
+                if entry["结果"] == _BATCH_CRED_ITEM_ROTATED:
+                    entry["结果"] = _BATCH_ROLLBACK
+        return results, all_ok
+
+    @staticmethod
+    def _render_batch_credential(now_ms, atomic, result, items):
+        # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
+        # 结果为 str，项目为项（用户/结果）列表，依输入顺序。
+        payload = {
+            "时刻": now_ms,
+            "原子": atomic,
+            "结果": result,
+            "项目": items,
+        }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def user_admin(self, key, op, user, now_ms, force=False):
