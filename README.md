@@ -40,7 +40,7 @@
   对象，对象前不得有空白、尾部仅许空白，顶层键依次且仅为
   `users,config,requests,query_ms`。`users` 为 1..10000 个按用户名 Unicode
   码点升序且互异的 `[用户名,口令]` 二元数组（在全新实例中注册）；`config`
-  为版本 10 配置对象（沿 `load_config` 键/结构/取值规则）且含 default
+  为版本 11 配置对象（沿 `load_config` 键/结构/取值规则）且含 default
   地址池，用户模板引用的用户须在 users 内；`requests` 为 1..1000 个对象，
   键依次且仅为 `key,op,sid,args,now_ms`，op 仅
   建立/续租/迁移/接管/挂起/恢复/下线，建立/迁移/接管/恢复的 args 为两个

@@ -11,13 +11,14 @@ from contextlib import contextmanager
 import access
 
 
-def config_v10(cidr="10.0.0.0/29", pools=None, templates=(), user_templates=()):
+def config_v11(cidr="10.0.0.0/29", pools=None, templates=(), user_templates=(),
+               template_pools=()):
     if pools is None:
         pools = [
             {"标识": "default", "CIDR": cidr, "保留": [], "静态": []}
         ]
     return {
-        "版本": 10,
+        "版本": 11,
         "会话": {"总数": 10, "每用户": 5, "空闲毫秒": 1000, "租期毫秒": 5000},
         "地址池": pools,
         "模板": list(templates),
@@ -29,7 +30,11 @@ def config_v10(cidr="10.0.0.0/29", pools=None, templates=(), user_templates=()):
             "重试基数毫秒": 0,
             "重试上限毫秒": 0,
         },
+        "模板地址池": [[item[0], list(item[1])] for item in template_pools],
     }
+
+
+config_v10 = config_v11
 
 
 def request(key, op, sid, args, now_ms):
