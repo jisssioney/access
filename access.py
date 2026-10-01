@@ -13279,27 +13279,48 @@ class Sessions:
 # ---------------------------------------------------------------------------
 # 命令行入口：python access.py <子命令>
 #
-# 两个无额外参数的子命令，均从 stdin 读入 UTF-8 JSON 请求对象（对象前不得
-# 有空白、尾部仅许 JSON 空白），在不加载地址池/模板/持久状态的临时实例中
-# 注册 users 后调用既有接口：
-# - stats-merge：顶层键依次 key/users/base/left/right，调用
-#   Sessions.stats_merge；
-# - stats-delta：顶层键依次 users/base/current，只读调用
-#   Sessions.stats_delta。
+# 三个无额外参数的子命令，均从 stdin 读入 UTF-8 JSON 请求对象（对象前不得
+# 有空白、尾部仅许 JSON 空白）：
+# - stats-merge：顶层键依次 key/users/base/left/right，在不加载地址池/模板/
+#   持久状态的临时实例中注册 users 后调用 Sessions.stats_merge；
+# - stats-delta：顶层键依次 users/base/current，同样注册 users 后只读调用
+#   Sessions.stats_delta；
+# - session-run：顶层键依次 users/config/requests/query_ms，在全新实例中
+#   注册 users、加载版本 10 配置（须含 default 池），依序调用 Sessions.do，
+#   时间只取请求自带 now_ms；业务失败记录后继续，最后按 query_ms 取会话
+#   全量查询与地址池统计，输出版本/项目/会话/地址池/摘要。
 # 成功把返回值原字节写 stdout（退出 0、stderr 空），失败 stdout 空、
 # stderr 写 LF 尾紧凑 JSON {"错误":<子命令名>,"类型":<异常类名>}，
 # TypeError/ValueError 退出 2、ResourceError 退出 3、StateError 退出 4；
 # 缺失或未知子命令按 stats-merge 名写 ValueError 信封（退出 2）。同输入
-# 逐字节同结果，时间 O(L+n log n)、空间 O(L+n)，L 为输入字节长度、
-# n 为 users 与检查点明细总数。
+# 逐字节同结果。stats-merge/stats-delta 时间 O(L+n log n)、空间 O(L+n)，
+# L 为输入字节长度、n 为 users 与检查点明细总数；session-run 时间
+# O(L+A+R(S+log A)+S log S)、空间 O(L+U+R+S+A)。
 # ---------------------------------------------------------------------------
 
 _CLI_MERGE_COMMAND = "stats-merge"
 _CLI_DELTA_COMMAND = "stats-delta"
+_CLI_RUN_COMMAND = "session-run"
 _CLI_MERGE_REQUEST_KEYS = ("key", "users", "base", "left", "right")
 _CLI_DELTA_REQUEST_KEYS = ("users", "base", "current")
+_CLI_RUN_REQUEST_KEYS = ("users", "config", "requests", "query_ms")
 _CLI_USERS_MIN = 1
 _CLI_USERS_MAX = 10000
+_CLI_RUN_REQUESTS_MIN = 1
+_CLI_RUN_REQUESTS_MAX = 1000
+# session-run 每个会话必由 requests 建立，故会话数不超过请求数；全量查询
+# 一页（limit 上限 1000）即可取全。
+_CLI_RUN_QUERY_LIMIT = _CLI_RUN_REQUESTS_MAX
+_CLI_RUN_OPS = (
+    _OP_ESTABLISH,
+    _OP_RENEW,
+    _OP_MIGRATE,
+    _OP_TAKEOVER,
+    _OP_SUSPEND,
+    _OP_RESUME,
+    _OP_OFFLINE,
+)
+_CLI_RUN_ITEM_KEYS = ("key", "op", "sid", "args", "now_ms")
 # 失败信封的退出码：参数类错误 2、资源错误 3、状态错误 4。
 _CLI_EXIT_CODES = {
     TypeError: 2,
@@ -13457,6 +13478,312 @@ def _run_stats_delta(users, base, current):
     return sessions.stats_delta(base, current)
 
 
+def _check_run_users(users):
+    """校验 session-run 的 users：1..10000 个按用户名 Unicode 码点升序且
+    互异的凭据二元数组 [user, password]。users 非 list 抛 TypeError；元素
+    非 list 抛 TypeError（元组非法形态为 ValueError，仅 list 为数组）；
+    长度、字段类型、取值、排序或重复错抛 ValueError。
+    """
+    if not isinstance(users, list):
+        raise TypeError(
+            f"users must be an array, got {type(users).__name__}"
+        )
+    if not (_CLI_USERS_MIN <= len(users) <= _CLI_USERS_MAX):
+        raise ValueError(
+            f"users must contain {_CLI_USERS_MIN}..{_CLI_USERS_MAX} items, "
+            f"got {len(users)}"
+        )
+    previous = None
+    for index, entry in enumerate(users):
+        if not isinstance(entry, list):
+            if isinstance(entry, tuple):
+                raise ValueError(
+                    f"users[{index}] must be an array pair, not a tuple"
+                )
+            raise TypeError(
+                f"users[{index}] must be an array, got {type(entry).__name__}"
+            )
+        if len(entry) != 2:
+            raise ValueError(
+                f"users[{index}] must be a [user, password] pair, "
+                f"got {len(entry)} items"
+            )
+        user, password = entry
+        if not isinstance(user, str):
+            raise TypeError(
+                f"users[{index}][0] must be a string, got "
+                f"{type(user).__name__}"
+            )
+        if not isinstance(password, str):
+            raise TypeError(
+                f"users[{index}][1] must be a string, got "
+                f"{type(password).__name__}"
+            )
+        _check_credential(f"users[{index}][0]", user)
+        _check_credential(f"users[{index}][1]", password)
+        if previous is not None:
+            if user == previous:
+                raise ValueError(f"users[{index}] duplicates {user!r}")
+            if user < previous:
+                raise ValueError(
+                    "users must be sorted by Unicode codepoint"
+                )
+        previous = user
+
+
+def _check_run_config(config, registered_users=None):
+    """校验 session-run 的 config：须为版本 10 配置对象（load_config 的键、
+    结构与取值规则）且含 default 地址池。config 非 object 抛 TypeError；
+    版本、键集/键序、结构、类型、值、引用、排序/重复或缺 default 池抛
+    ValueError。registered_users 给定时，用户模板引用的用户须在其中，
+    否则按引用非法抛 ValueError。仅做静态形态校验，不触碰任何实例。返回
+    规范化 spec（仅供调用方做进一步引用校验）。
+    """
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"config must be an object, got {type(config).__name__}"
+        )
+    spec = _parse_config_doc(config, None)
+    pool_ids = {pool_id for pool_id, *_rest in spec[4]}
+    if _DEFAULT_POOL_ID not in pool_ids:
+        raise ValueError("config must contain a default address pool")
+    if registered_users is not None:
+        for user, _template_id in spec[6]:
+            if user not in registered_users:
+                raise ValueError(
+                    f"user template references unregistered user: {user!r}"
+                )
+    return spec
+
+
+def _run_args_to_tuple(index, op, args):
+    """把会话请求的 args 数组转成 Sessions.do 原接口元组。
+
+    建立/迁移/接管/恢复须为恰含两个凭据字符串的数组（转为二元 tuple）；
+    续租/挂起/下线须为 null；其余形态按非法处理：非数组容器（tuple 等）
+    为 ValueError，非数组标量为 TypeError，长度/字段类型/取值错分别为
+    ValueError/TypeError/ValueError。
+    """
+    if op in (
+        _OP_ESTABLISH,
+        _OP_MIGRATE,
+        _OP_TAKEOVER,
+        _OP_RESUME,
+    ):
+        if isinstance(args, tuple):
+            raise ValueError(
+                f"requests[{index}].args must be an array, not a tuple"
+            )
+        if not isinstance(args, list):
+            raise TypeError(
+                f"requests[{index}].args must be an array, "
+                f"got {type(args).__name__}"
+            )
+        if len(args) != 2:
+            raise ValueError(
+                f"requests[{index}].args must have exactly 2 items, "
+                f"got {len(args)}"
+            )
+        field_names = {
+            _OP_ESTABLISH: ("user", "password"),
+            _OP_MIGRATE: ("target", "password"),
+            _OP_TAKEOVER: ("old", "password"),
+            _OP_RESUME: ("pool", "password"),
+        }[op]
+        first = _run_args_to_tuple_cred(index, 0, field_names[0], args[0])
+        second = _run_args_to_tuple_cred(index, 1, field_names[1], args[1])
+        return first, second
+    if args is not None:
+        if isinstance(args, (list, tuple)):
+            raise ValueError(
+                f"requests[{index}].args must be null for {op!r}"
+            )
+        raise TypeError(
+            f"requests[{index}].args must be null for {op!r}, "
+            f"got {type(args).__name__}"
+        )
+    return None
+
+
+def _run_args_to_tuple_cred(index, field_index, field_name, value):
+    """args 单个凭据字段的类型/取值校验（带请求下标定位）。"""
+    if not isinstance(value, str):
+        raise TypeError(
+            f"requests[{index}].args[{field_index}] ({field_name}) must be a "
+            f"string, got {type(value).__name__}"
+        )
+    _check_credential(
+        f"requests[{index}].args[{field_index}] ({field_name})", value
+    )
+    return value
+
+
+def _check_run_requests(requests):
+    """校验 session-run 的 requests：1..1000 个对象，键依次且仅为
+    key/op/sid/args/now_ms；key/sid 沿凭据约束，op 仅七个会话操作，
+    args 形态随 op（见 _run_args_to_tuple），now_ms 为非 bool 非负 int。
+    返回 [(key, op, sid, args_tuple, now_ms), ...]，保持请求顺序。
+    requests 非 list 抛 TypeError；长度、键集/键序、op、args 形态或取值
+    错抛 ValueError，字段类型错抛 TypeError。
+    """
+    if not isinstance(requests, list):
+        raise TypeError(
+            f"requests must be an array, got {type(requests).__name__}"
+        )
+    if not (
+        _CLI_RUN_REQUESTS_MIN
+        <= len(requests)
+        <= _CLI_RUN_REQUESTS_MAX
+    ):
+        raise ValueError(
+            f"requests must contain {_CLI_RUN_REQUESTS_MIN}.."
+            f"{_CLI_RUN_REQUESTS_MAX} items, got {len(requests)}"
+        )
+    parsed = []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise TypeError(
+                f"requests[{index}] must be an object, "
+                f"got {type(request).__name__}"
+            )
+        if list(request) != list(_CLI_RUN_ITEM_KEYS):
+            raise ValueError(
+                "requests[%d] keys must be exactly and in order: "
+                "key, op, sid, args, now_ms" % index
+            )
+        key = request["key"]
+        op = request["op"]
+        sid = request["sid"]
+        args = request["args"]
+        now_ms = request["now_ms"]
+        _check_credential(f"requests[{index}].key", key)
+        if not isinstance(op, str):
+            raise TypeError(
+                f"requests[{index}].op must be a string, "
+                f"got {type(op).__name__}"
+            )
+        if op not in _CLI_RUN_OPS:
+            raise ValueError(
+                f"requests[{index}].op must be one of {_CLI_RUN_OPS}, "
+                f"got {op!r}"
+            )
+        _check_credential(f"requests[{index}].sid", sid)
+        args_tuple = _run_args_to_tuple(index, op, args)
+        # 非 bool 非负 int：bool 归 TypeError，非 int 归 TypeError，负数归
+        # ValueError，与 _check_int 一致。
+        _check_int(f"requests[{index}].now_ms", now_ms, 0)
+        parsed.append((key, op, sid, args_tuple, now_ms))
+    return parsed
+
+
+def _parse_cli_run_request(raw):
+    """解析 session-run 请求字节，返回 (users, config, requests, query_ms)。
+
+    raw 须为 UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许
+    空白；编码、JSON、重键、顶层形态、键集或键序错抛 ValueError。users
+    为按用户名 Unicode 码点升序且互异的 [user, password] 二元数组；
+    config 为版本 10 配置对象且含 default 池；requests 为 1..1000 个会话
+    请求对象；query_ms 为非 bool 非负 int。类型错抛 TypeError，其余形态/
+    取值/排序/重复/配置非法抛 ValueError。
+    """
+    text = _decode_cli_request(raw)
+    doc = _decode_cli_object(text)
+    if list(doc) != list(_CLI_RUN_REQUEST_KEYS):
+        raise ValueError(
+            "request keys must be exactly and in order: "
+            "users, config, requests, query_ms"
+        )
+    users = doc["users"]
+    config = doc["config"]
+    requests = doc["requests"]
+    query_ms = doc["query_ms"]
+    _check_run_users(users)
+    registered_users = {user for user, _password in users}
+    _check_run_config(config, registered_users)
+    parsed_requests = _check_run_requests(requests)
+    _check_int("query_ms", query_ms, 0)
+    return users, config, parsed_requests, query_ms
+
+
+def _run_session_run(users, config, requests, query_ms):
+    """在全新实例中注册 users、加载 v10 配置并依序执行 Sessions.do。
+
+    注册与配置加载均已在输入校验阶段静态通过，此处不会失败。时间只取
+    各请求自带 now_ms：业务失败（AuthError/ResourceError/StateError/
+    KeyError/BackendError）记录异常类名后继续，老化、租约、认证、审计与
+    幂等副作用沿用 Sessions.do 既有语义（同一 key 同参重放原结果、异参
+    复用抛 ValueError 亦记为业务失败），失败不留半分配状态。全部结束后
+    按 query_ms 取会话全量查询（只读视图，不老化）与地址池统计
+    （pool_stats 先老化），组装 LF 尾紧凑 JSON：顶层键序版本/项目/会话/
+    地址池/摘要，版本 1；项目保持请求顺序，项键序序号/结果/输出/类型；
+    摘要为前四顶层字段紧凑编码 UTF-8 字节的 SHA-256 小写值。
+    """
+    auth = Authenticator(1, 0)
+    for user, password in users:
+        auth.add(user, password)
+    sessions = Sessions(auth, 1, 1, 0, lease_ms=1)
+    # v10 直载：键、结构、引用、承载力与 default 池均已静态校验，必成功。
+    config_text = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    sessions.load_config(config_text)
+
+    items = []
+    for index, (key, op, sid, args, now_ms) in enumerate(requests):
+        try:
+            output_text = sessions.do(key, op, sid, args, now_ms)
+        except (
+            AuthError,
+            ResourceError,
+            StateError,
+            KeyError,
+            BackendError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            # 业务失败统一记异常类名后继续。请求形态已在执行前静态校验，
+            # 故执行期出现的 ValueError/TypeError 只可能是幂等域冲突
+            # （同一 key 异参复用按 do 既有语义抛 ValueError），属业务
+            # 结果而非输入非法；老化、租约、认证、审计与幂等副作用沿用
+            # do 既有语义，失败不留半分配。
+            items.append(
+                {
+                    "序号": index,
+                    "结果": False,
+                    "输出": None,
+                    "类型": type(exc).__name__,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "序号": index,
+                    "结果": True,
+                    "输出": json.loads(output_text),
+                    "类型": "",
+                }
+            )
+
+    # 会话全量查询：会话数不超过请求数（<=1000），单页取全；只读视图，
+    # 不老化、不认证、不写审计/缓存/计数。
+    sessions_view = json.loads(
+        sessions.sessions(query_ms, "", _CLI_RUN_QUERY_LIMIT)
+    )
+    # 地址池统计：pool_stats 先按 query_ms 老化一次再统计。
+    pool_view = json.loads(sessions.pool_stats(query_ms))
+
+    document = {
+        "版本": 1,
+        "项目": items,
+        "会话": sessions_view,
+        "地址池": pool_view,
+    }
+    head = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    document["摘要"] = hashlib.sha256(head.encode("utf-8")).hexdigest()
+    return (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+
+
 def _write_cli_error(command, exc):
     """向 stderr 写 LF 尾紧凑 JSON 信封，键序“错误/类型”，UTF-8 字节。"""
     envelope = json.dumps(
@@ -13469,14 +13796,19 @@ def _write_cli_error(command, exc):
 
 
 def main(argv):
-    """命令行分派：受理无额外参数的 stats-merge 与 stats-delta。
+    """命令行分派：受理无额外参数的 stats-merge、stats-delta 与 session-run。
 
     缺失或未知子命令（含多余参数）沿用 stats-merge 名写 ValueError
     信封，退出 2；其余失败信封的“错误”取实际子命令名。
     """
     if (
         len(argv) != 2
-        or argv[1] not in (_CLI_MERGE_COMMAND, _CLI_DELTA_COMMAND)
+        or argv[1]
+        not in (
+            _CLI_MERGE_COMMAND,
+            _CLI_DELTA_COMMAND,
+            _CLI_RUN_COMMAND,
+        )
     ):
         _write_cli_error(_CLI_MERGE_COMMAND, ValueError("missing or unknown subcommand"))
         return 2
@@ -13486,9 +13818,12 @@ def main(argv):
         if command == _CLI_MERGE_COMMAND:
             key, users, base, left, right = _parse_cli_request(raw)
             result = _run_stats_merge(key, users, base, left, right)
-        else:
+        elif command == _CLI_DELTA_COMMAND:
             users, base, current = _parse_cli_delta_request(raw)
             result = _run_stats_delta(users, base, current)
+        else:
+            users, config, requests, query_ms = _parse_cli_run_request(raw)
+            result = _run_session_run(users, config, requests, query_ms)
     except (TypeError, ValueError, ResourceError, StateError) as exc:
         # 失败：stdout 保持空，信封仅含命令名与异常类名。
         _write_cli_error(command, exc)
