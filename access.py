@@ -25,7 +25,15 @@
   runtime_checkpoint/runtime_restore 提供覆盖会话/租约、容量队列/事件与
   共享 QoS 账本的运行态检查点（版本 1，摘要覆盖前四键）与按 key 原子
   恢复（仅缓存成功，同摘要空操作，异摘要覆盖状态 StateError），供续租、
-  计量、推进一致恢复。
+  计量、推进一致恢复。service_checkpoint/service_restore 提供跨域一致性
+  检查点（版本 1，顶层版本/时刻/配置摘要/认证/运行态/故障/统计/摘要，
+  生成先验参再只老化一次、末摘要盖前七键）与按 key 原子恢复：改态前完成
+  重键/键序/版本/类型/排序/各层摘要/统一时刻/跨域引用全验，配置摘要不符
+  StateError("配置")，认证用户集不同或引用未注册用户/未知模板/未知池
+  ResourceError，目标已有异摘要覆盖运行态 StateError("运行态")，空或同态
+  才整体替换认证（策略不变）、运行态、故障与统计，租约由会话重建；仅缓存
+  成功、同键同 text 重放原字节，任何失败不改态不占 key，生成/恢复/重放均
+  不审计、不老化（恢复）、不触发认证/计量/推进/统计。
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
@@ -1799,6 +1807,26 @@ class Sessions:
     separators=(',',':')），键序/型 追加:int/末序号:int/末哈希:str/摘要:str，
     摘要为前三键同法编码 UTF-8 字节的 sha256 小写值；空页追加 0。
     O(limit) 时间、O(limit) 空间。
+    service_checkpoint(now_ms) 先验参再只老化一次，随后从同一状态取当前
+    v10 配置规范摘要与各域对象，输出跨域一致性检查点 LF 尾紧凑 JSON：顶层
+    键固定依次为版本:int(1)/时刻:int/配置摘要:str/认证/运行态/故障/统计/
+    摘要:str，认证沿用同刻 auth_checkpoint 版本 2 对象契约，运行态沿用同刻
+    runtime_checkpoint 对象契约（容量时刻等于顶层），故障沿用同刻
+    fault_checkpoint 对象契约，统计沿用 stats_checkpoint 版本 1 对象契约，
+    末摘要覆盖前七键紧凑 JSON（无 LF）的 UTF-8 字节 sha256 小写值；除一次
+    老化外只读，不认证/计量/推进/新增统计/审计/事件/动各域缓存，同态同时刻
+    逐字节相同。service_restore(key, text) 在改变任何状态前完成重键、键序、
+    版本、字段类型、排序、各层摘要、统一时刻与跨域引用校验：参数类型错抛
+    TypeError，非法 JSON/结构/值/摘要或同键异型异参抛 ValueError；目标当前
+    配置摘要与包不一致抛 StateError("配置")，认证用户集合不同或引用未注册
+    用户、未知模板或未知地址池时抛 ResourceError；目标已有与包摘要不同的
+    会话、队列、容量事件或现存模板账本抛 StateError("运行态")；目标运行态
+    为空或整体相同时，认证（凭据/失败/锁定至/下次可试/停用，策略不变）、
+    运行态、故障三域与统计整体替换，租约由会话重建且必与会话一致。不导入或
+    清空配置与配置历史，不恢复主/批量/合规审计链及各域幂等缓存，生成/恢复/
+    重放均不追加审计事件；恢复不老化、不认证、不计量、不推进容量、不新增
+    统计；任何失败不改态、不占 key，成功返回同格式规范包，同键同 text 重放
+    原字节且无修改。单次生成与恢复 O(N log N) 时间、O(N) 辅助空间。
     """
 
     def __init__(self, auth, total, per, idle_ms, pool=None, lease_ms=1):
@@ -2047,6 +2075,10 @@ class Sessions:
         # （含参数错、ResourceError、StateError）不占 key。合并不写审计链，
         # 故无原序号索引。
         self._stats_merge_cache = {}
+        # service_restore 跨域一致性检查点恢复的重放缓存，与其余各域独立：
+        # key -> (text, 规范包)；仅首次成功缓存，失败（含参数错、
+        # ResourceError、StateError）不占 key。生成/恢复/重放均不写审计链。
+        self._service_restore_cache = {}
         # 按用户失败累计 user -> [认证, 资源, 状态, 后端]：仅 do/meter/
         # capacity 新 key 首次且已定位用户的四类异常各计一次；参数错、
         # KeyError、fault、重放与异参 key 不计，配置变更与重放恢复不清零。
@@ -10113,6 +10145,555 @@ class Sessions:
         if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
             raise ValueError("摘要 does not match the canonical runtime checkpoint")
         return now_ms, events, sessions, queued, quota_rows, summary
+
+    def _service_payload(self, now_ms):
+        """组装跨域一致性检查点文档 dict（顶层键序：
+        版本/时刻/配置摘要/认证/运行态/故障/统计/摘要）。
+
+        认证取同刻 auth_checkpoint 版本 2 对象（不含其尾 LF），运行态取同刻
+        runtime_checkpoint 对象（容量时刻等于顶层时刻），故障取同刻
+        fault_checkpoint 对象，统计取 stats_checkpoint 对象；配置摘要为当前
+        v10 配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写值；末摘要为前七键
+        紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。纯渲染：
+        不老化、不改态，各域状态由调用方先做过唯一一次老化。
+        """
+        doc = {
+            "版本": 1,
+            "时刻": now_ms,
+            "配置摘要": self._config_summary(),
+            "认证": json.loads(self._auth_checkpoint_text(now_ms)),
+            "运行态": self._runtime_payload(now_ms),
+            "故障": self._fault_payload(now_ms),
+            "统计": self._stats_payload(),
+        }
+        blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return doc
+
+    def _service_checkpoint_text(self, now_ms):
+        """跨域一致性检查点的 LF 结尾紧凑 JSON（基线序列化，不老化、不改态）。"""
+        return json.dumps(
+            self._service_payload(now_ms), ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def service_checkpoint(self, now_ms):
+        """先验参再只执行一次老化，随后从同一状态取当前 v10 配置的规范摘要与
+        认证、会话与租约、容量队列及事件、QoS 账本、故障演练、统计各域对象，
+        输出跨域一致性检查点的 LF 结尾紧凑 JSON。
+
+        now_ms 限非 bool 非负 int：类型错 TypeError、取值错 ValueError。顶层
+        键固定依次为“版本/时刻/配置摘要/认证/运行态/故障/统计/摘要”：版本
+        恒为 1；时刻为 now_ms；配置摘要为当前 v10 配置紧凑编码（无 LF）的
+        UTF-8 字节 sha256 小写值；认证沿用同刻 auth_checkpoint 版本 2 对象
+        契约；运行态沿用同刻 runtime_checkpoint 对象契约（版本 1，容量时刻
+        等于顶层时刻，覆盖会话/租约、容量队列/事件与共享 QoS 账本）；故障
+        沿用同刻 fault_checkpoint 对象契约（版本 1，覆盖后端、池与超时三域）；
+        统计沿用 stats_checkpoint 版本 1 对象契约（建立、用户失败、用户计量、
+        模板计量）；摘要为前七键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值。
+        除一次既有老化外只读：不认证、不计量、不推进容量、不新增统计、不写
+        任何审计或事件、不动各域幂等缓存；不导入或清空配置与配置历史。同一
+        状态与同一时刻逐字节相同。时间 O(N log N)、辅助空间 O(N)，N 为用户、
+        会话、排队项、容量事件、账本、故障项、统计明细与配置项总数。
+        """
+        _check_int("now_ms", now_ms, 0)
+        self._age(now_ms)
+        return self._service_checkpoint_text(now_ms)
+
+    def service_restore(self, key, text):
+        """按跨域一致性检查点在一次原子提交中恢复认证限制与凭据、运行态（会话/
+        租约、容量队列/事件、QoS 账本）、故障演练态与统计，返回同格式的规范
+        检查点 LF 结尾基线 JSON。
+
+        key 沿凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
+        text 非 str 抛 TypeError。在改变任何状态前完成全部校验：JSON 解析、
+        重键、键集/键序、版本、字段类型、取值、排序、各层摘要、统一时刻
+        （认证/运行态容量/故障时刻均等于顶层时刻）与跨域引用校验，非法均抛
+        ValueError；同 key 异型或同型异 text 重放抛 ValueError。目标当前配置
+        摘要与包不一致抛 StateError("配置")；认证用户集合与包不同，或内容
+        引用未注册用户、未知模板或未知地址池抛 ResourceError。目标已有与包
+        摘要不同的会话、队列、容量事件或现存模板账本时抛 StateError("运行态")；
+        目标运行态为空或整体与包相同时，认证限制与凭据摘要、运行态、故障态
+        和统计整体替换；恢复后地址池租约由会话重建、必与会话一致。任何失败
+        都不改变状态、不占用幂等键；成功返回同格式的规范检查点，同 key 同
+        text 重放原字节且不产生修改。
+
+        不导入或清空配置与配置历史，不恢复主审计链、批量审计链、合规链及
+        既有各域幂等缓存，不为生成、恢复或重放追加任何审计事件；恢复不老化、
+        不触发认证、计量、容量推进或新的统计。首次 O(N log N) 时间、O(N)
+        辅助空间，重放 O(1)。
+        """
+        _check_credential("key", key)
+
+        cached = self._service_restore_cache.get(key)
+        if cached is not None:
+            # 重放：不解析、不替换、不老化，仅核对同型同 text 后返回缓存原字节。
+            c_text, result = cached
+            if type(text) is not type(c_text) or text != c_text:
+                raise ValueError(f"key {key!r} reused with different parameters")
+            return result
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+
+        # 全部解析与校验在新数据上进行，通过后一次性替换；任何失败实例不变。
+        parsed = self._parse_service_checkpoint(text)
+        now_ms = parsed["now_ms"]
+        config_summary = parsed["配置摘要"]
+        auth_rows = parsed["认证"]
+        cap_events = parsed["容量事件"]
+        cap_sessions = parsed["容量会话"]
+        cap_queued = parsed["容量排队"]
+        quota_rows = parsed["配额"]
+        until = parsed["后端截至"]
+        backoff_rows = parsed["退避"]
+        fault_fail = parsed["失败"]
+        pool_fault_rows = parsed["池故障"]
+        timeout_waiting = parsed["超时等待"]
+        timeout_trigger = parsed["超时触发"]
+        total = parsed["建立总数"]
+        success = parsed["建立成功"]
+        fail_rows = parsed["用户失败"]
+        user_meter_rows = parsed["用户计量"]
+        template_meter_rows = parsed["模板计量"]
+        runtime_summary = parsed["运行态摘要"]
+
+        # 配置：目标当前 v10 配置摘要须与包一致（不导入也不清空配置）。
+        if self._config_summary() != config_summary:
+            raise StateError("配置")
+
+        # 认证用户集合：包的认证用户集合须与当前认证器完全一致。
+        current_users = set(self._auth._users)
+        checkpoint_users = {user for user, *_rest in auth_rows}
+        if checkpoint_users != current_users:
+            raise ResourceError(
+                "service checkpoint auth user set does not match the "
+                "current authenticator"
+            )
+
+        # 跨域引用与承载力（ResourceError）：容量部分沿 creplay/runtime_restore
+        # 口径（用户、全局/单用户上限、池址承载），配额沿 quota_restore 口径
+        # （用户、模板、令牌桶容），故障退避引用已注册用户、池演练引用现存池；
+        # 统计的用户失败与用户计量行引用已注册用户（模板计量不验模板引用）。
+        required_leases = self._checkpoint_carry_leases(
+            cap_sessions, cap_queued
+        )
+        for user, template_id, _used, _last, tokens in quota_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"service checkpoint references unregistered user: {user!r}"
+                )
+            template = self._templates.get(template_id)
+            if template is None:
+                raise ResourceError(
+                    f"service checkpoint references unknown template: "
+                    f"{template_id!r}"
+                )
+            if tokens > (template[0] + template[1]) * 1000:
+                raise ResourceError(
+                    f"令牌 for {(user, template_id)!r} exceeds template bucket "
+                    f"capacity {(template[0] + template[1]) * 1000}"
+                )
+        for user, _n, _retry_at in backoff_rows:
+            if user not in self._auth:
+                raise ResourceError(
+                    f"service checkpoint references unregistered user: {user!r}"
+                )
+        for pool_id, _pool_until in pool_fault_rows:
+            if pool_id not in self._pools:
+                raise ResourceError(
+                    f"service checkpoint references unknown pool: {pool_id!r}"
+                )
+        for ident_rows in (fail_rows, user_meter_rows):
+            for ident, *_values in ident_rows:
+                if ident not in self._auth:
+                    raise ResourceError(
+                        f"service checkpoint references unregistered user: "
+                        f"{ident!r}"
+                    )
+
+        # 引用与承载力全过后再判覆盖状态：运行态同摘要（以当前实况、不老化重算
+        # 规范化运行态）即整体一致，允许在非空同态上替换其余域；不同摘要时仅
+        # 允许目标运行态为空（无会话、队项、容量事件与现存模板账本），否则目标
+        # 已有与包不同的覆盖状态。
+        runtime_equal = self._runtime_payload(now_ms)["摘要"] == runtime_summary
+        if not runtime_equal and (
+            self._sessions
+            or self._capacity_queue
+            or self._capacity_events
+            or any(
+                template_id in self._templates
+                for _user, template_id in self._meter_ledgers
+            )
+        ):
+            raise StateError("运行态")
+
+        # 全部校验通过：一次性原子替换四个域。认证（凭据摘要、失败、锁定至、
+        # 下次可试、停用态；认证策略四项不变）。
+        self._auth._users = {
+            user: [digest, failed, until_lock, retry_at]
+            for user, digest, failed, until_lock, retry_at, _disabled in auth_rows
+        }
+        self._disabled_users = {
+            user
+            for user, _digest, _failed, _until, _retry_at, disabled in auth_rows
+            if disabled
+        }
+
+        # 运行态：会话（含墓碑）、租约、队列、入队序游标、事件账本与现存模板
+        # 账本；已删模板的历史账本原样保留。租约表由会话重建，恢复后必与会话
+        # 一致。
+        new_sessions = {}
+        for row in cap_sessions:
+            if row["池"] == "":
+                pool_id = None
+                ip_int = None
+            else:
+                pool_id = row["池"]
+                ip_int = _check_ip("会话.地址", row["地址"])
+            new_sessions[row["会话"]] = {
+                "user": row["用户"],
+                "state": row["状态"],
+                "deadline": row["期限"],
+                "ip": ip_int,
+                "lease": row["租期"],
+                "pool": pool_id,
+            }
+        self._sessions = new_sessions
+        self._rebuild_pool_leases(required_leases)
+        self._capacity_queue = {
+            row["会话"]: [
+                row["用户"],
+                row["申请时刻"],
+                row["等待"],
+                row["截止"],
+                row["入队序"],
+            ]
+            for row in cap_queued
+        }
+        self._queue_order = [row["会话"] for row in cap_queued]
+        # 入队序计数取账本中历次排队事件的最大序（消费不回收序号）。
+        self._queue_seq = max(
+            (order for _s, _t, _sid, verdict, order, _p, _h in cap_events
+             if verdict == _CAP_QUEUED),
+            default=0,
+        )
+        self._capacity_events = list(cap_events)
+        self._capacity_tail = (
+            cap_events[-1][6] if cap_events else "0" * 64
+        )
+        new_ledgers = {
+            ledger_key: ledger
+            for ledger_key, ledger in self._meter_ledgers.items()
+            if ledger_key[1] not in self._templates
+        }
+        for user, template_id, used, last, tokens in quota_rows:
+            new_ledgers[(user, template_id)] = [used, last, tokens]
+        self._meter_ledgers = new_ledgers
+
+        # 故障演练三域：后端截至与退避、失败计数、池演练记录、超时待触发值。
+        self._fault_until = until
+        self._backoff = {
+            user: (n, retry_at) for user, n, retry_at in backoff_rows
+        }
+        self._fault_fail = [fault_fail[0], fault_fail[1]]
+        self._pool_fault = {
+            pool_id: pool_until for pool_id, pool_until in pool_fault_rows
+        }
+        self._timeout_at = timeout_trigger if timeout_waiting else None
+
+        # 统计五类计数。
+        self._establish_total = total
+        self._establish_success = success
+        self._user_fail = {
+            user: [a, r, st, b] for user, a, r, st, b in fail_rows
+        }
+        self._meter_stats_user = {
+            ident: [p, d, o, byt]
+            for ident, p, d, o, byt in user_meter_rows
+        }
+        self._meter_stats_template = {
+            ident: [p, d, o, byt]
+            for ident, p, d, o, byt in template_meter_rows
+        }
+
+        result = self._service_checkpoint_text(now_ms)
+        self._service_restore_cache[key] = (text, result)
+        return result
+
+    def _parse_service_checkpoint(self, text):
+        """解析并全量校验跨域一致性检查点文本，返回以字段名为键的规范化值
+        dict；任何文本非法均抛 ValueError。
+
+        顶层须恰含“版本/时刻/配置摘要/认证/运行态/故障/统计/摘要”且键序
+        如此；版本为 1，时刻为非 bool 非负 int，配置摘要为 64 位小写十六
+        进制串；认证/运行态/故障/统计分别重编码为紧凑 JSON 后沿用各域既有
+        解析器全量校验（嵌套键序按原文先行校验，错序即 ValueError），各域
+        时刻须统一等于顶层时刻，各域自带摘要须重算相符；末摘要须为规范化
+        前七键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值。仅做结构自洽与
+        统一时刻校验；配置摘要一致、用户注册、模板/池存在与承载力由
+        service_restore 判定。
+        """
+        try:
+            doc = json.loads(text, object_pairs_hook=_unique_object)
+        except ValueError as exc:
+            raise ValueError(f"service checkpoint is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError("service checkpoint top level must be an object")
+        top_keys = [
+            "版本", "时刻", "配置摘要", "认证", "运行态", "故障", "统计", "摘要"
+        ]
+        if list(doc) != top_keys:
+            raise ValueError(
+                "service checkpoint top-level keys must be "
+                "版本/时刻/配置摘要/认证/运行态/故障/统计/摘要 in order"
+            )
+        version = doc["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"版本 must be 1, got {version}")
+        now_ms = self._cp_int(doc["时刻"], "时刻", 0)
+        config_summary = self._cp_hex64(doc["配置摘要"], "配置摘要")
+        auth_raw = doc["认证"]
+        runtime_raw = doc["运行态"]
+        fault_raw = doc["故障"]
+        stats_raw = doc["统计"]
+        if not isinstance(auth_raw, dict):
+            raise ValueError("认证 must be an object")
+        if not isinstance(runtime_raw, dict):
+            raise ValueError("运行态 must be an object")
+        if not isinstance(fault_raw, dict):
+            raise ValueError("故障 must be an object")
+        if not isinstance(stats_raw, dict):
+            raise ValueError("统计 must be an object")
+
+        # 嵌套键序按原文校验（dict 保序），先于重编码与各层摘要重算。
+        if list(auth_raw) != ["版本", "时刻", "用户", "摘要"]:
+            raise ValueError(
+                "认证 keys must be 版本/时刻/用户/摘要 in order"
+            )
+        if list(runtime_raw) != ["版本", "时刻", "容量", "配额", "摘要"]:
+            raise ValueError(
+                "运行态 keys must be 版本/时刻/容量/配额/摘要 in order"
+            )
+        capacity_raw = runtime_raw["容量"]
+        if not isinstance(capacity_raw, dict) or list(capacity_raw) != [
+            "时刻", "事件", "会话", "排队", "状态哈希"
+        ]:
+            raise ValueError(
+                "运行态.容量 keys must be 时刻/事件/会话/排队/状态哈希 in order"
+            )
+        if not isinstance(runtime_raw["配额"], dict) or list(
+            runtime_raw["配额"]
+        ) != ["版本", "账本"]:
+            raise ValueError("运行态.配额 keys must be 版本/账本 in order")
+        for label, key_order in (
+            ("事件", ["序号", "时刻", "会话", "结果", "入队序", "前哈希", "哈希"]),
+            ("会话", ["会话", "用户", "状态", "期限", "池", "地址", "租期"]),
+            ("排队", ["会话", "用户", "申请时刻", "等待", "截止", "入队序"]),
+        ):
+            rows = capacity_raw[label]
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if isinstance(item, dict) and list(item) != key_order:
+                    raise ValueError(
+                        f"运行态.容量.{label} item keys must be "
+                        f"{'/'.join(key_order)} in order"
+                    )
+        if list(fault_raw) != ["版本", "时刻", "后端", "池", "超时", "摘要"]:
+            raise ValueError(
+                "故障 keys must be 版本/时刻/后端/池/超时/摘要 in order"
+            )
+        backend_raw = fault_raw["后端"]
+        if not isinstance(backend_raw, dict) or list(backend_raw) != [
+            "截至", "退避", "失败"
+        ]:
+            raise ValueError("故障.后端 keys must be 截至/退避/失败 in order")
+        if not isinstance(fault_raw["超时"], dict) or list(
+            fault_raw["超时"]
+        ) != ["等待", "触发"]:
+            raise ValueError("故障.超时 keys must be 等待/触发 in order")
+        if list(stats_raw) != [
+            "版本", "建立", "用户失败", "用户计量", "模板计量", "摘要"
+        ]:
+            raise ValueError(
+                "统计 keys must be "
+                "版本/建立/用户失败/用户计量/模板计量/摘要 in order"
+            )
+
+        def compact(value):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+        # 子文档沿用各域既有解析器全量校验（重键已在顶层解析时拒绝；规范化
+        # 行由解析器返回，与原文排版无关）。
+        auth_now, auth_rows = self._parse_auth_checkpoint(compact(auth_raw))
+        if auth_now != now_ms:
+            raise ValueError(
+                f"认证.时刻 must equal top-level 时刻 {now_ms}, got {auth_now}"
+            )
+        (
+            runtime_now,
+            cap_events,
+            cap_sessions,
+            cap_queued,
+            quota_rows,
+            runtime_summary,
+        ) = self._parse_runtime_checkpoint(compact(runtime_raw))
+        if runtime_now != now_ms:
+            raise ValueError(
+                f"运行态.时刻 must equal top-level 时刻 {now_ms}, "
+                f"got {runtime_now}"
+            )
+        (
+            fault_now,
+            until,
+            backoff_rows,
+            fail_pair,
+            pool_fault_rows,
+            timeout_waiting,
+            timeout_trigger,
+        ) = self._parse_fault_checkpoint(compact(fault_raw))
+        if fault_now != now_ms:
+            raise ValueError(
+                f"故障.时刻 must equal top-level 时刻 {now_ms}, got {fault_now}"
+            )
+        (
+            total,
+            success,
+            fail_rows,
+            user_meter_rows,
+            template_meter_rows,
+            _stats_summary,
+        ) = self._parse_stats_checkpoint(compact(stats_raw))
+        # stats_checkpoint 文档无时刻字段，时刻统一由顶层与其余三域保证。
+
+        # 末摘要：用各域规范化行重建前七键（数值相等即与生成方基线逐字节一致）。
+        # 四个内嵌对象在顶层 blob 中均带各自的末摘要（生成器先对去摘要头部
+        # 求 sha256 再追加“摘要”键），故须按同序补算，再纳入顶层摘要。
+        canonical_auth = {
+            "版本": 2,
+            "时刻": now_ms,
+            "用户": [
+                {
+                    "用户": user,
+                    "凭据": digest.hex(),
+                    "失败": failed,
+                    "锁定至": until_lock,
+                    "下次可试": retry_at,
+                    "停用": disabled,
+                }
+                for user, digest, failed, until_lock, retry_at, disabled
+                in auth_rows
+            ],
+        }
+        canonical_auth["摘要"] = hashlib.sha256(
+            compact(canonical_auth).encode("utf-8")
+        ).hexdigest()
+        event_rows = [
+            {
+                "序号": seq,
+                "时刻": ev_now,
+                "会话": sid,
+                "结果": verdict,
+                "入队序": order,
+                "前哈希": prev_hash,
+                "哈希": digest,
+            }
+            for seq, ev_now, sid, verdict, order, prev_hash, digest
+            in cap_events
+        ]
+        canonical_capacity = {
+            "时刻": now_ms,
+            "事件": event_rows,
+            "会话": cap_sessions,
+            "排队": cap_queued,
+            "状态哈希": self._checkpoint_state_hash(
+                now_ms, event_rows, cap_sessions, cap_queued
+            ),
+        }
+        canonical_runtime = {
+            "版本": 1,
+            "时刻": now_ms,
+            "容量": canonical_capacity,
+            "配额": {"版本": 1, "账本": [list(row) for row in quota_rows]},
+        }
+        canonical_runtime["摘要"] = hashlib.sha256(
+            compact(canonical_runtime).encode("utf-8")
+        ).hexdigest()
+        canonical_fault = {
+            "版本": 1,
+            "时刻": now_ms,
+            "后端": {
+                "截至": until,
+                "退避": [
+                    {"用户": user, "次数": n, "下次": retry_at}
+                    for user, n, retry_at in backoff_rows
+                ],
+                "失败": {"故障": fail_pair[0], "退避": fail_pair[1]},
+            },
+            "池": [
+                {"标识": pool_id, "截至": pool_until}
+                for pool_id, pool_until in pool_fault_rows
+            ],
+            "超时": {"等待": timeout_waiting, "触发": timeout_trigger},
+        }
+        canonical_fault["摘要"] = hashlib.sha256(
+            compact(canonical_fault).encode("utf-8")
+        ).hexdigest()
+        canonical_stats = {
+            "版本": 1,
+            "建立": {"总数": total, "成功": success},
+            "用户失败": [
+                {"用户": user, "认证": a, "资源": r, "状态": st, "后端": b}
+                for user, a, r, st, b in fail_rows
+            ],
+            "用户计量": [
+                {"标识": ident, "通过": p, "拒绝": d, "下线": o, "通过字节": byt}
+                for ident, p, d, o, byt in user_meter_rows
+            ],
+            "模板计量": [
+                {"标识": ident, "通过": p, "拒绝": d, "下线": o, "通过字节": byt}
+                for ident, p, d, o, byt in template_meter_rows
+            ],
+        }
+        canonical_stats["摘要"] = hashlib.sha256(
+            compact(canonical_stats).encode("utf-8")
+        ).hexdigest()
+        canonical_head = {
+            "版本": 1,
+            "时刻": now_ms,
+            "配置摘要": config_summary,
+            "认证": canonical_auth,
+            "运行态": canonical_runtime,
+            "故障": canonical_fault,
+            "统计": canonical_stats,
+        }
+        blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
+        summary = self._cp_hex64(doc["摘要"], "摘要")
+        if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
+            raise ValueError("摘要 does not match the canonical service checkpoint")
+        return {
+            "now_ms": now_ms,
+            "配置摘要": config_summary,
+            "认证": auth_rows,
+            "容量事件": cap_events,
+            "容量会话": cap_sessions,
+            "容量排队": cap_queued,
+            "配额": quota_rows,
+            "运行态摘要": runtime_summary,
+            "后端截至": until,
+            "退避": backoff_rows,
+            "失败": fail_pair,
+            "池故障": pool_fault_rows,
+            "超时等待": timeout_waiting,
+            "超时触发": timeout_trigger,
+            "建立总数": total,
+            "建立成功": success,
+            "用户失败": fail_rows,
+            "用户计量": user_meter_rows,
+            "模板计量": template_meter_rows,
+        }
 
     @staticmethod
     def _render_capacity(sid, result, now_ms, deadline):
