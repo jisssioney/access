@@ -68,13 +68,13 @@ class UpgradeConfigTest(unittest.TestCase):
             list(doc), ["源版本", "目标版本", "改变", "摘要", "配置"]
         )
         self.assertEqual(doc["源版本"], 1)
-        self.assertEqual(doc["目标版本"], 5)
+        self.assertEqual(doc["目标版本"], 10)
         self.assertIs(doc["改变"], True)
         self.assertIsInstance(doc["摘要"], str)
-        # 迁移：v1 单池改 default；模板/用户模板补空；容量补 1024、0；
-        # 认证补认证器当前两值。
+        # 迁移：v1 单池改 default；模板/用户模板补空；容量补 1024、0、拒绝；
+        # 认证补认证器当前四值（重试两项补 0）。
         cfg = doc["配置"]
-        self.assertEqual(cfg["版本"], 5)
+        self.assertEqual(cfg["版本"], 10)
         self.assertEqual(
             list(cfg), ["版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"]
         )
@@ -83,9 +83,17 @@ class UpgradeConfigTest(unittest.TestCase):
         self.assertEqual(cfg["地址池"][0]["CIDR"], "10.9.0.0/24")
         self.assertEqual(cfg["模板"], [])
         self.assertEqual(cfg["用户模板"], [])
-        self.assertEqual(cfg["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
-        self.assertEqual(list(cfg["认证"]), ["最大失败", "锁定毫秒"])
-        self.assertEqual(cfg["认证"], {"最大失败": 3, "锁定毫秒": 1000})
+        self.assertEqual(
+            cfg["容量"], {"队列上限": 1024, "最大等待毫秒": 0, "队满策略": "拒绝"}
+        )
+        self.assertEqual(
+            list(cfg["认证"]),
+            ["最大失败", "锁定毫秒", "重试基数毫秒", "重试上限毫秒"],
+        )
+        self.assertEqual(cfg["认证"], {
+            "最大失败": 3, "锁定毫秒": 1000,
+            "重试基数毫秒": 0, "重试上限毫秒": 0,
+        })
         # 摘要 = 配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写值。
         config_text = canonical_config_bytes(out)
         expect = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
@@ -97,8 +105,8 @@ class UpgradeConfigTest(unittest.TestCase):
         d2 = json.loads(s.upgrade_config(V2))
         self.assertEqual(d2["源版本"], 2)
         self.assertIs(d2["改变"], True)
-        self.assertEqual(d2["目标版本"], 5)
-        # 池按标识升序、保留按 IP 升序、静态按用户升序（同 export v5）。
+        self.assertEqual(d2["目标版本"], 10)
+        # 池按标识升序、保留按 IP 升序、静态按用户升序（同 export v10）。
         pools = d2["配置"]["地址池"]
         self.assertEqual([p["标识"] for p in pools], ["a", "b"])
         self.assertEqual(pools[1]["保留"], ["192.168.0.3", "192.168.0.5"])
@@ -108,8 +116,14 @@ class UpgradeConfigTest(unittest.TestCase):
         )
         self.assertEqual(d2["配置"]["模板"], [])
         self.assertEqual(d2["配置"]["用户模板"], [])
-        self.assertEqual(d2["配置"]["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
-        self.assertEqual(d2["配置"]["认证"], {"最大失败": 3, "锁定毫秒": 1000})
+        self.assertEqual(
+            d2["配置"]["容量"],
+            {"队列上限": 1024, "最大等待毫秒": 0, "队满策略": "拒绝"},
+        )
+        self.assertEqual(d2["配置"]["认证"], {
+            "最大失败": 3, "锁定毫秒": 1000,
+            "重试基数毫秒": 0, "重试上限毫秒": 0,
+        })
 
         d3 = json.loads(s.upgrade_config(V3))
         self.assertEqual(d3["源版本"], 3)
@@ -119,34 +133,70 @@ class UpgradeConfigTest(unittest.TestCase):
             [t["标识"] for t in d3["配置"]["模板"]], ["basic", "gold"]
         )
         self.assertEqual(d3["配置"]["用户模板"], [["alice", "gold"]])
-        self.assertEqual(d3["配置"]["容量"], {"队列上限": 1024, "最大等待毫秒": 0})
-        self.assertEqual(d3["配置"]["认证"], {"最大失败": 3, "锁定毫秒": 1000})
+        self.assertEqual(
+            d3["配置"]["容量"],
+            {"队列上限": 1024, "最大等待毫秒": 0, "队满策略": "拒绝"},
+        )
+        self.assertEqual(d3["配置"]["认证"], {
+            "最大失败": 3, "锁定毫秒": 1000,
+            "重试基数毫秒": 0, "重试上限毫秒": 0,
+        })
 
-        # v4 迁移：容量沿源文，认证补认证器当前两值。
+        # v4 迁移：容量沿源文（队满策略补拒绝），认证补认证器当前四值。
         d4 = json.loads(s.upgrade_config(V4))
         self.assertEqual(d4["源版本"], 4)
         self.assertIs(d4["改变"], True)
-        self.assertEqual(d4["目标版本"], 5)
-        self.assertEqual(d4["配置"]["容量"], {"队列上限": 512, "最大等待毫秒": 250})
-        self.assertEqual(d4["配置"]["认证"], {"最大失败": 3, "锁定毫秒": 1000})
+        self.assertEqual(d4["目标版本"], 10)
+        self.assertEqual(
+            d4["配置"]["容量"],
+            {"队列上限": 512, "最大等待毫秒": 250, "队满策略": "拒绝"},
+        )
+        self.assertEqual(d4["配置"]["认证"]["重试基数毫秒"], 0)
+        self.assertEqual(d4["配置"]["认证"]["重试上限毫秒"], 0)
 
-    def test_v5_only_canonicalizes_and_changed_false(self):
+    def test_v9_upgrades_to_v10_with_zero_backoff(self):
         s = make()
         s.add_pool("bpool", ("192.168.0.0/24", (), ()))
-        v5 = s.export_config()
-        out = s.upgrade_config(v5)
+        # 由当前导出构造 v9 源（认证仅两键、容量三键）。
+        v9 = json.loads(s.export_config())
+        v9["版本"] = 9
+        v9["认证"] = {"最大失败": 3, "锁定毫秒": 1000}
+        v9_text = json.dumps(v9, ensure_ascii=False)
+        out = s.upgrade_config(v9_text)
         doc = json.loads(out)
-        self.assertEqual(doc["源版本"], 5)
-        self.assertEqual(doc["目标版本"], 5)
-        self.assertIs(doc["改变"], False)
-        # v5 只规范化：配置部分与 export 逐字节一致。
+        self.assertEqual(doc["源版本"], 9)
+        self.assertEqual(doc["目标版本"], 10)
+        self.assertIs(doc["改变"], True)
+        self.assertEqual(doc["配置"]["认证"], {
+            "最大失败": 3, "锁定毫秒": 1000,
+            "重试基数毫秒": 0, "重试上限毫秒": 0,
+        })
+        # v10 只规范化：配置部分与 export 逐字节一致。
+        v10 = s.export_config()
         self.assertEqual(
             json.dumps(doc["配置"], ensure_ascii=False, separators=(",", ":")),
-            v5.rstrip("\n"),
+            v10.rstrip("\n"),
         )
-        # target 显式传 5（位置与关键字）。
-        self.assertEqual(s.upgrade_config(v5, 5), out)
-        self.assertEqual(s.upgrade_config(v5, target=5), out)
+        # 加载 v9 源亦补 0。
+        self.assertEqual(json.loads(s.load_config(v9_text))["认证"]["重试基数毫秒"], 0)
+
+    def test_v10_only_canonicalizes_and_changed_false(self):
+        s = make()
+        s.add_pool("bpool", ("192.168.0.0/24", (), ()))
+        v10 = s.export_config()
+        out = s.upgrade_config(v10)
+        doc = json.loads(out)
+        self.assertEqual(doc["源版本"], 10)
+        self.assertEqual(doc["目标版本"], 10)
+        self.assertIs(doc["改变"], False)
+        # v10 只规范化：配置部分与 export 逐字节一致。
+        self.assertEqual(
+            json.dumps(doc["配置"], ensure_ascii=False, separators=(",", ":")),
+            v10.rstrip("\n"),
+        )
+        # target 显式传 10（位置与关键字）。
+        self.assertEqual(s.upgrade_config(v10, 10), out)
+        self.assertEqual(s.upgrade_config(v10, target=10), out)
 
     def test_type_errors(self):
         s = make()
@@ -162,9 +212,9 @@ class UpgradeConfigTest(unittest.TestCase):
             with self.assertRaises(TypeError):
                 s.upgrade_config(V1, bad_target)
 
-    def test_target_must_be_5(self):
+    def test_target_must_be_10(self):
         s = make()
-        for bad_target in (0, 1, 2, 3, 4, 6, -1):
+        for bad_target in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, -1):
             with self.assertRaises(ValueError):
                 s.upgrade_config(V1, bad_target)
 
@@ -257,9 +307,12 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
         expect = json.dumps(cfg, ensure_ascii=False, separators=(",", ":")) + "\n"
         self.assertEqual(out, expect)
         self.assertEqual(s.export_config(), expect)
-        # 迁移配置含认证节（认证器当前两值）
+        # 迁移配置含认证节（认证器当前四值，重试补 0）
         self.assertEqual(
-            json.loads(out)["认证"], {"最大失败": 3, "锁定毫秒": 1000}
+            json.loads(out)["认证"], {
+                "最大失败": 3, "锁定毫秒": 1000,
+                "重试基数毫秒": 0, "重试上限毫秒": 0,
+            }
         )
         # 唯一回滚点指向加载前配置
         self.assertEqual(s.rollback_config(), before)
@@ -291,13 +344,13 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
         bad = json.loads(json.dumps(doc))
         bad["改变"] = False
         reload(json.dumps(bad, ensure_ascii=False))
-        # 目标版本非 5
+        # 目标版本非 10
         bad = json.loads(json.dumps(doc))
-        bad["目标版本"] = 4
+        bad["目标版本"] = 9
         reload(json.dumps(bad, ensure_ascii=False))
         # 源版本越界
         bad = json.loads(json.dumps(doc))
-        bad["源版本"] = 6
+        bad["源版本"] = 11
         reload(json.dumps(bad, ensure_ascii=False))
         # 摘要类型错
         bad = json.loads(json.dumps(doc))
@@ -315,10 +368,10 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
         bad["多"] = 1
         reload(json.dumps(bad, ensure_ascii=False))
         # 键序错（内容不变）
-        m = re.match(r'^\{"源版本":\d+,"目标版本":5,', raw)
+        m = re.match(r'^\{"源版本":\d+,"目标版本":10,', raw)
         self.assertIsNotNone(m)
         head = m.group(0)
-        new_head = '{"目标版本":5,"源版本":' + str(doc["源版本"]) + ","
+        new_head = '{"目标版本":10,"源版本":' + str(doc["源版本"]) + ","
         reload(new_head + raw[len(head):])
         # 配置非规范形态：键序错（顶层 版本/会话 对调须整体重排，改测容量键序）
         bad = json.loads(json.dumps(doc))
@@ -333,6 +386,8 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
         # 配置非规范形态：认证键序错（摘要按该字节算出也须拒）
         bad = json.loads(json.dumps(doc))
         bad["配置"]["认证"] = {
+            "重试上限毫秒": bad["配置"]["认证"]["重试上限毫秒"],
+            "重试基数毫秒": bad["配置"]["认证"]["重试基数毫秒"],
             "锁定毫秒": bad["配置"]["认证"]["锁定毫秒"],
             "最大失败": bad["配置"]["认证"]["最大失败"],
         }
@@ -347,9 +402,9 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
             json.dumps(bad["配置"], ensure_ascii=False, separators=(",", ":")).encode()
         ).hexdigest()
         reload(json.dumps(bad, ensure_ascii=False))
-        # 配置版本非 5
+        # 配置版本非 10
         bad = json.loads(json.dumps(doc))
-        bad["配置"]["版本"] = 4
+        bad["配置"]["版本"] = 9
         reload(json.dumps(bad, ensure_ascii=False))
         # 配置不是对象
         bad = json.loads(json.dumps(doc))
@@ -394,17 +449,25 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
         with self.assertRaises(StateError):
             s.rollback_config()
 
-    def test_direct_load_still_accepts_v1_to_v5(self):
+    def test_direct_load_still_accepts_v1_to_v9(self):
         s = make()
         # 直载（既有行为）：v1 迁移
         out = json.loads(s.load_config(V1))
-        self.assertEqual(out["版本"], 5)
+        self.assertEqual(out["版本"], 10)
         self.assertEqual(out["地址池"][0]["标识"], "default")
         # 直载 v2/v3/v4 迁移
-        self.assertEqual(json.loads(s.load_config(V2))["版本"], 5)
-        self.assertEqual(json.loads(s.load_config(V3))["版本"], 5)
-        self.assertEqual(json.loads(s.load_config(V4))["版本"], 5)
-        # 直载 v5
+        self.assertEqual(json.loads(s.load_config(V2))["版本"], 10)
+        self.assertEqual(json.loads(s.load_config(V3))["版本"], 10)
+        self.assertEqual(json.loads(s.load_config(V4))["版本"], 10)
+        # 直载 v9（认证两键）迁移补退避 0
+        v9 = json.loads(s.export_config())
+        v9["版本"] = 9
+        v9["认证"] = {"最大失败": 3, "锁定毫秒": 1000}
+        self.assertEqual(
+            json.loads(s.load_config(json.dumps(v9, ensure_ascii=False)))["版本"],
+            10,
+        )
+        # 直载 v10
         self.assertEqual(s.load_config(s.export_config()), s.export_config())
 
     def test_load_envelope_type_error_and_bad_json(self):
@@ -417,13 +480,15 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
     def test_load_envelope_applies_auth_policy_and_rollback_restores(self):
         s = make()
         doc = json.loads(s.export_config())
-        doc["认证"] = {"最大失败": 1, "锁定毫秒": 0}
-        # 经升级包加载（v5 源只规范化），提交替换认证策略
+        doc["认证"] = {"最大失败": 1, "锁定毫秒": 0,
+                      "重试基数毫秒": 0, "重试上限毫秒": 0}
+        # 经升级包加载（v10 源只规范化），提交替换认证策略
         envelope = s.upgrade_config(json.dumps(doc, ensure_ascii=False))
         s.load_config(envelope)
         self.assertEqual(
             json.loads(s.export_config())["认证"],
-            {"最大失败": 1, "锁定毫秒": 0},
+            {"最大失败": 1, "锁定毫秒": 0,
+             "重试基数毫秒": 0, "重试上限毫秒": 0},
         )
         # 新策略生效：单次失败即锁定（零时锁同刻到期）
         with self.assertRaises(AuthError):
@@ -432,7 +497,8 @@ class LoadUpgradeEnvelopeTest(unittest.TestCase):
         s.rollback_config()
         self.assertEqual(
             json.loads(s.export_config())["认证"],
-            {"最大失败": 3, "锁定毫秒": 1000},
+            {"最大失败": 3, "锁定毫秒": 1000,
+             "重试基数毫秒": 0, "重试上限毫秒": 0},
         )
 
 

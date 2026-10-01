@@ -17,82 +17,88 @@ def make():
     return Sessions(auth, 10, 5, 5000, pool=("10.0.0.0/24", (), ()), lease_ms=1000)
 
 
-V6 = {
-    "版本": 6,
+V10 = {
+    "版本": 10,
     "会话": {"总数": 10, "每用户": 5, "空闲毫秒": 5000, "租期毫秒": 1000},
     "地址池": [{"标识": "default", "CIDR": "10.0.0.0/24", "保留": [], "静态": []}],
     "模板": [
-        {"标识": "t1", "限速": 100, "突发": 0, "配额": 1000, "会话上限": 1, "超限": "拒绝"},
-        {"标识": "t2", "限速": 100, "突发": 0, "配额": 1000, "会话上限": 0, "超限": "拒绝"},
+        {"标识": "t1", "限速": 100, "突发": 0, "配额": 1000, "周期毫秒": 0,
+         "会话上限": 1, "排队优先级": 0, "超限": "拒绝"},
+        {"标识": "t2", "限速": 100, "突发": 0, "配额": 1000, "周期毫秒": 0,
+         "会话上限": 0, "排队优先级": 0, "超限": "拒绝"},
     ],
     "用户模板": [["alice", "t1"], ["bob", "t1"], ["carol", "t2"]],
-    "容量": {"队列上限": 1024, "最大等待毫秒": 0},
-    "认证": {"最大失败": 3, "锁定毫秒": 1000},
+    "容量": {"队列上限": 1024, "最大等待毫秒": 0, "队满策略": "拒绝"},
+    "认证": {"最大失败": 3, "锁定毫秒": 1000,
+            "重试基数毫秒": 0, "重试上限毫秒": 0},
 }
 
 
-def v6_text():
-    return json.dumps(V6, ensure_ascii=False, separators=(",", ":"))
+def cfg_text():
+    return json.dumps(V10, ensure_ascii=False, separators=(",", ":"))
 
 
-class V6Test(unittest.TestCase):
-    def test_export_v6(self):
+class V10SmokeTest(unittest.TestCase):
+    def test_export_v10(self):
         s = make()
-        out = s.load_config(v6_text())
+        out = s.load_config(cfg_text())
         doc = json.loads(out)
-        self.assertEqual(doc["版本"], 6)
+        self.assertEqual(doc["版本"], 10)
         self.assertEqual(
             list(doc), ["版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"]
         )
         self.assertEqual(
             list(doc["模板"][0]),
-            ["标识", "限速", "突发", "配额", "会话上限", "超限"],
+            ["标识", "限速", "突发", "配额", "周期毫秒", "会话上限",
+             "排队优先级", "超限"],
         )
         self.assertEqual(doc["模板"][0]["会话上限"], 1)
         self.assertEqual(doc["模板"][1]["会话上限"], 0)
         self.assertEqual(out, s.export_config())
         self.assertTrue(out.endswith("\n"))
 
-    def test_upgrade_v5_to_v6(self):
+    def test_upgrade_v9_to_v10(self):
         s = make()
-        v5 = json.loads(v6_text())
-        v5["版本"] = 5
-        for t in v5["模板"]:
-            del t["会话上限"]
-        raw = s.upgrade_config(json.dumps(v5, ensure_ascii=False, separators=(",", ":")))
+        v9 = json.loads(cfg_text())
+        v9["版本"] = 9
+        # v9 无重试两项。
+        for key in ("重试基数毫秒", "重试上限毫秒"):
+            del v9["认证"][key]
+        raw = s.upgrade_config(json.dumps(v9, ensure_ascii=False, separators=(",", ":")))
         doc = json.loads(raw)
         self.assertEqual(list(doc), ["源版本", "目标版本", "改变", "摘要", "配置"])
-        self.assertEqual(doc["源版本"], 5)
-        self.assertEqual(doc["目标版本"], 6)
+        self.assertEqual(doc["源版本"], 9)
+        self.assertEqual(doc["目标版本"], 10)
         self.assertIs(doc["改变"], True)
-        self.assertEqual(doc["配置"]["版本"], 6)
-        self.assertEqual(doc["配置"]["模板"][0]["会话上限"], 0)
+        self.assertEqual(doc["配置"]["版本"], 10)
+        self.assertEqual(doc["配置"]["模板"][0]["会话上限"], 1)
+        self.assertEqual(doc["配置"]["认证"]["重试基数毫秒"], 0)
         # 升级包可直接加载
         out = s.load_config(raw)
-        self.assertEqual(json.loads(out)["版本"], 6)
-        # v6 不再改变
-        doc2 = json.loads(s.upgrade_config(v6_text()))
+        self.assertEqual(json.loads(out)["版本"], 10)
+        # v10 不再改变
+        doc2 = json.loads(s.upgrade_config(cfg_text()))
         self.assertIs(doc2["改变"], False)
-        self.assertEqual(doc2["源版本"], 6)
-        # target 只许 6
+        self.assertEqual(doc2["源版本"], 10)
+        # target 只许 10
         with self.assertRaises(ValueError):
-            s.upgrade_config(v6_text(), 5)
+            s.upgrade_config(cfg_text(), 9)
         with self.assertRaises(TypeError):
-            s.upgrade_config(v6_text(), "6")
+            s.upgrade_config(cfg_text(), "10")
         with self.assertRaises(TypeError):
             s.upgrade_config(123)
 
     def test_upgrade_bad_template_limit(self):
         s = make()
         for bad in (-1, 10001, True, "1", 1.5):
-            doc = json.loads(v6_text())
+            doc = json.loads(cfg_text())
             doc["模板"][0]["会话上限"] = bad
             with self.assertRaises(ValueError, msg=repr(bad)):
                 s.upgrade_config(json.dumps(doc, ensure_ascii=False))
 
     def test_do_establish_limit(self):
         s = make()
-        s.load_config(v6_text())
+        s.load_config(cfg_text())
         s.do("k1", "建立", "s1", ("alice", "pw"), 0)
         # 同模板（t1 上限 1）另一用户建立超限
         with self.assertRaises(ResourceError):
@@ -108,7 +114,7 @@ class V6Test(unittest.TestCase):
         s.do("k7", "建立", "s4", ("bob", "pw"), 2)
         # 接管不净增占用：t1 已有 alice? 无——alice 已下线。bob 在线占 1。
         # carol 改绑 t1 验证接管豁免
-        doc = json.loads(v6_text())
+        doc = json.loads(cfg_text())
         doc["用户模板"].append(["dave", "t1"])
         doc["用户模板"].sort()
         # 先让 dave 以 t2 上线（改绑前），再加载新绑定
@@ -117,7 +123,7 @@ class V6Test(unittest.TestCase):
 
     def test_takeover_not_limited(self):
         s = make()
-        s.load_config(v6_text())
+        s.load_config(cfg_text())
         s.do("k1", "建立", "s1", ("alice", "pw"), 0)
         # t1 占用 1/1；接管 alice 的 s1 净增 0，不受限
         out = json.loads(s.do("k2", "接管", "s2", ("s1", "pw"), 1))
@@ -125,7 +131,7 @@ class V6Test(unittest.TestCase):
 
     def test_batch_online_limit(self):
         s = make()
-        s.load_config(v6_text())
+        s.load_config(cfg_text())
         out = json.loads(
             s.batch_online(
                 "kb",
@@ -141,7 +147,7 @@ class V6Test(unittest.TestCase):
 
     def test_capacity_queue_and_advance_skip(self):
         s = make()
-        s.load_config(v6_text())
+        s.load_config(cfg_text())
         s.do("k1", "建立", "s1", ("alice", "pw"), 0)  # t1 占用 1/1
         # bob (t1) 超限 -> 排队
         out = json.loads(s.capacity("k2", "申请", "s2", ("bob", "pw", 100), 0))
@@ -163,7 +169,7 @@ class V6Test(unittest.TestCase):
 
     def test_load_limit_below_occupancy(self):
         s = make()
-        doc = json.loads(v6_text())
+        doc = json.loads(cfg_text())
         doc["模板"][0]["会话上限"] = 0  # 先不限，建两个 t1 会话
         s.load_config(json.dumps(doc, ensure_ascii=False))
         s.do("k1", "建立", "s1", ("alice", "pw"), 0)
@@ -191,19 +197,20 @@ class V6Test(unittest.TestCase):
 
     def test_config_change_upgrade(self):
         s = make()
-        v5 = json.loads(v6_text())
-        v5["版本"] = 5
-        for t in v5["模板"]:
-            del t["会话上限"]
-        text = json.dumps(v5, ensure_ascii=False, separators=(",", ":"))
+        v9 = json.loads(cfg_text())
+        v9["版本"] = 9
+        # v9 认证仅两键（无重试两项）。
+        for key in ("重试基数毫秒", "重试上限毫秒"):
+            del v9["认证"][key]
+        text = json.dumps(v9, ensure_ascii=False, separators=(",", ":"))
         out = s.config_change("kc", "升级", text, 0)
         doc = json.loads(out)
-        self.assertEqual(doc["目标版本"], 6)
+        self.assertEqual(doc["目标版本"], 10)
         # 同参重放
         self.assertEqual(s.config_change("kc", "升级", text, 0), out)
         # 异参
         with self.assertRaises(ValueError):
-            s.config_change("kc", "升级", v6_text(), 0)
+            s.config_change("kc", "升级", cfg_text(), 0)
 
 
 if __name__ == "__main__":

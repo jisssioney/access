@@ -60,7 +60,7 @@ class ConfigHistoryTest(unittest.TestCase):
             s.config_cas("c2", text, 99, 0)
         self.assertEqual(set(s._config_history), {0, 1, 2, 3})
         # 只读升级不保存
-        s.upgrade_config(v0, 6)
+        s.upgrade_config(v0, 10)
         self.assertEqual(set(s._config_history), {0, 1, 2, 3})
         # 失败加载不保存
         bad = json.loads(s.export_config())

@@ -1,7 +1,10 @@
 """access — 接入网后端服务框架（仅标准库）。
 
 当前提供：
-- Authenticator：带失败计数与锁定的用户认证器。
+- Authenticator：带失败计数、锁定与按用户指数退避的用户认证器（策略为
+  最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒，重试两项 0/0 关闭退避；
+  口令错误在未达最大失败数且退避启用时置下次可试时刻
+  now+min(基数*2**(失败数-1),上限)，退避未到不验密不增失败）。
 - Sessions：基于 Authenticator 的会话管理（建立/续租/下线/接管/跨池迁移、空闲老化、
   零池起步可 add_pool 激活多地址池、租约、按 key 重放缓存、pool_stats、接管审计
   takeover_audit、防篡改审计链 audit/verify_audit、只读审计窗口快照
@@ -34,13 +37,15 @@
   检查点只读、不清到期退避，恢复全验后原子替换，仅缓存首次成功、同参
   重放原字节，首次成功与重放写防篡改审计链（后端恢复，会话空串）。
   auth_checkpoint/auth_restore 提供认证器（全部用户的凭据摘要、失败计数、
-  锁定至与停用态）检查点（版本 1，顶层版本/时刻/用户/摘要，摘要盖前三键）
-  与按 key 原子恢复：检查点只读、不清到期锁、不按当前 max_fail 折算，
-  用户按码点升序，凭据为 64 位小写十六进制摘要，锁定至为 null 或非负 int；
-  恢复严格全验（JSON/重键/键序结构类型值/排序重复/版本摘要错 ValueError，
-  用户集与当前认证器不一致 ResourceError）后原子替换四项且不改认证策略，
-  失败与锁定至原样往返、后续认证沿既有规则；仅缓存首次成功、同型同 text
-  重放原字节、异参 ValueError，不老化、不审计。
+  锁定至、下次可试时刻与停用态）检查点（版本 2，顶层版本/时刻/用户/摘要，
+  项键序 用户/凭据/失败/锁定至/下次可试/停用，摘要盖前三键）
+  与按 key 原子恢复：检查点只读、不清到期锁/退避、不按当前 max_fail 折算，
+  用户按码点升序，凭据为 64 位小写十六进制摘要，锁定至与下次可试为 null 或
+  非负 int；恢复接受版本 1（下次可试补 0）与版本 2（严格全验结构、键序、
+  类型、范围、用户顺序与摘要），JSON/重键/排序重复/版本摘要错 ValueError，
+  用户集与当前认证器不一致 ResourceError；全验后原子替换五项且不改认证策略，
+  失败、锁定至与下次可试原样往返、后续认证沿既有规则；仅缓存首次成功、同型
+  同 text 重放原字节、异参 ValueError，不老化、不审计。
   pool_fault 注入/恢复指定地址池的可恢复耗尽演练（不改真实租约及配置）：
   注入期该池视为无可分配地址，建立、迁入、无址接管在既有认证与老化后抛
   ResourceError，capacity 申请排队、推进跳过，到刻自动正常；首果独立域
@@ -143,8 +148,9 @@
   同参重放原字节且不追加，异参 ValueError。返回 追加/末序号/末哈希/摘要，
   摘要为前三键紧凑 JSON UTF-8 字节 sha256 小写值，LF 尾；O(事件数) 时空。
 - Sessions.credential_change 凭据轮换：按 key 独立重放缓存，首果（含参数
-  异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked 抛
-  AuthError 并保留失败计数与锁定，成功按摘要规则换密并清零二者，会话与
+  异常）永久缓存；首次合法经 Authenticator 校验旧密码，denied/locked/
+  backoff 抛 AuthError 并保留失败计数、锁定与下次可试时刻，成功按摘要
+  规则换密并清零三者，会话与
   已入队队项保留；首果（成功/AuthError/KeyError）及同参重放写防篡改审计链
   （凭据轮换，会话=user），参数错不审计。
 - Sessions.user_admin 用户停用/启用：key/user 沿用凭据，op 仅停用/启用，
@@ -616,15 +622,26 @@ def _parse_config_capacity(doc, version):
     return queue_limit, max_wait, policy
 
 
-def _parse_config_auth(doc):
-    """校验 v5+ 的认证节，返回 (最大失败, 锁定毫秒)。
+def _parse_config_auth(doc, version):
+    """校验认证节，返回 (最大失败, 锁定毫秒, 重试基数毫秒, 重试上限毫秒)。
 
-    认证须恰含“最大失败/锁定毫秒”，二者为非 bool int：最大失败 >= 1，
-    锁定毫秒 >= 0。结构、类型或值错均抛 ValueError。
+    v5..v9 认证节须恰含“最大失败/锁定毫秒”，迁移时两项退避补 0（无退避）；
+    v10 须恰含“最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒”且键序如此。
+    四项均为非 bool int：最大失败 >= 1，锁定毫秒 >= 0；重试两项只许同时为 0
+    （关闭退避）或同时为正（重试上限 >= 重试基数）。结构、类型或值错均抛
+    ValueError。
     """
     raw = doc["认证"]
-    if not isinstance(raw, dict) or set(raw) != {"最大失败", "锁定毫秒"}:
-        raise ValueError("认证 keys must be exactly 最大失败/锁定毫秒")
+    if version >= _CONFIG_VERSION:
+        if not isinstance(raw, dict) or set(raw) != {
+            "最大失败", "锁定毫秒", "重试基数毫秒", "重试上限毫秒"
+        }:
+            raise ValueError(
+                "认证 keys must be exactly 最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒"
+            )
+    else:
+        if not isinstance(raw, dict) or set(raw) != {"最大失败", "锁定毫秒"}:
+            raise ValueError("认证 keys must be exactly 最大失败/锁定毫秒")
     max_fail = raw["最大失败"]
     lock_ms = raw["锁定毫秒"]
     if isinstance(max_fail, bool) or not isinstance(max_fail, int):
@@ -635,7 +652,36 @@ def _parse_config_auth(doc):
         raise ValueError(f"锁定毫秒 must be an int, got {type(lock_ms).__name__}")
     if lock_ms < 0:
         raise ValueError(f"锁定毫秒 must be >= 0, got {lock_ms}")
-    return max_fail, lock_ms
+    if version >= _CONFIG_VERSION:
+        base_ms = raw["重试基数毫秒"]
+        cap_ms = raw["重试上限毫秒"]
+        if isinstance(base_ms, bool) or not isinstance(base_ms, int):
+            raise ValueError(
+                f"重试基数毫秒 must be an int, got {type(base_ms).__name__}"
+            )
+        if isinstance(cap_ms, bool) or not isinstance(cap_ms, int):
+            raise ValueError(
+                f"重试上限毫秒 must be an int, got {type(cap_ms).__name__}"
+            )
+        if base_ms < 0:
+            raise ValueError(f"重试基数毫秒 must be >= 0, got {base_ms}")
+        if cap_ms < 0:
+            raise ValueError(f"重试上限毫秒 must be >= 0, got {cap_ms}")
+        # 两项只许同时为 0（关闭退避）或同时为正；正值时上限不得小于基数。
+        if (base_ms == 0) != (cap_ms == 0):
+            raise ValueError(
+                "重试基数毫秒/重试上限毫秒 must be both zero or both positive, "
+                f"got {base_ms}/{cap_ms}"
+            )
+        if base_ms > 0 and cap_ms < base_ms:
+            raise ValueError(
+                f"重试上限毫秒 must be >= 重试基数毫秒, got {cap_ms} < {base_ms}"
+            )
+    else:
+        # v5..v9 迁移：两项退避补 0，保持无退避行为。
+        base_ms = 0
+        cap_ms = 0
+    return max_fail, lock_ms, base_ms, cap_ms
 
 
 def _load_config_doc(text):
@@ -654,7 +700,7 @@ def _parse_config_doc(doc, default_auth=None):
 
     spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
     capacity, auth)，capacity 为 (队列上限, 最大等待毫秒, 队满策略)，auth 为
-    (最大失败, 锁定毫秒)；pools 为按标识升序的 (标识, cidr, reserved,
+    (最大失败, 锁定毫秒, 重试基数毫秒, 重试上限毫秒)；pools 为按标识升序的 (标识, cidr, reserved,
     static) 元组，reserved/static 已规范化排序；templates 为按标识升序的
     (标识, 限速, 突发, 配额, 周期毫秒, 会话上限, 排队优先级, 超限) 元组，
     user_templates 为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为
@@ -664,21 +710,24 @@ def _parse_config_doc(doc, default_auth=None):
     模板项增会话上限（0..10000，0 不限）；v7（版本=7）模板项增周期毫秒
     （非负 int，0 表示不重置）；v8（版本=8）模板项增排队优先级（非 bool
     int 0..100）；v9（版本=9）容量节增队满策略（str，仅“拒绝/替换”，
-    键序 队列上限/最大等待毫秒/队满策略）。v1/v2 迁移时模板、用户模板为空；
+    键序 队列上限/最大等待毫秒/队满策略）；v10（版本=10）认证节增重试基数
+    毫秒与重试上限毫秒（非 bool int，只许同时为 0 或同时为正，正值时上限
+    不小于基数，0/0 关闭退避）。v1/v2 迁移时模板、用户模板为空；
     v1-v3 迁移时容量补默认 (1024, 0, 拒绝)；v1-v8 迁移时队满策略补“拒绝”；
-    v1-v4 迁移时认证补 default_auth（认证器当前两值，缺省 None 时拒绝非
-    v5+ 文档）；v1-v5 迁移时模板会话上限补 0；v1-v6 迁移时模板周期毫秒补
-    0；v1-v7 迁移时模板排队优先级补 0；v8 只规范化容量旧两键。重复/未知/
-    缺失键、结构、值、引用或版本错均抛 ValueError。
+    v1-v4 迁移时认证补 default_auth（认证器当前四值，缺省 None 时拒绝非
+    v5+ 文档）；v5-v9 迁移时重试两项补 0；v1-v5 迁移时模板会话上限补 0；
+    v1-v6 迁移时模板周期毫秒补 0；v1-v7 迁移时模板排队优先级补 0；v8 只
+    规范化容量旧两键。重复/未知/缺失键、结构、值、引用或版本错均抛
+    ValueError。
     """
     if not isinstance(doc, dict):
         raise ValueError(f"config must be a JSON object, got {type(doc).__name__}")
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
-        raise ValueError(f"版本 must be 1..9, got {version}")
-    if version in (5, 6, 7, 8, 9):
+    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        raise ValueError(f"版本 must be 1..10, got {version}")
+    if version in (5, 6, 7, 8, 9, 10):
         if set(doc) != {
             "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"
         }:
@@ -758,10 +807,10 @@ def _parse_config_doc(doc, default_auth=None):
         # v1-v3 迁移：容量补默认 1024 项队列、不限等待、队满拒绝。
         capacity = (_MAX_QUEUE, 0, _QUEUE_POLICY_REJECT)
     if version >= 5:
-        auth = _parse_config_auth(doc)
+        auth = _parse_config_auth(doc, version)
     else:
-        # v1-v4 迁移：认证补认证器当前两值；无默认（如升级包内嵌配置须为
-        # v8 规范形态）时拒绝。
+        # v1-v4 迁移：认证补认证器当前四值；无默认（如升级包内嵌配置须为
+        # v10 规范形态）时拒绝。
         if default_auth is None:
             raise ValueError(f"config version must be {_CONFIG_VERSION}")
         auth = default_auth
@@ -779,7 +828,7 @@ def _parse_config_doc(doc, default_auth=None):
 
 
 def _config_payload(spec):
-    """由规范化 spec 构建 export/升级共用的 v9 配置 payload（固定键序与排序）。"""
+    """由规范化 spec 构建 export/升级共用的 v10 配置 payload（固定键序与排序）。"""
     (
         total,
         per,
@@ -789,7 +838,7 @@ def _config_payload(spec):
         templates,
         user_templates,
         (queue_limit, max_wait_ms, queue_policy),
-        (max_fail, lock_ms),
+        (max_fail, lock_ms, retry_base_ms, retry_cap_ms),
     ) = spec
     pools = [
         {
@@ -835,12 +884,14 @@ def _config_payload(spec):
         "认证": {
             "最大失败": max_fail,
             "锁定毫秒": lock_ms,
+            "重试基数毫秒": retry_base_ms,
+            "重试上限毫秒": retry_cap_ms,
         },
     }
 
 
 def _compact_config(spec):
-    """spec 的 v9 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
+    """spec 的 v10 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
     return json.dumps(
         _config_payload(spec), ensure_ascii=False, separators=(",", ":")
     )
@@ -865,8 +916,8 @@ def _parse_upgrade_envelope(doc):
     """严格复核升级包对象，返回 (源版本, 目标版本, 改变, 摘要, spec)。
 
     文档须恰含“源版本/目标版本/改变/摘要/配置”五键（键序亦须如此），
-    源版本为 1..9 的非 bool int、目标版本恒为 9、改变为 bool 且等于
-    源版本 != 9、摘要为 str；配置须为能解析出 v9 spec 的对象，再将其
+    源版本为 1..10 的非 bool int、目标版本恒为 10、改变为 bool 且等于
+    源版本 != 10、摘要为 str；配置须为能解析出 v10 spec 的对象，再将其
     规范化重编码与文档原编码逐字节比对（拒键序/形态/值偏差），摘要须为
     规范配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写十六进制。任何不符
     均抛 ValueError。
@@ -891,8 +942,8 @@ def _parse_upgrade_envelope(doc):
     summary = doc["摘要"]
     if isinstance(source, bool) or not isinstance(source, int):
         raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
-    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
-        raise ValueError(f"源版本 must be 1..9, got {source}")
+    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        raise ValueError(f"源版本 must be 1..10, got {source}")
     if isinstance(target, bool) or not isinstance(target, int):
         raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
     if target != _CONFIG_VERSION:
@@ -914,7 +965,7 @@ def _parse_upgrade_envelope(doc):
     # 配置自 JSON 解析而来，再编码必成功；键序/排序/值偏差令两串不一致。
     original = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     if original != canonical:
-        raise ValueError("配置 must be a canonical v9 config object")
+        raise ValueError("配置 must be a canonical v10 config object")
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if summary != digest:
         raise ValueError("摘要 does not match the canonical config digest")
@@ -925,15 +976,45 @@ def _digest(user, password):
     return hashlib.sha256((user + "\0" + password).encode("utf-8")).digest()
 
 
-class Authenticator:
-    """基于 sha256 摘要的认证器，失败 max_fail 次后锁定 lock_ms 毫秒。"""
+def _check_backoff_policy(base_ms, cap_ms):
+    """校验重试退避策略对，返回 (重试基数毫秒, 重试上限毫秒, 封顶位移)。
 
-    def __init__(self, max_fail, lock_ms):
+    二者为非 bool 非负 int：只许同时为 0（关闭退避）或同时为正，正值时
+    上限不得小于基数。类型错抛 TypeError，取值错抛 ValueError。封顶位移
+    max_shifts = floor(log2(上限//基数))：指数位移 k=失败数-1 超过它即取
+    上限，使单次认证的整数位宽只受策略常量约束（O(1)，不随恢复进来的大
+    失败数放大）；关闭退避时为 0。
+    """
+    base_ms = _check_int("retry_base_ms", base_ms, 0)
+    cap_ms = _check_int("retry_cap_ms", cap_ms, 0)
+    if (base_ms == 0) != (cap_ms == 0):
+        raise ValueError(
+            "retry_base_ms/retry_cap_ms must be both zero or both positive, "
+            f"got {base_ms}/{cap_ms}"
+        )
+    if base_ms > 0 and cap_ms < base_ms:
+        raise ValueError(
+            f"retry_cap_ms must be >= retry_base_ms, got {cap_ms} < {base_ms}"
+        )
+    max_shifts = (cap_ms // base_ms).bit_length() - 1 if base_ms > 0 else 0
+    return base_ms, cap_ms, max_shifts
+
+
+class Authenticator:
+    """基于 sha256 摘要的认证器：失败 max_fail 次后锁定 lock_ms 毫秒；
+    retry_base_ms/retry_cap_ms 为按用户指数退避（0/0 关闭）。"""
+
+    def __init__(self, max_fail, lock_ms, retry_base_ms=0, retry_cap_ms=0):
         self._max_fail = _check_int("max_fail", max_fail, 1)
         self._lock_ms = _check_int("lock_ms", lock_ms, 0)
-        # user -> [digest, failed, until]；until 为 None 表示未锁定，
-        # 不能用 0 作哨兵，否则零时锁（lock_ms=0 于 now_ms=0）到期后
-        # failed 永不清零。
+        (
+            self._retry_base_ms,
+            self._retry_cap_ms,
+            self._retry_max_shifts,
+        ) = _check_backoff_policy(retry_base_ms, retry_cap_ms)
+        # user -> [digest, failed, until, retry_at]；until 为 None 表示未锁定，
+        # retry_at 为 None 表示无待退避；均不能用 0 作哨兵，否则零时锁
+        # （lock_ms=0 于 now_ms=0）到期后 failed 永不清零。
         self._users = {}
 
     def __contains__(self, user):
@@ -941,13 +1022,31 @@ class Authenticator:
         return user in self._users
 
     def policy(self):
-        """当前认证策略 (max_fail, lock_ms)，供配置导出/回滚点快照。"""
-        return (self._max_fail, self._lock_ms)
+        """当前认证策略 (max_fail, lock_ms, retry_base_ms, retry_cap_ms)，
+        供配置导出/回滚点快照。"""
+        return (
+            self._max_fail,
+            self._lock_ms,
+            self._retry_base_ms,
+            self._retry_cap_ms,
+        )
 
-    def set_policy(self, max_fail, lock_ms):
-        """原子替换认证策略；用户凭据、失败计数与锁定记录全部保留。"""
+    def set_policy(self, max_fail, lock_ms, retry_base_ms=0, retry_cap_ms=0):
+        """原子替换认证策略；用户凭据、失败计数、锁定与退避记录全部保留。
+
+        策略切换不重算已有失败数、锁定截止与下次可试时刻；新参数先全验后
+        整体替换，参数非法时旧策略不变。
+        """
+        max_fail = _check_int("max_fail", max_fail, 1)
+        lock_ms = _check_int("lock_ms", lock_ms, 0)
+        retry_base_ms, retry_cap_ms, max_shifts = _check_backoff_policy(
+            retry_base_ms, retry_cap_ms
+        )
         self._max_fail = max_fail
         self._lock_ms = lock_ms
+        self._retry_base_ms = retry_base_ms
+        self._retry_cap_ms = retry_cap_ms
+        self._retry_max_shifts = max_shifts
 
     def add(self, user, password):
         """注册新用户，返回 (user, "created", 0)。"""
@@ -957,38 +1056,73 @@ class Authenticator:
             raise KeyError(f"duplicate user: {user!r}")
         if len(self._users) >= _MAX_USERS:
             raise OverflowError(f"user limit {_MAX_USERS} reached")
-        self._users[user] = [_digest(user, password), 0, None]
+        self._users[user] = [_digest(user, password), 0, None, None]
         return (user, "created", 0)
 
     def authenticate(self, user, password, now_ms):
-        """验证凭据，返回 (user, status, until)，status ∈ ok/denied/locked。"""
+        """验证凭据，返回 (user, status, retry_at)，
+        status ∈ ok/denied/locked/backoff。
+
+        锁定未到返回 locked 与锁定截止，不验密、不改状态；锁到期（含同刻）
+        先清零 failed/until/retry_at 再验密。未锁定且 now_ms 早于下次可试
+        时刻时不验密、不增失败，直接返回 backoff 与原时刻；等于该时刻可
+        重试。允许尝试时：正确口令清零失败数、锁定与退避，返回 ok 与 0；
+        口令错误先增失败数，达到 max_fail 即按现有规则锁定、清除下次可试
+        时刻，返回 locked 与锁定截止；未达到且退避启用时把下次可试时刻设为
+        now_ms + min(重试基数 * 2**(失败数-1), 重试上限)，返回 backoff 与
+        该时刻；退避关闭仍返回 denied 与 0。O(1) 时间与空间。
+        """
         _check_credential("user", user)
         _check_credential("password", password)
         _check_int("now_ms", now_ms, 0)
         record = self._users.get(user)
         if record is None:
             raise KeyError(f"unknown user: {user!r}")
-        digest, failed, until = record
+        digest, failed, until, retry_at = record
 
         if until is not None:
             if now_ms < until:
-                # 锁定中：不验密、不改状态。
+                # 锁定中：不验密、不改状态（退避时刻原样保留）。
                 return (user, "locked", until)
-            # 锁已到期（含同刻）：先清零 failed 与 until 再验证。
+            # 锁已到期（含同刻）：先清零 failed/until/retry_at 再验证。
             failed = 0
             until = None
+            retry_at = None
             record[1] = 0
             record[2] = None
+            record[3] = None
+
+        if retry_at is not None and now_ms < retry_at:
+            # 退避未到：不验密、不增失败，返回原下次可试时刻。
+            return (user, "backoff", retry_at)
 
         if hmac.compare_digest(digest, _digest(user, password)):
+            # 允许时刻的正确口令：清零失败数、锁定与退避。
             record[1] = 0
+            record[2] = None
+            record[3] = None
             return (user, "ok", 0)
 
+        # 允许尝试且口令错误：先增失败数。
         failed += 1
         record[1] = failed
         if failed >= self._max_fail:
+            # 达到最大失败数：按现有规则锁定并清除下次可试时刻。
             record[2] = now_ms + self._lock_ms
+            record[3] = None
             return (user, "locked", record[2])
+        if self._retry_base_ms > 0:
+            # 退避启用：min(基数 * 2**(failed-1), 上限)。位移超过策略封顶
+            # 位移即取上限，整数位宽只受策略常量约束（恢复进来的大失败数
+            # 亦不放大计算量），O(1)。
+            shifts = failed - 1
+            if shifts > self._retry_max_shifts:
+                delay = self._retry_cap_ms
+            else:
+                delay = self._retry_base_ms << shifts
+            record[3] = now_ms + delay
+            return (user, "backoff", record[3])
+        # 退避关闭：维持 denied 与 0。
         return (user, "denied", 0)
 
 
@@ -1075,7 +1209,7 @@ _MAX_TEMPLATE_SESSIONS = 10000
 _MAX_QUEUE_PRIORITY = 100
 # 有效优先级上界：min(1000, 基础 + 等待秒数)。
 _MAX_EFFECTIVE_PRIORITY = 1000
-_CONFIG_VERSION = 9
+_CONFIG_VERSION = 10
 # 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
 # 最旧项，当前修订永不淘汰。
 _CONFIG_HISTORY_LIMIT = 256
@@ -1289,31 +1423,33 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v9 配置 JSON（顶层键序
+    参数错与异参 key 重放不入链。export_config 导出 v10 配置 JSON（顶层键序
     版本/会话/地址池/模板/用户模板/容量/认证；会话与地址池沿用 v2，模板按
     标识升序、项键序标识/限速/突发/配额/周期毫秒/会话上限/排队优先级/超限
     （周期毫秒为非 bool 非负 int、0 不重置，会话上限 0 不限并发占用，占用为
     绑定模板用户的在线加挂起会话数，排队优先级为非 bool int 0..100）、用户
     模板按用户升序、容量为队列上限/最大等待毫秒/队满策略（策略 str 仅
-    “拒绝/替换”）、认证为最大失败/锁定毫秒）；
+    “拒绝/替换”）、认证为最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒（重试
+    两项为 0/0 或同时为正且上限不小于基数，0/0 关闭按用户指数退避））；
     upgrade_config(text,
-    target=9) 只读地把 v1..v9 配置升级为 v9 升级包 JSON（LF 尾紧凑；顶层序/型
-    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=9，
-    配置同 export_config 的 v9，摘要为配置紧凑编码 UTF-8 字节的 sha256
-    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 9，
-    源版本限 1..9，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
+    target=10) 只读地把 v1..v10 配置升级为 v10 升级包 JSON（LF 尾紧凑；顶层序/型
+    源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本!=10，
+    配置同 export_config 的 v10，摘要为配置紧凑编码 UTF-8 字节的 sha256
+    小写值），text 非 str 或 target 非非 bool int 抛 TypeError，target 只许 10，
+    源版本限 1..10，解析、重键、键缺失/未知、结构/值/引用/版本非法抛 ValueError，
     迁移沿 load_config 既有规则（v1 单池改 default、v1/v2 补空模板与用户模板、
-    v1-v3 补容量 1024/0/拒绝、v1-v4 以认证器当前两值补认证、v1-v5 模板会话上限
+    v1-v3 补容量 1024/0/拒绝、v1-v4 以认证器当前四值补认证、v1-v5 模板会话上限
     补 0、v1-v6 模板周期毫秒补 0、v1-v7 模板排队优先级补 0、v1-v8 容量队满
-    策略补“拒绝”、v9 只规范化），
+    策略补“拒绝”、v5-v9 重试两项补 0、v10 只规范化），
     升级不改任何实例状态；
     load_config
-    直载 v1..v9 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
+    直载 v1..v10 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
     全验后原子替换并保存旧配置为唯一回滚点，升级包复核不符抛 ValueError，
     引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限、模板
     占用、租约或队长承载不满足抛 ResourceError，失败不改配置、回滚点、会话、
     租约与运行态，
-    提交替换认证策略但保留认证记录（凭据、失败计数、锁定）；
+    提交替换认证策略但保留认证记录（凭据、失败计数、锁定、下次可试时刻，
+    策略切换不重算这三类限制）；
     rollback_config 经同样校验恢复旧配置（含认证策略）并清除回滚点，无回滚点
     抛 StateError。
     配置修订历史保留最近 256 个修订：构造态为修订 0，load_config/
@@ -1340,7 +1476,7 @@ class Sessions:
     after!=-1 且该修订未保留抛 KeyError(after)；返回修订 > after 的升序前
     limit 项，顶层为“下个修订:int、项目:list”，无项下个修订=after，查询
     O(limit) 时空。
-    export/load/rollback 成功均返回 v9 配置 JSON，会话状态、期限、地址、租期与
+    export/load/rollback 成功均返回 v10 配置 JSON，会话状态、期限、地址、租期与
     旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
@@ -1572,8 +1708,9 @@ class Sessions:
     credential_change(key, user, old_password, new_password, now_ms) 轮换
     用户密码：四串沿用凭据约束，now_ms 为非 bool 非负 int；型/值错分别抛
     TypeError/ValueError，旧新相同抛 ValueError，未知用户抛 KeyError。首次
-    合法先经 Authenticator 校验旧密码，denied/locked 抛 AuthError 并保留
-    失败计数与锁定；成功按摘要规则换密并清零失败计数与锁定。除缓存、审计与
+    合法先经 Authenticator 校验旧密码，denied/locked/backoff 抛
+    AuthError 并保留失败计数、锁定与下次可试时刻；成功按摘要规则换密并
+    清零失败计数、锁定与下次可试时刻。除缓存、审计与
     认证副作用外失败不改其他状态；成功保留会话与已入队队项，此后仅新密码可
     认证。返回键序“用户/时刻/结果”、结果恒为“已轮换”的 LF 尾紧凑 JSON。
     验 key 后以独立域永久缓存余参与首果（含参数异常），同型同参重放不认证、
@@ -2958,11 +3095,13 @@ class Sessions:
     def _auth_payload(self, now_ms):
         """组装认证器检查点文档 dict（顶层键序：版本/时刻/用户/摘要）。
 
-        用户按用户名 Unicode 码点升序，项键序“用户/凭据/失败/锁定至/停用”；
-        凭据为 sha256(user+"\\0"+password) 摘要字节的 64 位小写十六进制串；
-        失败与锁定至原样取自认证记录（不清到期锁、不按当前 max_fail 折算），
-        停用取自停用态集合；摘要为前三键紧凑 JSON（无 LF）UTF-8 字节的
-        sha256 小写十六进制串。纯渲染：不老化、不清到期锁、不改态。
+        版本恒为 2；用户按用户名 Unicode 码点升序，项键序
+        “用户/凭据/失败/锁定至/下次可试/停用”；凭据为
+        sha256(user+"\\0"+password) 摘要字节的 64 位小写十六进制串；失败、
+        锁定至与下次可试原样取自认证记录（不清到期锁/退避、不按当前
+        max_fail 折算），停用取自停用态集合；摘要为前三键紧凑 JSON（无
+        LF）UTF-8 字节的 sha256 小写十六进制串。纯渲染：不老化、不清到期
+        锁/退避、不改态。
         """
         users = [
             {
@@ -2970,12 +3109,13 @@ class Sessions:
                 "凭据": digest.hex(),
                 "失败": failed,
                 "锁定至": until,
+                "下次可试": retry_at,
                 "停用": user in self._disabled_users,
             }
-            for user, (digest, failed, until)
+            for user, (digest, failed, until, retry_at)
             in sorted(self._auth._users.items())
         ]
-        doc = {"版本": 1, "时刻": now_ms, "用户": users}
+        doc = {"版本": 2, "时刻": now_ms, "用户": users}
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return doc
@@ -2988,33 +3128,39 @@ class Sessions:
 
     def auth_checkpoint(self, now_ms):
         """只读输出认证器检查点的 LF 结尾基线 JSON，O(U log U) 时间、O(U)
-        空间；不认证、不老化、不清到期锁、不审计、不动各域缓存。
+        空间；不认证、不老化、不清到期锁/退避、不审计、不动各域缓存。
 
         now_ms 限非 bool 非负 int：类型错 TypeError、取值错 ValueError。
-        顶层依次为“版本/时刻/用户/摘要”：版本恒为 1，时刻为 now_ms；用户
+        顶层依次为“版本/时刻/用户/摘要”：版本恒为 2，时刻为 now_ms；用户
         为按用户名 Unicode 码点升序的列表，项键序
-        “用户/凭据/失败/锁定至/停用”——用户为凭据约束串，凭据为 64 位小写
-        十六进制摘要，失败为非 bool 非负 int，锁定至为 null 或非 bool 非负
-        int（即便锁定已到期或失败为 0 亦原样导出，不按当前 max_fail 校验或
-        清零），停用为 bool；摘要为前三键紧凑 JSON（无 LF）UTF-8 字节的
-        sha256 小写值。同态同时刻查询逐字节相同。
+        “用户/凭据/失败/锁定至/下次可试/停用”——用户为凭据约束串，凭据为
+        64 位小写十六进制摘要，失败为非 bool 非负 int，锁定至与下次可试为
+        null 或非 bool 非负 int（即便锁定已到期、退避已到期或失败为 0 亦
+        原样导出，不按当前 max_fail/退避策略校验或清零），停用为 bool；
+        摘要为前三键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值。同态同
+        时刻查询逐字节相同。
         """
         _check_int("now_ms", now_ms, 0)
         return self._auth_checkpoint_text(now_ms)
 
     def auth_restore(self, key, text):
-        """按认证器检查点原子替换全部用户的凭据、失败计数、锁定至与停用态，
-        返回替换后检查点（规范包）的 LF 结尾基线 JSON。
+        """按认证器检查点原子替换全部用户的凭据、失败计数、锁定至、下次可试
+        时刻与停用态，返回替换后检查点（版本 2 规范包）的 LF 结尾基线 JSON。
 
         key 沿凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
-        text 非 str 抛 TypeError。JSON 解析、重键、键集/键序、结构、类型、
-        取值范围、用户排序或重复、版本或摘要错均抛 ValueError；检查点用户集
-        与当前认证器不完全一致（多、少或不同）抛 ResourceError。全部校验通过
-        后原子替换认证器的用户记录（凭据摘要、失败、锁定至）与停用态集合；
-        认证策略 max_fail/lock_ms 不变，失败与锁定至不依当前最大失败数折算、
-        原样往返，后续认证沿既有规则（锁定未到即 locked、到刻先清零再验密）。
-        会话、租约、队列、统计、配置及其余各域缓存均不变；任何失败不改实例、
-        不老化、不审计。
+        text 非 str 抛 TypeError。接受版本 1（项键序
+        用户/凭据/失败/锁定至/停用）与版本 2（项键序
+        用户/凭据/失败/锁定至/下次可试/停用）文档：版本 1 恢复时下次可试
+        补 0（now_ms 恒非负，0 即已到期，保持无退避行为）；版本 2 严格校验
+        结构、键序、类型、范围、用户顺序与摘要。JSON 解析、重键、键集/键序、结构、类型、取值范围、
+        用户排序或重复、版本或摘要错均抛 ValueError；检查点用户集与当前
+        认证器不完全一致（多、少或不同）抛 ResourceError。全部校验通过后
+        原子替换认证器的用户记录（凭据摘要、失败、锁定至、下次可试）与停
+        用态集合；认证策略 max_fail/lock_ms/重试两项不变，失败与锁定至不
+        依当前最大失败数折算、原样往返，后续认证沿既有规则（锁定未到即
+        locked、到刻先清零再验密；退避未到即 backoff、到刻可重试）。会话、
+        租约、队列、统计、配置及其余各域缓存均不变；任何失败不改实例、不
+        老化、不审计。
 
         重放缓存与各域独立：仅缓存首次成功，同 key 同型同 text 重放不解析、
         不重验、不替换，直接返回首次规范包原字节，异参（含异型）抛
@@ -3037,20 +3183,25 @@ class Sessions:
         # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
         now_ms, rows = self._parse_auth_checkpoint(text)
         current_users = set(self._auth._users)
-        checkpoint_users = {user for user, _digest, _failed, _until, _disabled in rows}
+        checkpoint_users = {
+            user
+            for user, _digest, _failed, _until, _retry_at, _disabled in rows
+        }
         if checkpoint_users != current_users:
             raise ResourceError(
                 "auth checkpoint user set does not match the current authenticator"
             )
 
-        # 全验后原子替换认证器用户记录与停用态；认证策略 max_fail/lock_ms 不变。
+        # 全验后原子替换认证器用户记录与停用态；认证策略四值不变。
         new_users = {
-            user: [digest, failed, until]
-            for user, digest, failed, until, _disabled in rows
+            user: [digest, failed, until, retry_at]
+            for user, digest, failed, until, retry_at, _disabled in rows
         }
         self._auth._users = new_users
         self._disabled_users = {
-            user for user, _digest, _failed, _until, disabled in rows if disabled
+            user
+            for user, _digest, _failed, _until, _retry_at, disabled in rows
+            if disabled
         }
 
         result = self._auth_checkpoint_text(now_ms)
@@ -3059,17 +3210,20 @@ class Sessions:
 
     def _parse_auth_checkpoint(self, text):
         """解析并全量校验认证器检查点文本，返回
-        (时刻, [(用户, 凭据bytes, 失败, 锁定至, 停用), ...])；任何文本非法
-        均抛 ValueError。
+        (时刻, [(用户, 凭据bytes, 失败, 锁定至, 下次可试, 停用), ...])；任何
+        文本非法均抛 ValueError。
 
-        顶层须恰含“版本/时刻/用户/摘要”且键序如此；版本为 1，时刻为非 bool
-        非负 int；用户项键序“用户/凭据/失败/锁定至/停用”，用户为凭据约束
-        串，凭据为 64 位小写十六进制串，失败为非 bool 非负 int，锁定至为
-        null 或非 bool 非负 int，停用为 bool，行按用户 Unicode 码点严格升序、
-        无重复；失败与锁定至仅做非 bool 非负校验，不依当前 max_fail 折算。
-        摘要须为规范化前三键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值
-        （与原文排版无关）。仅做结构自洽校验；用户集与当前认证器一致由调用
-        方判定（ResourceError）。
+        顶层须恰含“版本/时刻/用户/摘要”且键序如此；版本为 1 或 2，时刻为
+        非 bool 非负 int。版本 2 用户项键序
+        “用户/凭据/失败/锁定至/下次可试/停用”，版本 1 用户项键序
+        “用户/凭据/失败/锁定至/停用”（恢复时下次可试补 0）；用户为凭据
+        约束串，凭据为 64 位小写十六进制串，失败为非 bool 非负 int，锁定至
+        与下次可试为 null 或非 bool 非负 int，停用为 bool，行按用户
+        Unicode 码点严格升序、无重复；失败、锁定至与下次可试仅做非 bool
+        非负校验，不依当前 max_fail/退避策略折算。摘要须为该版本规范化前
+        三键紧凑 JSON（无 LF，版本 1 行内无下次可试键）UTF-8 字节的
+        sha256 小写值（与原文排版无关）。仅做结构自洽校验；用户集与当前
+        认证器一致由调用方判定（ResourceError）。
         """
         try:
             doc = json.loads(text, object_pairs_hook=_unique_object)
@@ -3084,25 +3238,24 @@ class Sessions:
         version = doc["版本"]
         if isinstance(version, bool) or not isinstance(version, int):
             raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-        if version != 1:
-            raise ValueError(f"版本 must be 1, got {version}")
+        if version not in (1, 2):
+            raise ValueError(f"版本 must be 1 or 2, got {version}")
         now_ms = self._cp_int(doc["时刻"], "时刻", 0)
 
+        if version == 2:
+            item_keys = ["用户", "凭据", "失败", "锁定至", "下次可试", "停用"]
+        else:
+            item_keys = ["用户", "凭据", "失败", "锁定至", "停用"]
         users_raw = doc["用户"]
         if not isinstance(users_raw, list):
             raise ValueError("用户 must be a list")
         rows = []
         last_user = None
         for index, item in enumerate(users_raw, start=1):
-            if not isinstance(item, dict) or list(item) != [
-                "用户",
-                "凭据",
-                "失败",
-                "锁定至",
-                "停用",
-            ]:
+            if not isinstance(item, dict) or list(item) != item_keys:
                 raise ValueError(
-                    f"user {index} keys must be 用户/凭据/失败/锁定至/停用 in order"
+                    f"user {index} keys must be "
+                    f"{'/'.join(item_keys)} in order"
                 )
             user = self._cp_str(item["用户"], "用户.用户")
             credential_hex = self._cp_hex64(item["凭据"], "用户.凭据")
@@ -3116,6 +3269,14 @@ class Sessions:
             until = item["锁定至"]
             if until is not None:
                 until = self._cp_int(until, "用户.锁定至", 0)
+            if version == 2:
+                retry_at = item["下次可试"]
+                if retry_at is not None:
+                    retry_at = self._cp_int(retry_at, "用户.下次可试", 0)
+            else:
+                # 版本 1 恢复：下次可试补 0（now_ms 恒非负，0 时刻不构成
+                # 待退避，保持无退避行为）。
+                retry_at = 0
             disabled = item["停用"]
             if not isinstance(disabled, bool):
                 raise ValueError(
@@ -3127,14 +3288,28 @@ class Sessions:
                     "with no duplicates"
                 )
             last_user = user
-            rows.append((user, bytes.fromhex(credential_hex), failed, until, disabled))
+            rows.append(
+                (user, bytes.fromhex(credential_hex), failed, until, retry_at,
+                 disabled)
+            )
 
         summary = self._cp_hex64(doc["摘要"], "摘要")
-        # 摘要：用规范化值重建前三键（数值相等即与生成方基线逐字节一致）。
-        canonical_head = {
-            "版本": 1,
-            "时刻": now_ms,
-            "用户": [
+        # 摘要：用该版本规范化值重建前三键（数值相等即与生成方基线逐字节
+        # 一致；版本 1 行内无下次可试键）。
+        if version == 2:
+            canonical_users = [
+                {
+                    "用户": user,
+                    "凭据": digest.hex(),
+                    "失败": failed,
+                    "锁定至": until,
+                    "下次可试": retry_at,
+                    "停用": disabled,
+                }
+                for user, digest, failed, until, retry_at, disabled in rows
+            ]
+        else:
+            canonical_users = [
                 {
                     "用户": user,
                     "凭据": digest.hex(),
@@ -3142,8 +3317,12 @@ class Sessions:
                     "锁定至": until,
                     "停用": disabled,
                 }
-                for user, digest, failed, until, disabled in rows
-            ],
+                for user, digest, failed, until, _retry_at, disabled in rows
+            ]
+        canonical_head = {
+            "版本": version,
+            "时刻": now_ms,
+            "用户": canonical_users,
         }
         blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
         if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
@@ -8577,7 +8756,7 @@ class Sessions:
         不记 capacity 事件、不动入队序号、不写审计。
 
         预检只读：全部演算仅在局部副本上进行，不改配置、修订、历史、回滚点、
-        会话与队列；执行原子提交：旧配置作回滚点，修订号加 1 并存 v9 快照，
+        会话与队列；执行原子提交：旧配置作回滚点，修订号加 1 并存 v10 快照，
         config_history 追加“加载”记录（目标 -1），不关联 audit；随后原子改
         队列、原子建立晋升会话与租约；任何承载前失败均不改实例。执行仅缓存
         首次成功：同 (mode, changes, now_ms) 同型同参重放原字节，异参抛
@@ -8618,7 +8797,7 @@ class Sessions:
                 if value != "" and value not in self._templates:
                     raise ResourceError(f"unknown template: {value!r}")
 
-        # 组候选 v9 spec；_build_pools 以候选绑定做模板占用承载（更小的目标
+        # 组候选 v10 spec；_build_pools 以候选绑定做模板占用承载（更小的目标
         # 队限由本接口自身超时/淘汰收敛，故跳过队长承载判定）。
         spec, bindings, tmpl_priority, tmpl_limit, queue_limit, max_wait_ms = (
             self._rebalance_candidate(changes)
@@ -8643,7 +8822,7 @@ class Sessions:
         )
 
         if mode == _CAP_REBALANCE_MODE_EXECUTE:
-            # 原子提交：先装候选配置（旧配置作回滚点、修订加 1、存 v9 快照、
+            # 原子提交：先装候选配置（旧配置作回滚点、修订加 1、存 v10 快照、
             # config_history 追加“加载”、目标 -1），再落实队列收敛与晋升；
             # 所有可能失败的承载校验均已在提交前通过，提交后不留失败路径。
             self._commit_config(
@@ -8802,7 +8981,7 @@ class Sessions:
                     )
 
     def _rebalance_candidate(self, changes):
-        """由当前 v9 spec 与变更组候选 spec 及演算视图，不改实例。
+        """由当前 v10 spec 与变更组候选 spec 及演算视图，不改实例。
 
         返回 (候选 spec, 候选绑定 dict, 候选模板优先级 dict, 候选队列上限,
         候选最大等待毫秒)。优先级仅改命中模板的排队优先级；绑定按用户覆盖或
@@ -9972,7 +10151,8 @@ class Sessions:
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
         模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒,
-        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒)。"""
+        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒, 重试基数毫秒,
+        重试上限毫秒)。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -10005,7 +10185,7 @@ class Sessions:
         )
 
     def export_config(self):
-        """导出当前配置为 v9 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
+        """导出当前配置为 v10 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
 
         顶层键序为“版本/会话/地址池/模板/用户模板/容量/认证”；会话键序为
         “总数/每用户/空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为
@@ -10016,25 +10196,26 @@ class Sessions:
         值；用户模板为按用户升序的 [user, 标识] 二元串列表；容量键序为
         “队列上限/最大等待毫秒/队满策略”，队列上限 0 表示不限队长、最大
         等待毫秒 0 表示不限等待，队满策略为“拒绝/替换”；认证键序为
-        “最大失败/锁定毫秒”，取认证器当前两值。
+        “最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒”，取认证器当前四值，
+        重试两项为 0/0 表示关闭退避。
         """
         return _compact_config(self._current_spec()) + "\n"
 
-    def upgrade_config(self, text, target=9):
-        """只读地将 v1..v9 配置文本升级到 target（仅支持 9），返回升级包 JSON。
+    def upgrade_config(self, text, target=10):
+        """只读地将 v1..v10 配置文本升级到 target（仅支持 10），返回升级包 JSON。
 
         text 须为 str、target 须为非 bool int，否则抛 TypeError；源版本限
-        1..9 且 target 只许 9；JSON 解析、重复键、键缺失或未知、结构、值、
+        1..10 且 target 只许 10；JSON 解析、重复键、键缺失或未知、结构、值、
         引用或版本非法均抛 ValueError。迁移沿既有规则：v1 单池改 default，
         v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0, 拒绝)，v1-v4 以
-        认证器当前两值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒
-        补 0，v1-v7 模板排队优先级补 0，v1-v8 容量队满策略补“拒绝”，v9 只
-        规范化。返回基线格式的 LF 尾紧凑 JSON：
-        顶层序/型为“源版本:int、目标版本:int、改变:bool、摘要:str、配置:
-        object”，改变 = 源版本 != 9；配置逐层键序、类型与排序同
-        export_config() 的 v9；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
-        sha256 小写值。升级只读，不触碰任何实例状态；时/空上界 O(n log n)/
-        O(n)。
+        认证器当前四值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒
+        补 0，v1-v7 模板排队优先级补 0，v1-v8 容量队满策略补“拒绝”，
+        v5-v9 重试两项补 0（无退避），v10 只规范化。返回基线格式的 LF 尾
+        紧凑 JSON：顶层序/型为“源版本:int、目标版本:int、改变:bool、
+        摘要:str、配置:object”，改变 = 源版本 != 10；配置逐层键序、类型与
+        排序同 export_config() 的 v10；摘要为配置对象同法编码、去 LF 后的
+        UTF-8 字节 sha256 小写值。升级只读，不触碰任何实例状态；时/空上界
+        O(n log n)/O(n)。
         """
         if not isinstance(text, str):
             raise TypeError(f"text must be a str, got {type(text).__name__}")
@@ -10198,7 +10379,7 @@ class Sessions:
             templates,
             user_templates,
             (queue_limit, max_wait_ms, queue_policy),
-            (max_fail, lock_ms),
+            (max_fail, lock_ms, retry_base_ms, retry_cap_ms),
         ) = spec
         self._total = total
         self._per = per
@@ -10217,8 +10398,9 @@ class Sessions:
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
         self._queue_policy = queue_policy
-        # 认证策略随配置提交；认证记录（凭据、失败计数、锁定）保留。
-        self._auth.set_policy(max_fail, lock_ms)
+        # 认证策略随配置提交；认证记录（凭据、失败计数、锁定、下次可试时刻）
+        # 保留，策略切换不重算这三类限制。
+        self._auth.set_policy(max_fail, lock_ms, retry_base_ms, retry_cap_ms)
         # 计量账本：同标识原样保留 u/t/c；周期窗由 _meter/quota_stats 按新
         # 模板周期毫秒 P 即时判定（P>0 且 now_ms//P != t//P 即视为新窗）。
         # 已删模板的历史账本原样保留（改绑后按新 (用户, 模板) 独立建账），
@@ -10319,9 +10501,9 @@ class Sessions:
         return spec, self._build_pools(spec)
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v9 JSON。
+        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v10 JSON。
 
-        直载 v1..v9 配置，或加载 upgrade_config 产出的升级包；升级包须复核
+        直载 v1..v10 配置，或加载 upgrade_config 产出的升级包；升级包须复核
         键序、字段、配置规范形态与摘要，任一不符抛 ValueError。text 非 str
         抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、值、重复项或
         引用（用户模板引用未注册用户或未知模板标识）错抛 ValueError；上限、
@@ -10347,7 +10529,7 @@ class Sessions:
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v9 JSON。
+        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v10 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点、
         历史或运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，生成
@@ -10392,7 +10574,7 @@ class Sessions:
 
         left/right 须为非 bool 非负 int：类型错抛 TypeError，负值抛
         ValueError；校验后依 left、right 次序在保留窗口（最近 256 项）查找，
-        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v9
+        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v10
         配置：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或两侧节点
         JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再下探，
         同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer：
@@ -10433,7 +10615,7 @@ class Sessions:
             )
 
         def json_type(value):
-            # 规范 v9 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            # 规范 v10 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
             if value is None:
                 return "null"
             if isinstance(value, bool):
@@ -10515,14 +10697,14 @@ class Sessions:
         JSON；不老化、不缓存、不审计，不改配置、修订、历史、回滚点及任何运行
         态，同态同参逐字节相同。
 
-        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v9 配置或经
+        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v10 配置或经
         严格复核的升级包，解析、重键、键集/键序、结构、类型、值、排序或引用
         错抛 ValueError，当前会话上限、模板占用、队长或在租租约不能承载抛
         ResourceError；校验次序与 load_config 完全一致（共用 _parse_config_text：
         先解析/迁移并复核升级包，再校验用户模板引用，最后做承载校验），承载
         校验只构造临时池表、不触碰实例状态。
 
-        预检文本先规范化为 v9 spec，再与当前配置（_current_spec() 的规范 v9
+        预检文本先规范化为 v10 spec，再与当前配置（_current_spec() 的规范 v10
         形态）递归比较：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或
         两侧节点 JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再
         下探，同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer
@@ -10533,7 +10715,7 @@ class Sessions:
 
         顶层键序/型为“修订:int、当前摘要:str、目标摘要:str、改变:bool、
         变更:list、摘要:str”；修订与当前摘要沿 config_revision（修订号、当前
-        export 去 LF 的 sha256），目标摘要为规范 v9 对象紧凑编码 UTF-8 字节的
+        export 去 LF 的 sha256），目标摘要为规范 v10 对象紧凑编码 UTF-8 字节的
         sha256 小写值，摘要覆盖前五键（前五键同法编码之 UTF-8 字节 sha256），
         改变恰为变更列表非空。时间 O(n log n + S + Q + D log D)、辅助空间
         O(n + D)（外加两份规范配置），n 为配置规模、S/Q 为会话与等待队列规模、
@@ -10556,7 +10738,7 @@ class Sessions:
             )
 
         def json_type(value):
-            # 规范 v9 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
+            # 规范 v10 仅含 JSON 类型；bool 须与数值区分（True 亦是 int）。
             if value is None:
                 return "null"
             if isinstance(value, bool):
@@ -10861,7 +11043,7 @@ class Sessions:
         回滚点未知。锚后逐项先按 config_history_verify 契约校验字段、修订链、
         操作/目标、快照摘要与哈希链（快照/哈希编码失败各归同名原因），再按提交
         语义演算：构造仅生成修订 0；加载/CAS 取本项快照为新当前态；回退须目标
-        快照在册且本项快照与其规范 v9 JSON 逐字节相同；加载/CAS/回退均保存前态
+        快照在册且本项快照与其规范 v10 JSON 逐字节相同；加载/CAS/回退均保存前态
         为回滚点；回滚须回滚点已知且本项快照与其逐字节相同，随后清除回滚点。
         演算依赖（回退目标快照、回滚点）随窗口淘汰而不可知时归“边界”。
 
@@ -11030,7 +11212,7 @@ class Sessions:
                         if same is None:
                             broken = (revision, "快照")
                         elif not same:
-                            # 本项快照与目标快照规范 v9 JSON 不逐字节相同。
+                            # 本项快照与目标快照规范 v10 JSON 不逐字节相同。
                             broken = (revision, "回退")
                         else:
                             new_current, new_rollback = spec, current
@@ -11139,7 +11321,7 @@ class Sessions:
         (操作, 摘要) 定位唯一在册修订（加载与回滚同摘要不互配）。候选按审计
         序号升序收集：仅取由同键索引指认的原序号 0 首次事件，且缓存原调为
         成功的加载/回滚（失败、升级、重放与未指认事件不入候选）；其首果配置
-        为缓存返回的 v9 JSON，摘要按 config_revision 既有口径（去尾 LF 的
+        为缓存返回的 v10 JSON，摘要按 config_revision 既有口径（去尾 LF 的
         UTF-8 字节 sha256）求。再按修订升序扫描在册“加载/回滚”记录做配对：
         候选仅允许丢弃一段连续前缀作为已淘汰边界（其数量不得超过已淘汰修订
         数，且由反向就近同 (操作, 摘要) 对齐定切点）；其余候选必须与记录形成
@@ -11282,7 +11464,7 @@ class Sessions:
         # 候选选取（审计序号升序；时间 O(A)、不在此步算配置摘要）：事务候选
         # 仅取 config_change 域“键 → 首次事件序号”索引指认
         # （cindex[事件键] == 序号）的原序号 0 事件，且该键缓存原调为成功的
-        # 加载/回滚（首果 ("ok", v9 JSON 文本)）；失败、升级、重放与未被同键
+        # 加载/回滚（首果 ("ok", v10 JSON 文本)）；失败、升级、重放与未被同键
         # 索引指认的事件一律不是候选。每个在册修订至多消费一个候选，故事务候
         # 选与在册 load/rollback 记录的保序配对所用候选必为候选序列的一个后缀
         # （更早的成功首调皆对应已淘汰修订，为可信边界前缀）：自链尾反向仅收
@@ -11338,7 +11520,7 @@ class Sessions:
         # 早于末 R 个候选的事务首调必对应已淘汰修订（在册记录至多消费 R 个，
         # 且配对候选为候选序列后缀）：其数量即不经哈希即采信的淘汰前缀。
         pre_eliminated = max(0, total_candidates - pair_cap)
-        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v9 配置 JSON 去尾 LF 后
+        # 仅对窗口内候选按既有口径求摘要：缓存返回的 v10 配置 JSON 去尾 LF 后
         # 的 UTF-8 字节 sha256 小写值（同 config_revision/历史摘要）。
         candidates = []
         for fseq, ckey, cache in window_rev:
@@ -12000,8 +12182,9 @@ class Sessions:
         1..256 字节、无 U+0000），now_ms 为非 bool 非负 int；类型错抛
         TypeError，取值错抛 ValueError，旧新密码相同抛 ValueError，未知用户
         抛 KeyError。首次合法调用先经 Authenticator 校验旧密码：denied/
-        locked 抛 AuthError，失败计数与锁定由 Authenticator 保留；成功按
-        sha256(user+"\\0"+password) 摘要规则换密并清零失败计数与锁定。除缓存、
+        locked/backoff 抛 AuthError，失败计数、锁定与下次可试时刻由
+        Authenticator 保留；成功按
+        sha256(user+"\\0"+password) 摘要规则换密并清零失败计数、锁定与下次可试时刻。除缓存、
         审计与认证副作用外，失败不改其他状态；成功保留会话与已入队队项，此后
         仅新密码可认证。
 
@@ -12101,7 +12284,8 @@ class Sessions:
             )
             raise
         if status != "ok":
-            # denied/locked：失败计数与锁定已由 Authenticator 保留，此处不改。
+            # denied/locked/backoff：失败计数、锁定与下次可试时刻已由
+            # Authenticator 保留，此处不改。
             exc = AuthError(
                 f"authentication not ok for user {user!r}: {status}"
             )
@@ -12122,11 +12306,13 @@ class Sessions:
             )
             raise exc
 
-        # 成功：按摘要规则换密并清零失败计数与锁定；会话与已入队队项保持不变。
+        # 成功：按摘要规则换密并清零失败计数、锁定与下次可试时刻；会话与
+        # 已入队队项保持不变。
         record = self._auth._users[user]
         record[0] = _digest(user, new_password)
         record[1] = 0
         record[2] = None
+        record[3] = None
         result = self._render_credential_change(user, now_ms)
         self._credential_change_cache[key] = (
             user,

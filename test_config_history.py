@@ -126,7 +126,7 @@ class ConfigHistoryAppendTest(unittest.TestCase):
         with self.assertRaises(StateError):
             s.config_revert("y", 0, 99, 0)
         # 只读升级不追加
-        s.upgrade_config(s.export_config(), 6)
+        s.upgrade_config(s.export_config(), 10)
         self.assertEqual(items(s, limit=1000), before)
 
         # CAS / 回退成功后的同参重放不追加

@@ -193,7 +193,8 @@ class QuotaRestoreTest(unittest.TestCase):
         # 删除 gold、alice 改绑 kill。
         config = json.loads(s.export_config())
         config["模板"] = [
-            {"标识": "kill", "限速": 1000000, "突发": 0, "配额": 10, "超限": "下线"}
+            {"标识": "kill", "限速": 1000000, "突发": 0, "配额": 10,
+             "周期毫秒": 0, "会话上限": 0, "排队优先级": 0, "超限": "下线"}
         ]
         config["用户模板"] = [["alice", "kill"], ["bob", "kill"]]
         s.load_config(json.dumps(config, ensure_ascii=False))
@@ -348,8 +349,10 @@ class QuotaRestoreTest(unittest.TestCase):
         # 缩小 gold 桶容后，同参重放不重新校验、直接返回缓存检查点。
         config = json.loads(s.export_config())
         config["模板"] = [
-            {"标识": "gold", "限速": 1, "突发": 0, "配额": 1000, "超限": "拒绝"},
-            {"标识": "kill", "限速": 1000000, "突发": 0, "配额": 10, "超限": "下线"},
+            {"标识": "gold", "限速": 1, "突发": 0, "配额": 1000,
+             "周期毫秒": 0, "会话上限": 0, "排队优先级": 0, "超限": "拒绝"},
+            {"标识": "kill", "限速": 1000000, "突发": 0, "配额": 10,
+             "周期毫秒": 0, "会话上限": 0, "排队优先级": 0, "超限": "下线"},
         ]
         s.load_config(json.dumps(config, ensure_ascii=False))
         # 文本相对新桶容（1*1000）已非法，但同参重放不重新校验，

@@ -42,20 +42,24 @@ def seal(doc):
     return compact(doc) + "\n"
 
 
-def build(now_ms=0, users=()):
-    """users 为 (用户, 失败, 锁定至, 停用, 密码)；密码默认 pw。"""
+def build(now_ms=0, users=(), version=2):
+    """users 为 (用户, 失败, 锁定至, 下次可试, 停用[, 密码])；version 1 省略
+    下次可试键（恢复时补 None）。"""
     rows = []
     for item in users:
-        user, failed, until, disabled = item[:4]
-        password = item[4] if len(item) > 4 else "pw"
-        rows.append({
+        user, failed, until, retry_at, disabled = item[:5]
+        password = item[5] if len(item) > 5 else "pw"
+        row = {
             "用户": user,
             "凭据": cred_hex(user, password),
             "失败": failed,
             "锁定至": until,
-            "停用": disabled,
-        })
-    return {"版本": 1, "时刻": now_ms, "用户": rows}
+        }
+        if version == 2:
+            row["下次可试"] = retry_at
+        row["停用"] = disabled
+        rows.append(row)
+    return {"版本": version, "时刻": now_ms, "用户": rows}
 
 
 def row(doc, user):
@@ -71,9 +75,9 @@ class AuthCheckpointTest(unittest.TestCase):
         self.assertNotIn("\\u", out)
         self.assertEqual(
             out,
-            '{"版本":1,"时刻":0,"用户":[],'
-            '"摘要":"2362dddf735e1b67505ae64a4e6fc7fb'
-            'dc6ffa1d4f17750d57669e87c7bee43b"}\n',
+            '{"版本":2,"时刻":0,"用户":[],'
+            '"摘要":"279d29321d549c616d85737e38c11854'
+            'a0f63216d9e4d862f8b2f3d9493d00a6"}\n',
         )
         doc = parse(out)
         self.assertEqual(list(doc), ["版本", "时刻", "用户", "摘要"])
@@ -96,13 +100,13 @@ class AuthCheckpointTest(unittest.TestCase):
         s.user_admin("d", "停用", "bob", 0, force=True)
         out = s.auth_checkpoint(60)
         doc = parse(out)
-        self.assertEqual(doc["版本"], 1)
+        self.assertEqual(doc["版本"], 2)
         self.assertEqual(doc["时刻"], 60)
         self.assertEqual(
             [item["用户"] for item in doc["用户"]], ["alice", "bob", "carol"]
         )
         self.assertTrue(all(
-            list(item) == ["用户", "凭据", "失败", "锁定至", "停用"]
+            list(item) == ["用户", "凭据", "失败", "锁定至", "下次可试", "停用"]
             for item in doc["用户"]
         ))
         self.assertEqual(row(doc, "alice"), {
@@ -110,6 +114,7 @@ class AuthCheckpointTest(unittest.TestCase):
             "凭据": cred_hex("alice"),
             "失败": 3,
             "锁定至": 1000,
+            "下次可试": None,
             "停用": False,
         })
         self.assertEqual(row(doc, "bob"), {
@@ -117,6 +122,7 @@ class AuthCheckpointTest(unittest.TestCase):
             "凭据": cred_hex("bob"),
             "失败": 0,
             "锁定至": None,
+            "下次可试": None,
             "停用": True,
         })
         self.assertEqual(row(doc, "carol"), {
@@ -124,6 +130,7 @@ class AuthCheckpointTest(unittest.TestCase):
             "凭据": cred_hex("carol"),
             "失败": 0,
             "锁定至": None,
+            "下次可试": None,
             "停用": False,
         })
         head = {key: doc[key] for key in ("版本", "时刻", "用户")}
@@ -191,18 +198,18 @@ class AuthRestoreTest(unittest.TestCase):
         self.assertEqual(dst_auth._users["alice"][2], 1000)
         self.assertEqual(dst._disabled_users, {"bob"})
         # 认证策略不被恢复改写。
-        self.assertEqual(dst_auth.policy(), (3, 1000))
+        self.assertEqual(dst_auth.policy(), (3, 1000, 0, 0))
 
     def test_policy_preserved_and_failed_until_verbatim(self):
         _auth, s = make()
         cp = seal(build(0, [
-            ("alice", 99, None, False),     # 失败远超 max_fail=3，原样往返
-            ("bob", 0, 0, False),           # 锁定至=0（非 null）原样往返
-            ("carol", 5, 12345, True),      # 停用+未到期锁
+            ("alice", 99, None, None, False),     # 失败远超 max_fail=3，原样往返
+            ("bob", 0, 0, None, False),           # 锁定至=0（非 null）原样往返
+            ("carol", 5, 12345, None, True),      # 停用+未到期锁
         ]))
         dst_auth, dst = make()
         self.assertEqual(dst.auth_restore("r1", cp), cp)
-        self.assertEqual(dst_auth.policy(), (3, 1000))
+        self.assertEqual(dst_auth.policy(), (3, 1000, 0, 0))
         self.assertEqual(dst_auth._users["alice"][1], 99)
         self.assertIsNone(dst_auth._users["alice"][2])
         self.assertEqual(dst_auth._users["bob"][1], 0)
@@ -215,9 +222,9 @@ class AuthRestoreTest(unittest.TestCase):
         _auth, s = make()
         # carol 锁定至 10000：后续认证先判锁，不验密、不清零。
         cp = seal(build(0, [
-            ("alice", 0, None, False),
-            ("bob", 0, None, False),
-            ("carol", 2, 10000, False),
+            ("alice", 0, None, None, False),
+            ("bob", 0, None, None, False),
+            ("carol", 2, 10000, None, False),
         ]))
         dst_auth, _dst = make()
         _dst.auth_restore("r1", cp)
@@ -229,14 +236,15 @@ class AuthRestoreTest(unittest.TestCase):
         self.assertEqual(dst_auth.authenticate("carol", "pw", 10000)[1], "ok")
         self.assertEqual(dst_auth._users["carol"][1], 0)
         self.assertIsNone(dst_auth._users["carol"][2])
+        self.assertIsNone(dst_auth._users["carol"][3])
 
     def test_high_failed_count_keeps_existing_lock_rule(self):
         # 失败=99 原样恢复；下一次错密码按既有规则 failed>=max_fail 立即锁定。
         _auth, s = make()
         cp = seal(build(0, [
-            ("alice", 99, None, False),
-            ("bob", 0, None, False),
-            ("carol", 0, None, False),
+            ("alice", 99, None, None, False),
+            ("bob", 0, None, None, False),
+            ("carol", 0, None, None, False),
         ]))
         dst_auth, _dst = make()
         _dst.auth_restore("r1", cp)
@@ -262,9 +270,9 @@ class AuthRestoreTest(unittest.TestCase):
     def test_disabled_user_blocks_establish_until_enabled(self):
         _auth, s = make()
         cp = seal(build(0, [
-            ("alice", 0, None, True),
-            ("bob", 0, None, False),
-            ("carol", 0, None, False),
+            ("alice", 0, None, None, True),
+            ("bob", 0, None, None, False),
+            ("carol", 0, None, None, False),
         ]))
         _a, dst = make()
         dst.auth_restore("r1", cp)
@@ -301,9 +309,9 @@ class AuthRestoreTest(unittest.TestCase):
         _auth, s = make()
         good = json.loads(seal(build()))
         good3 = json.loads(seal(build(0, [
-            ("alice", 0, None, False),
-            ("bob", 0, None, False),
-            ("carol", 0, None, False),
+            ("alice", 0, None, None, False),
+            ("bob", 0, None, None, False),
+            ("carol", 0, None, None, False),
         ])))
         bad_texts = [
             "",
@@ -312,14 +320,14 @@ class AuthRestoreTest(unittest.TestCase):
             "1",
             '"x"',
             # 键集/键序。
-            compact({"版本": 1}),
+            compact({"版本": 2}),
             compact({k: good3[k] for k in
                      ("摘要", "版本", "时刻", "用户")}),
             compact({**good3, "x": 1}),
             compact({k: v for k, v in good3.items() if k != "用户"}),
-            # 版本。
+            # 版本：1/2 合法，其余非法。
             seal({**good3, "版本": 0}),
-            seal({**good3, "版本": 2}),
+            seal({**good3, "版本": 3}),
             seal({**good3, "版本": "1"}),
             seal({**good3, "版本": True}),
             # 时刻。
@@ -333,106 +341,128 @@ class AuthRestoreTest(unittest.TestCase):
             # 用户项键集/键序。
             seal({**good3, "用户": [
                 {"凭据": cred_hex("alice"), "失败": 0, "锁定至": None,
-                 "停用": False, "用户": "alice"}
+                 "下次可试": None, "停用": False, "用户": "alice"}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
                  "锁定至": None}
             ]}),
+            # 版本 2 缺下次可试键。
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": False, "x": 0}
+                 "锁定至": None, "停用": False}
+            ]}),
+            seal({**good3, "用户": [
+                {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
+                 "锁定至": None, "下次可试": None, "停用": False, "x": 0}
             ]}),
             seal({**good3, "用户": [[]]}),
             # 用户凭据约束。
             seal({**good3, "用户": [
                 {"用户": "", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": 1, "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "a\u0000", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             # 凭据：64 位小写十六进制。
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": 0, "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": "0" * 63, "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": "A" * 64, "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": "g" * 64, "失败": 0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             # 失败：非 bool 非负 int。
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": -1,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": True,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": "1",
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 1.0,
-                 "锁定至": None, "停用": False}
+                 "锁定至": None, "下次可试": None, "停用": False}
             ]}),
             # 锁定至：null 或非 bool 非负 int。
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": -1, "停用": False}
+                 "锁定至": -1, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": True, "停用": False}
+                 "锁定至": True, "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": "1", "停用": False}
+                 "锁定至": "1", "下次可试": None, "停用": False}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": 1.5, "停用": False}
+                 "锁定至": 1.5, "下次可试": None, "停用": False}
+            ]}),
+            # 下次可试：null 或非 bool 非负 int。
+            seal({**good3, "用户": [
+                {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
+                 "锁定至": None, "下次可试": -1, "停用": False}
+            ]}),
+            seal({**good3, "用户": [
+                {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
+                 "锁定至": None, "下次可试": True, "停用": False}
+            ]}),
+            seal({**good3, "用户": [
+                {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
+                 "锁定至": None, "下次可试": "1", "停用": False}
+            ]}),
+            seal({**good3, "用户": [
+                {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
+                 "锁定至": None, "下次可试": 1.5, "停用": False}
             ]}),
             # 停用：bool。
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": 0}
+                 "锁定至": None, "下次可试": None, "停用": 0}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": "false"}
+                 "锁定至": None, "下次可试": None, "停用": "false"}
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": None}
+                 "锁定至": None, "下次可试": None, "停用": None}
             ]}),
             # 排序/重复。
             seal({**good3, "用户": [
                 {"用户": "bob", "凭据": cred_hex("bob"), "失败": 0,
-                 "锁定至": None, "停用": False},
+                 "锁定至": None, "下次可试": None, "停用": False},
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": False},
+                 "锁定至": None, "下次可试": None, "停用": False},
             ]}),
             seal({**good3, "用户": [
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 0,
-                 "锁定至": None, "停用": False},
+                 "锁定至": None, "下次可试": None, "停用": False},
                 {"用户": "alice", "凭据": cred_hex("alice"), "失败": 1,
-                 "锁定至": None, "停用": False},
+                 "锁定至": None, "下次可试": None, "停用": False},
             ]}),
             # 摘要形态与内容。
             compact({**good3, "摘要": 0}),
@@ -440,11 +470,17 @@ class AuthRestoreTest(unittest.TestCase):
             compact({**good3, "摘要": "g" * 64}),
             compact({**good3, "摘要": "0" * 64}),  # 形态合法但内容不符
             # 重复顶层键。
-            '{"版本":1,"版本":1,"时刻":0,"用户":[],"摘要":"' + "0" * 64 + '"}',
+            '{"版本":2,"版本":2,"时刻":0,"用户":[],"摘要":"' + "0" * 64 + '"}',
             # 重复用户项内键。
-            '{"版本":1,"时刻":0,"用户":[{"用户":"alice","用户":"alice",'
+            '{"版本":2,"时刻":0,"用户":[{"用户":"alice","用户":"alice",'
             '"凭据":"' + cred_hex("alice") + '","失败":0,"锁定至":null,'
-            '"停用":false}],"摘要":"' + "0" * 64 + '"}',
+            '"下次可试":null,"停用":false}],"摘要":"' + "0" * 64 + '"}',
+            # 版本 1 文档混入下次可试键（键集不符）。
+            seal(build(0, [
+                ("alice", 0, None, None, False),
+                ("bob", 0, None, None, False),
+                ("carol", 0, None, None, False),
+            ], version=1)).replace('"停用":false', '"下次可试":null,"停用":false'),
         ]
         self.assertGreater(len(bad_texts), 30)  # 防止误删用例
         for text in bad_texts:
@@ -455,9 +491,9 @@ class AuthRestoreTest(unittest.TestCase):
     def test_user_set_mismatch_resource_error(self):
         _auth, s = make()
         cp = seal(build(0, [
-            ("alice", 0, None, False),
-            ("bob", 0, None, False),
-            ("carol", 0, None, False),
+            ("alice", 0, None, None, False),
+            ("bob", 0, None, None, False),
+            ("carol", 0, None, None, False),
         ]))
         _a2, fewer = make(users=("alice", "bob"))
         with self.assertRaises(ResourceError):
@@ -541,9 +577,9 @@ class AuthRestoreTest(unittest.TestCase):
         _auth, s = make(idle_ms=50)
         s.do("e1", "建立", "s1", ("alice", "pw"), 0)
         cp = seal(build(100000, [
-            ("alice", 0, None, False),
-            ("bob", 0, None, False),
-            ("carol", 0, None, False),
+            ("alice", 0, None, None, False),
+            ("bob", 0, None, None, False),
+            ("carol", 0, None, None, False),
         ]))
         s.auth_restore("r1", cp)
         self.assertEqual(s._sessions["s1"]["state"], "在线")

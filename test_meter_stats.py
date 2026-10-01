@@ -135,7 +135,8 @@ class MeterStatsTest(unittest.TestCase):
         # 热加载：alice 改绑 kill，gold 删除
         config = json.loads(s.export_config())
         config["模板"] = [
-            {"标识": "kill", "限速": 1000000, "突发": 0, "配额": 10, "超限": "下线"}
+            {"标识": "kill", "限速": 1000000, "突发": 0, "配额": 10,
+             "周期毫秒": 0, "会话上限": 0, "排队优先级": 0, "超限": "下线"}
         ]
         config["用户模板"] = [["alice", "kill"]]
         s.load_config(json.dumps(config, ensure_ascii=False))

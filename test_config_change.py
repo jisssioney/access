@@ -274,7 +274,7 @@ class ConfigChangeUpgradeTest(unittest.TestCase):
         before = s.export_config()
         out = s.config_change("U", "升级", self.V1, 100)
         # 首调等同 upgrade_config(text, 5)，原字节返回升级包。
-        self.assertEqual(out, s.upgrade_config(self.V1, 5))
+        self.assertEqual(out, s.upgrade_config(self.V1, 10))
         self.assertTrue(out.endswith("\n"))
         self.assertNotIn(" ", out.strip())
         doc = json.loads(out)
@@ -282,7 +282,7 @@ class ConfigChangeUpgradeTest(unittest.TestCase):
             list(doc), ["源版本", "目标版本", "改变", "摘要", "配置"]
         )
         self.assertEqual(doc["源版本"], 1)
-        self.assertEqual(doc["目标版本"], 5)
+        self.assertEqual(doc["目标版本"], 10)
         self.assertIs(doc["改变"], True)
         self.assertIsInstance(doc["摘要"], str)
         self.assertIsInstance(doc["配置"], dict)
@@ -298,7 +298,7 @@ class ConfigChangeUpgradeTest(unittest.TestCase):
 
     def test_upgrade_replay_returns_same_bytes_and_links_origin(self):
         s = make()
-        direct = s.upgrade_config(self.V1, 5)
+        direct = s.upgrade_config(self.V1, 10)
         out1 = s.config_change("U", "升级", self.V1, 100)
         # 外部改变配置与认证策略；重放不预检、不重跑，仍返回首果原字节。
         loaded = json.loads(s.export_config())
@@ -314,11 +314,11 @@ class ConfigChangeUpgradeTest(unittest.TestCase):
         )
         self.assertTrue(s.verify_audit())
 
-    def test_upgrade_v5_changed_false(self):
+    def test_upgrade_v10_changed_false(self):
         s = make()
-        v5 = s.export_config()
-        doc = json.loads(s.config_change("V", "升级", v5, 0))
-        self.assertEqual(doc["源版本"], 5)
+        v10 = s.export_config()
+        doc = json.loads(s.config_change("V", "升级", v10, 0))
+        self.assertEqual(doc["源版本"], 10)
         self.assertIs(doc["改变"], False)
         self.assertEqual(ops(s), [(1, "配置升级", "", "成功", 0)])
 
