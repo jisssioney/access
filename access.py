@@ -27,18 +27,36 @@
   恢复（仅缓存成功，同摘要空操作，异摘要覆盖状态 StateError），供续租、
   计量、推进一致恢复。
   service_checkpoint(now_ms)/service_restore(key,text) 提供跨域一致性
-  检查点（版本 1，顶层依次版本/时刻/配置摘要/认证/运行态/故障/统计/摘要，
-  末摘要盖前七键 UTF-8 字节）：生成先验显式毫秒时钟再只老化一次，随后从
-  同一状态取当前 v10 配置规范摘要与认证（v2）、运行态（v1）、故障（v1）、
-  统计（v1）规范对象，除该次老化外只读、逐字节确定；恢复在改任何状态前
-  完成重键、键序、版本、类型、排序、各层摘要、统一时刻与跨域引用校验，
-  参数型错 TypeError、JSON/结构/值/摘要/同键异参 ValueError、配置摘要
-  不符 StateError("配置")、用户集不同或引用未注册用户/未知模板/未知地址池
-  ResourceError、非空且异摘要运行态 StateError("运行态")，运行态为空或
-  整体相同才整体替换认证限制与凭据摘要、运行态、故障态与统计并重建租约，
-  失败不改态不占 key，不导入/清空配置与配置历史、不恢复三类审计链与各域
-  幂等缓存、不写审计，成功返回同格式规范包，同键同文本重放原字节不产生
-  修改；单次 O(N log N)/O(N)。
+  检查点（版本 2，顶层依次版本/时刻/配置摘要/认证/运行态/故障/统计/计费/
+  摘要，末摘要盖前八键 UTF-8 字节；“计费”域为版本 1，含计费哈希链、按会话
+  升序的活动会话累计与最近计费时刻及链尾哈希）：生成先验显式毫秒时钟再只
+  老化一次，随后从同一状态取当前 v10 配置规范摘要与认证（v2）、运行态
+  （v1）、故障（v1）、统计（v1）、计费（v1）规范对象，除该次老化外只读、
+  逐字节确定；恢复接受版本 1（无计费域，缺失计费态按空）与版本 2，在改任何
+  状态前完成重键、键序、版本、类型、排序、各层摘要、计费链结构/顺序/哈希、
+  统一时刻与跨域引用校验，参数型错 TypeError、新版本结构/顺序/哈希/生命周期
+  或摘要非法 ValueError、引用未知用户或会话 ResourceError、配置摘要不符
+  StateError("配置")、非空且异态计费 StateError("计费")、非空且异摘要运行态
+  StateError("运行态")，各域为空或整体相同才整体替换并重建租约，失败不改任何
+  域、不占 key，不导入/清空配置与配置历史、不恢复审计链与各域幂等缓存、不写
+  审计与计费事件，成功返回版本 2 规范包，同键同文本重放原字节不产生修改；
+  旧版本（v1）恢复的遗留在线会话无开始事件，后续 meter/interim 惰性建账；
+  单次 O(N log N)/O(N)。
+  accounting_interim(key,sid,now_ms)/accounting_events(after=0,limit=100)
+  提供确定性会话计费：do 建立、capacity 立即建立/排队晋升、batch_online
+  实际提交项产生“开始”事件；仅 meter 通过的字节按会话累计；中间计费产生
+  “中间”累计事件；显式下线/批量下线/强制停用/QoS 超限下线/接管旧会话产生
+  “停止”事件（原因依次下线/批量下线/停用/配额/接管，开始与中间原因为空串），
+  接管新会话同刻产生开始；迁移、续租、挂起、恢复与超时老化（含演练）挂起不
+  切分；原子批次回滚截断链不留事件，非原子只留实际提交项，失败与重放不重复
+  记账。事件十一键（序号/类型/时刻/会话/用户/地址池/地址/累计字节/原因/
+  前哈希/哈希），链首前哈希 64 个 0，哈希按前哈希与本条前九项紧凑 JSON
+  UTF-8 字节算 SHA-256；accounting_interim 独立 key 重放原结果且不重复记账、
+  异参复用抛 ValueError，未知 sid KeyError、非在线或时刻早于最近计费时刻
+  StateError（旧检查点恢复的在线会话首次中间计费惰性开账）；accounting_events
+  只读分页（after 非 bool 非负 int、limit 1..1000，型错 TypeError、界错
+  ValueError，链尾后空页），顶层键序版本/起点/下页/事件/尾序号/尾哈希，LF
+  尾紧凑 JSON，同状态逐字节一致，时空 O(limit)。
   fault 注入/恢复后端故障：do 建立/迁移/接管与 capacity 申请在验参后、
   老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
@@ -1374,6 +1392,29 @@ _ADMIN_ENABLED = "启用"
 _ADMIN_CHAIN_DISABLE = "用户停用"
 _ADMIN_CHAIN_ENABLE = "用户启用"
 
+# 会话计费：事件类型仅开始/中间/停止；停止原因依次为下线/批量下线/停用/
+# 配额/接管，开始与中间原因恒为空串。链首前哈希为 64 个 0，哈希按前哈希
+# 与本条前九项（序号/类型/时刻/会话/用户/地址池/地址/累计字节/原因）的
+# 紧凑 JSON（前哈希置末）UTF-8 字节计算 SHA-256。
+_ACCOUNT_START = "开始"
+_ACCOUNT_INTERIM = "中间"
+_ACCOUNT_STOP = "停止"
+_ACCOUNT_REASON_OFFLINE = "下线"
+_ACCOUNT_REASON_BATCH = "批量下线"
+_ACCOUNT_REASON_DISABLE = "停用"
+_ACCOUNT_REASON_QUOTA = "配额"
+_ACCOUNT_REASON_TAKEOVER = "接管"
+_ACCOUNT_TYPES = (_ACCOUNT_START, _ACCOUNT_INTERIM, _ACCOUNT_STOP)
+_ACCOUNT_STOP_REASONS = (
+    _ACCOUNT_REASON_OFFLINE,
+    _ACCOUNT_REASON_BATCH,
+    _ACCOUNT_REASON_DISABLE,
+    _ACCOUNT_REASON_QUOTA,
+    _ACCOUNT_REASON_TAKEOVER,
+)
+# service 跨域检查点版本：1 无计费域，2 在统计后追加“计费”域。
+_SERVICE_VERSION = 2
+
 
 class _Pool:
     """单个地址池：保留/静态集、动态空闲最小堆与本池租用地址表。
@@ -2075,6 +2116,25 @@ class Sessions:
         self._establish_total = 0
         self._establish_success = 0
 
+        # 会话计费：十一元组哈希链事件序列（序号, 类型, 时刻, 会话, 用户,
+        # 地址池, 地址, 累计字节, 原因, 前哈希, 哈希），序号自 1；末项哈希
+        # （空链为 64 个 0，即首项前哈希）。开始/中间原因恒为空串；停止原因
+        # 为下线/批量下线/停用/配额/接管。仅会话建立、容量申请立即建立、
+        # 容量晋升与批量上线成功追加开始；显式下线、批量下线、强制停用、
+        # QoS 超限下线与接管追加停止；接管的新会话同刻追加开始。迁移、续租、
+        # 挂起、恢复、超时老化挂起与超时演练挂起均不切分计费。
+        self._account_events = []
+        self._account_tail = "0" * 64
+        # 活动（在线或挂起、未停止）会话的计费账：sid -> [累计字节, 用户,
+        # 最近计费时刻]；池/地址不缓存，始终取会话当前持址（迁移改址不切分
+        # 计费，故中间/停止事件须反映迁移后池址；挂起为 ""）。仅 meter 通过
+        # 的字节计入累计；最近计费时刻取开始、历次中间与 meter 通过时刻的
+        # 最大值。停止后删账；同 sid 再建立即新账。
+        self._account_active = {}
+        # accounting_interim 的重放缓存，与其余各域独立：
+        # key -> (sid, now_ms, 结果 JSON)；仅首次成功缓存，失败不占 key。
+        self._account_interim_cache = {}
+
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
 
@@ -2541,6 +2601,8 @@ class Sessions:
 
         # 全部校验通过后再落库，杜绝失败残留。
         deadline, lease = self._commit_session(sid, user, pool_id, ip_int, now_ms)
+        # 计费开始：仅建立成功产生开始事件（累计 0）。
+        self._account_start(sid, now_ms)
         address = str(ipaddress.IPv4Address(ip_int))
         return self._render(sid, _STATE_ONLINE, now_ms, deadline, address, lease)
 
@@ -2692,6 +2754,9 @@ class Sessions:
             lease = now_ms + self._lease_ms
 
         # 全部校验通过：原子下线旧会话（清期限/地址/租期），新会话在线接管。
+        # 计费：旧会话先以“接管”结账停止（须在清场前，取其当前持址），
+        # 新会话同刻开账产生开始事件。
+        self._account_stop(old, now_ms, _ACCOUNT_REASON_TAKEOVER)
         pool = self._pools[pool_id]
         pool.leases[ip_int] = sid
         old_session["state"] = _STATE_OFFLINE
@@ -2708,6 +2773,7 @@ class Sessions:
             "lease": lease,
             "pool": pool_id,
         }
+        self._account_start(sid, now_ms)
         old_address = (
             str(ipaddress.IPv4Address(old_ip)) if old_ip is not None else ""
         )
@@ -2731,6 +2797,8 @@ class Sessions:
             raise KeyError(f"unknown sid: {sid!r}")
         if session["state"] not in (_STATE_ONLINE, _STATE_SUSPENDED, _STATE_OFFLINE):
             raise StateError(f"cannot offline sid {sid!r} in state {session['state']!r}")
+        # 计费停止：须在清场前结账（取当前持址）；下线墓碑无活动账为空操作。
+        self._account_stop(sid, now_ms, _ACCOUNT_REASON_OFFLINE)
         session["state"] = _STATE_OFFLINE
         session["deadline"] = 0
         self._release(session)
@@ -2968,10 +3036,14 @@ class Sessions:
             tokens -= size * 1000
             self._meter_ledgers[ledger_key] = [used, now_ms, tokens]
             result = "通过"
+            # 计费：仅 meter 通过的字节计入该会话活动账。
+            self._account_add_bytes(sid, size, now_ms)
         else:
             result = exceed
             if exceed == "下线":
                 # 不累计：原子下线、清期限、释址退租，账本不提交。
+                # 计费停止（配额）须在清场前结账；本次拒绝字节不计入。
+                self._account_stop(sid, now_ms, _ACCOUNT_REASON_QUOTA)
                 session["state"] = _STATE_OFFLINE
                 session["deadline"] = 0
                 self._release(session)
@@ -3090,6 +3162,238 @@ class Sessions:
             "累计": used,
             "剩余": max(0, quota - used),
             "令牌": tokens,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _account_location(self, session):
+        """会话当前持址快照 (地址池, 地址)：无址（挂起或在线租期到期）为
+        ("", "")，持址为 (池标识, 规范 IPv4 串)。"""
+        if session["ip"] is None:
+            return "", ""
+        return session["pool"], str(ipaddress.IPv4Address(session["ip"]))
+
+    @staticmethod
+    def _account_hash(
+        seq, kind, now_ms, sid, user, pool_id, address, total, reason, prev_hash
+    ):
+        """计费哈希：前哈希与本条前九项（序号/类型/时刻/会话/用户/地址池/
+        地址/累计字节/原因/前哈希）的紧凑 JSON（无 LF）之 UTF-8 字节
+        sha256 小写十六进制串。"""
+        head = {
+            "序号": seq,
+            "类型": kind,
+            "时刻": now_ms,
+            "会话": sid,
+            "用户": user,
+            "地址池": pool_id,
+            "地址": address,
+            "累计字节": total,
+            "原因": reason,
+            "前哈希": prev_hash,
+        }
+        blob = json.dumps(head, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _account_append(self, kind, sid, user, pool_id, address, total,
+                        reason, now_ms):
+        """追加一条计费事件（序号自 1），O(1) 时空，返回十一元组。
+
+        前哈希首项为 64 个 0，余取前项哈希；事件时刻允许回拨，链接只认追加
+        序。仅由各业务提交点与 accounting_interim 调用。
+        """
+        seq = len(self._account_events) + 1
+        prev_hash = self._account_tail
+        digest = self._account_hash(
+            seq, kind, now_ms, sid, user, pool_id, address, total, reason,
+            prev_hash,
+        )
+        event = (
+            seq, kind, now_ms, sid, user, pool_id, address, total, reason,
+            prev_hash, digest,
+        )
+        self._account_events.append(event)
+        self._account_tail = digest
+        return event
+
+    def _account_start(self, sid, now_ms):
+        """会话建立成功（do 建立/capacity 立即建立与晋升/批量上线提交项）后
+        原子开账：按当前持址追加累计 0、原因空串的开始事件并建活动账。"""
+        session = self._sessions[sid]
+        pool_id, address = self._account_location(session)
+        user = session["user"]
+        self._account_append(
+            _ACCOUNT_START, sid, user, pool_id, address, 0, "", now_ms
+        )
+        # 活动账三元组：累计字节、用户、最近计费时刻（开始/中间事件时刻）。
+        self._account_active[sid] = [0, user, now_ms]
+
+    def _account_stop(self, sid, now_ms, reason):
+        """会话停止（显式下线/批量下线/强制停用/QoS 超限/接管旧会话）前
+        原子结账：按当前持址与累计追加停止事件并销活动账。
+
+        须在清场（置下线、释址）之前调用；挂起会话无址，池址记 ""。下线
+        墓碑无活动账（停止事件已在首次清场时追加），为空操作。
+        """
+        account = self._account_active.get(sid)
+        if account is None:
+            return
+        pool_id, address = self._account_location(self._sessions[sid])
+        self._account_append(
+            _ACCOUNT_STOP, sid, account[1], pool_id, address, account[0],
+            reason, now_ms,
+        )
+        del self._account_active[sid]
+
+    def _account_add_bytes(self, sid, size, now_ms):
+        """meter 通过后把 size 字节计入该会话活动账；不产生事件、不改最近
+        计费时刻。仅由 _meter 通过分支调用，会话必在线。旧检查点（v1 service/
+        runtime/creplay）恢复的遗留会话无开始事件：首次计费时惰性建账（累计
+        从本次起、不补开始事件）。"""
+        account = self._account_active.get(sid)
+        if account is None:
+            self._account_active[sid] = [size, self._sessions[sid]["user"], now_ms]
+        else:
+            account[0] += size
+
+    def accounting_interim(self, key, sid, now_ms):
+        """对活动会话生成一条累计（中间）计费事件，返回该事件的 LF 结尾
+        紧凑 JSON（十一键，键序同 accounting_events 事件项）。
+
+        key/sid 沿用凭据约束，now_ms 为非 bool 非负 int：类型错 TypeError、
+        取值错 ValueError。首果（成功或异常）以独立域永久缓存：同型同参
+        重放不老化、不重复记账、原样返回或重抛，异参复用抛 ValueError。
+        首次合法调用先老化（与 meter 同序）；未知 sid 抛 KeyError，非在线
+        会话（挂起/下线墓碑）抛 StateError，now_ms 早于该会话最近计费时刻
+        （开始或上一中间时刻）抛 StateError；中间事件原因恒为空串，累计为
+        该会话仅由 meter 通过累计的字节数，池址取当前持址（无址为 ""）。
+        """
+        _check_credential("key", key)
+
+        cached = self._account_interim_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不记账、不追加事件，仅按缓存返回或重抛。
+            c_sid, c_now_ms, outcome = cached
+            if not _strict_equal((sid, now_ms), (c_sid, c_now_ms)):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            if outcome[0] == "ok":
+                return outcome[1]
+            exc_class, exc_args = outcome[1]
+            raise _replay_exception(exc_class, exc_args)
+
+        # 新 key：余参校验本身的异常同样入缓存。
+        try:
+            _check_credential("sid", sid)
+            _check_int("now_ms", now_ms, 0)
+        except (TypeError, ValueError) as exc:
+            self._account_interim_cache[key] = (
+                sid, now_ms, ("err", (type(exc), exc.args))
+            )
+            raise
+
+        # 首次合法调用：先老化（与 meter 同序）；到期在线会话挂起释址后
+        # 按非在线会话抛 StateError。
+        self._age(now_ms)
+        session = self._sessions.get(sid)
+        if session is None:
+            exc = KeyError(f"unknown sid: {sid!r}")
+            self._account_interim_cache[key] = (
+                sid, now_ms, ("err", (type(exc), exc.args))
+            )
+            raise exc
+        account = self._account_active.get(sid)
+        if session["state"] != _STATE_ONLINE:
+            exc = StateError(
+                f"cannot account sid {sid!r} in state {session['state']!r}"
+            )
+            self._account_interim_cache[key] = (
+                sid, now_ms, ("err", (type(exc), exc.args))
+            )
+            raise exc
+        if account is None:
+            # 旧检查点（v1 service/runtime/creplay）恢复的遗留在线会话无开始
+            # 事件：首次中间计费惰性建账，不补开始事件。
+            account = self._account_active[sid] = [
+                0, session["user"], now_ms
+            ]
+        if now_ms < account[2]:
+            exc = StateError(
+                f"now_ms {now_ms} before last accounting time {account[2]} "
+                f"for sid {sid!r}"
+            )
+            self._account_interim_cache[key] = (
+                sid, now_ms, ("err", (type(exc), exc.args))
+            )
+            raise exc
+
+        pool_id, address = self._account_location(session)
+        account[2] = now_ms
+        event = self._account_append(
+            _ACCOUNT_INTERIM, sid, account[1], pool_id, address, account[0],
+            "", now_ms,
+        )
+        result = self._render_account_event(event)
+        self._account_interim_cache[key] = (sid, now_ms, ("ok", result))
+        return result
+
+    @staticmethod
+    def _account_event_dict(event):
+        """计费事件十一元组 → 十一键 dict（固定键序）。"""
+        seq, kind, now_ms, sid, user, pool_id, address, total, reason, \
+            prev_hash, digest = event
+        return {
+            "序号": seq,
+            "类型": kind,
+            "时刻": now_ms,
+            "会话": sid,
+            "用户": user,
+            "地址池": pool_id,
+            "地址": address,
+            "累计字节": total,
+            "原因": reason,
+            "前哈希": prev_hash,
+            "哈希": digest,
+        }
+
+    @classmethod
+    def _render_account_event(cls, event):
+        """计费事件十一元组 → 十一键 LF 尾紧凑 JSON（固定键序）。"""
+        return (
+            json.dumps(
+                cls._account_event_dict(event),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+    def accounting_events(self, after=0, limit=100):
+        """只读分页返回计费哈希链事件的 LF 结尾紧凑 JSON，不老化、不改态。
+
+        after 为非 bool 非负 int，limit 为非 bool int 且 1..1000：类型错抛
+        TypeError，范围错抛 ValueError。取序号 > after 的前 limit 项，序号
+        即位置，切片 O(limit)。顶层键序固定为
+        “版本/起点/下页/事件/尾序号/尾哈希”：版本恒为 1，起点为 after，
+        下页为末项序号、空页为 after（链尾后返回空页），尾序号为链长、
+        尾哈希为链末哈希（空链为 64 个 0）。事件项十一键，顺序为
+        序号/类型/时刻/会话/用户/地址池/地址/累计字节/原因/前哈希/哈希；
+        开始与中间原因为空串，停止原因为下线/批量下线/停用/配额/接管。
+        同状态逐字节一致，时空均为 O(limit)。
+        """
+        _check_int("after", after, 0)
+        _check_int("limit", limit, 1)
+        if limit > 1000:
+            raise ValueError(f"limit must be <= 1000, got {limit}")
+
+        window = self._account_events[after : after + limit]
+        events = [self._account_event_dict(event) for event in window]
+        next_cursor = window[-1][0] if window else after
+        payload = {
+            "版本": 1,
+            "起点": after,
+            "下页": next_cursor,
+            "事件": events,
+            "尾序号": len(self._account_events),
+            "尾哈希": self._account_tail,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
@@ -5443,9 +5747,9 @@ class Sessions:
         self._age(now_ms)
 
         if atomic:
-            items, commit = self._batch_offline_atomic(sids)
+            items, commit = self._batch_offline_atomic(sids, now_ms)
         else:
-            items, commit = self._batch_offline_sequential(sids)
+            items, commit = self._batch_offline_sequential(sids, now_ms)
         if commit:
             result = _BATCH_COMMIT
         else:
@@ -5504,7 +5808,7 @@ class Sessions:
         if len(set(sids)) != len(sids):
             raise ValueError("sids must not contain duplicate sid")
 
-    def _batch_offline_sequential(self, sids):
+    def _batch_offline_sequential(self, sids, now_ms):
         """非原子逐项处理：现存项下线释址记“下线”，未知记“未知”，不影响后项。
 
         返回 (items, commit)：commit 恒为是否无未知项。
@@ -5518,13 +5822,15 @@ class Sessions:
                 commit = False
                 continue
             # 现存项（在线/挂起/下线墓碑）：置下线、期限 0 并释放地址租约。
+            # 计费停止（批量下线）在清场前结账；墓碑无活动账为空操作。
+            self._account_stop(sid, now_ms, _ACCOUNT_REASON_BATCH)
             session["state"] = _STATE_OFFLINE
             session["deadline"] = 0
             self._release(session)
             items.append({"会话": sid, "结果": _STATE_OFFLINE})
         return items, commit
 
-    def _batch_offline_atomic(self, sids):
+    def _batch_offline_atomic(self, sids, now_ms):
         """原子批量：基于老化后快照先查全部项。
 
         有未知项则不执行任何下线（保留老化结果），未知记“未知”、现存记
@@ -5539,10 +5845,12 @@ class Sessions:
                 for sid in sids
             ]
             return items, False
-        # 全部存在：逐项提交下线（置下线、期限 0、释放地址租约）。
+        # 全部存在：逐项提交下线（置下线、期限 0、释放地址租约）；计费停止
+        # （批量下线）在清场前按输入序结账。
         items = []
         for sid in sids:
             session = self._sessions[sid]
+            self._account_stop(sid, now_ms, _ACCOUNT_REASON_BATCH)
             session["state"] = _STATE_OFFLINE
             session["deadline"] = 0
             self._release(session)
@@ -5636,6 +5944,10 @@ class Sessions:
         total_count, per_user, per_template = self._active_counts()
         results = []
         created = []
+        # 计费：批内每成功一项即在其提交点开账（开始事件按输入序追加）；
+        # 原子批回滚时整批撤账（链截断至批前、删活动账），非原子只留实际
+        # 提交项。失败项与重放不产生事件或累计。
+        account_seq = len(self._account_events)
         all_ok = True
         for sid, user, password in items:
             try:
@@ -5653,6 +5965,7 @@ class Sessions:
                 all_ok = False
             else:
                 created.append(sid)
+                self._account_start(sid, now_ms)
                 total_count += 1
                 per_user[user] = per_user.get(user, 0) + 1
                 template_id = self._user_templates.get(user)
@@ -5662,9 +5975,15 @@ class Sessions:
 
         if atomic and not all_ok:
             # 整批回滚：摘除批内所建会话并释放其地址租约（静态址仅退租）；
-            # 老化、认证计数与退避保留。
+            # 老化、认证计数与退避保留。计费整批撤账：链截断至批前长度，
+            # 末哈希与活动账同步回退，不留开始事件或累计。
             for sid in created:
                 self._release(self._sessions.pop(sid))
+                self._account_active.pop(sid, None)
+            del self._account_events[account_seq:]
+            self._account_tail = (
+                self._account_events[-1][10] if self._account_events else "0" * 64
+            )
             for entry in results:
                 if entry["结果"] == _BATCH_ITEM_ONLINE:
                     entry["结果"] = _BATCH_ROLLBACK
@@ -8184,6 +8503,8 @@ class Sessions:
         if servable:
             self._commit_session(sid, user, pool_id, ip_int, now_ms)
             self._cap_event(now_ms, sid, _CAP_ONLINE, 0)
+            # 计费开始：申请立即服务成功即开账。
+            self._account_start(sid, now_ms)
             return self._render_capacity(sid, _CAP_ONLINE, now_ms, deadline)
 
         # 在线满（含挂起占位）或缺址：入队等待，队列本身达上限则按队满策略
@@ -8319,6 +8640,9 @@ class Sessions:
                 self._commit_session(queued_sid, user, pool_id, ip_int, now_ms)
                 promoted.append((queued_sid, order))
                 promoted_sids.add(queued_sid)
+                # 计费开始：晋升提交即开账，按尝试序追加，与后附的晋升
+                # capacity 事件同序。
+                self._account_start(queued_sid, now_ms)
                 del self._capacity_queue[queued_sid]
                 total_count += 1
                 per_user[user] = per_user.get(user, 0) + 1
@@ -10132,22 +10456,47 @@ class Sessions:
             raise ValueError("摘要 does not match the canonical runtime checkpoint")
         return now_ms, events, sessions, queued, quota_rows, summary
 
+    def _accounting_payload(self):
+        """组装计费检查点文档 dict（顶层键序：版本/事件/活动/尾哈希）。
+
+        事件为计费哈希链全量十一键行（序号升序）；活动按会话 Unicode 码点
+        升序，项键序“会话/累计字节/最近计费时刻”；尾哈希为链末哈希（空链
+        64 个 0）。纯渲染：不老化、不改态。
+        """
+        active_rows = [
+            {
+                "会话": sid,
+                "累计字节": self._account_active[sid][0],
+                "最近计费时刻": self._account_active[sid][2],
+            }
+            for sid in sorted(self._account_active)
+        ]
+        return {
+            "版本": 1,
+            "事件": [
+                self._account_event_dict(event) for event in self._account_events
+            ],
+            "活动": active_rows,
+            "尾哈希": self._account_tail,
+        }
+
     def _service_payload(self, now_ms, config_summary):
-        """组装跨域一致性检查点文档 dict（顶层键序：
-        版本/时刻/配置摘要/认证/运行态/故障/统计/摘要）。
+        """组装跨域一致性检查点文档 dict（v2 顶层键序：
+        版本/时刻/配置摘要/认证/运行态/故障/统计/计费/摘要）。
 
         各子对象直接取同一状态、同一时刻的规范域文档（认证 v2、运行态 v1、
-        故障 v1、统计 v1，均含各自摘要）；摘要为前七键紧凑 JSON（无 LF）
-        UTF-8 字节的 sha256 小写十六进制串。纯渲染：不老化、不改态。
+        故障 v1、统计 v1、计费 v1，均含各自摘要）；摘要为前八键紧凑 JSON
+        （无 LF）UTF-8 字节的 sha256 小写十六进制串。纯渲染：不老化、不改态。
         """
         doc = {
-            "版本": 1,
+            "版本": _SERVICE_VERSION,
             "时刻": now_ms,
             "配置摘要": config_summary,
             "认证": self._auth_payload(now_ms),
             "运行态": self._runtime_payload(now_ms),
             "故障": self._fault_payload(now_ms),
             "统计": self._stats_payload(),
+            "计费": self._accounting_payload(),
         }
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -10163,21 +10512,25 @@ class Sessions:
 
     def service_checkpoint(self, now_ms):
         """只读输出跨域一致性检查点的 LF 结尾基线 JSON，把认证（凭据限制
-        摘要）、会话与租约、容量队列及事件、QoS 账本、故障演练态与统计收进
-        同一份包；单次 O(N log N) 时间、O(N) 辅助空间（N 为用户、会话、排队
-        项、容量事件、账本、故障项、统计明细与配置项总数）。
+        摘要）、会话与租约、容量队列及事件、QoS 账本、故障演练态、统计与
+        会话计费链收进同一份包；单次 O(N log N) 时间、O(N) 辅助空间（N 为
+        用户、会话、排队项、容量/计费事件、账本、故障项、统计明细与配置项
+        总数）。
 
         先校验显式毫秒时钟（非 bool 非负 int：类型错 TypeError、取值错
         ValueError），且只执行一次既有老化（_age），随后从同一状态取得当前
         v10 配置的规范摘要与各域对象；除本次老化外只读：不认证、不计量、不
-        推进容量、不新增统计、不写任何审计链、不动各域幂等缓存，也不导出或
-        清空配置与配置历史。顶层键固定依次为
-        “版本/时刻/配置摘要/认证/运行态/故障/统计/摘要”，版本恒为 1；配置
-        摘要为当前 v10 配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写值；
+        推进容量、不新增统计、不写任何审计/计费事件、不动各域幂等缓存，也不
+        导出或清空配置与配置历史。顶层键固定依次为
+        “版本/时刻/配置摘要/认证/运行态/故障/统计/计费/摘要”，版本恒为 2；
+        配置摘要为当前 v10 配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写值；
         认证沿用同刻 auth_checkpoint 的版本 2 规范对象，运行态沿用同刻
         runtime_checkpoint 对象（容量时刻等于顶层时刻），故障沿用同刻
-        fault_checkpoint 对象，统计沿用 stats_checkpoint 对象；末摘要覆盖
-        前七键紧凑编码（无 LF）的 UTF-8 字节。同一状态与同一时刻逐字节相同。
+        fault_checkpoint 对象，统计沿用 stats_checkpoint 对象，计费为版本 1
+        对象（键序版本/事件/活动/尾哈希：事件为计费哈希链全量十一键行，活动
+        按会话升序列“会话/累计字节/最近计费时刻”，尾哈希为链末哈希，空链
+        64 个 0）；末摘要覆盖前八键紧凑编码（无 LF）的 UTF-8 字节。同一状态
+        与同一时刻逐字节相同。
         """
         _check_int("now_ms", now_ms, 0)
         # 唯一副作用：先老化一次；之后全部从同一老化后状态取快照。
@@ -10187,25 +10540,30 @@ class Sessions:
 
     def service_restore(self, key, text):
         """按跨域一致性检查点原子恢复认证、会话与租约、容量队列及事件、QoS
-        账本、故障演练态与统计，返回恢复后同格式规范检查点的 LF 结尾基线
-        JSON。
+        账本、故障演练态、统计与会话计费态，返回恢复后同格式规范检查点（版本
+        恒为 2）的 LF 结尾基线 JSON。
 
         key 沿凭据约束，text 须为 str：key 型/值错抛 TypeError/ValueError，
         text 非 str 抛 TypeError。在改变任何状态前完成全部校验：JSON、重键、
-        顶层键集/键序、版本、字段类型、排序、各层（认证/运行态/故障/统计及
-        容量事件链与状态哈希）摘要、统一时刻（认证、容量、故障时刻均须等于
-        顶层时刻）与跨域引用。非法 JSON、结构、值、排序、摘要或同 key 异参
-        抛 ValueError；目标当前配置摘要与包“配置摘要”不一致抛
+        顶层键集/键序、版本（接受 1 与 2：版本 1 无“计费”域，缺失计费态按空
+        处理；版本与键序形态不符即 ValueError）、字段类型、排序、各层
+        （认证/运行态/故障/统计及容量事件链与状态哈希）摘要、计费链结构与
+        哈希、统一时刻（认证、容量、故障时刻均须等于顶层时刻）与跨域引用。
+        非法 JSON、结构、版本、顺序、值、排序、计费链哈希/生命周期或摘要，或
+        同 key 异参抛 ValueError；目标当前配置摘要与包“配置摘要”不一致抛
         StateError("配置")；认证用户集合与当前认证器不同，或内容引用未注册
         用户、未知模板、未知地址池（含池址不承载、全局/单用户上限不足、令牌
-        超桶容）抛 ResourceError。若目标已有与包运行态摘要不同的会话、排队
-        项、容量事件或现存模板账本，抛 StateError("运行态")；目标运行态为空
-        或整体相同（全部四域摘要均相同）时，认证限制与凭据摘要、运行态、故障
-        态与统计整体替换；恢复后地址池租约由在租会话重建，必与会话一致。
+        超桶容、计费事件引用未知地址池或未知会话）抛 ResourceError。若目标
+        已有与包计费态不同的非空计费链或活动账，抛 StateError("计费")；若目标
+        已有与包运行态摘要不同的会话、排队项、容量事件或现存模板账本，抛
+        StateError("运行态")；目标各域为空或整体相同（全部五域摘要均相同）时，
+        认证限制与凭据摘要、运行态、故障态、统计与计费态整体替换；恢复后地址
+        池租约由在租会话重建，必与会话一致。版本 1 包恢复后，其遗留在线会话
+        无开始事件：后续 meter/accounting_interim 惰性建账，不补开始事件。
 
         不导入或清空配置与配置历史，不恢复主审计链、批量审计链、合规链及既有
-        各域幂等缓存，也不为生成、恢复或重放追加任何审计事件；不触发认证、
-        计量、容量推进或新的统计。任何失败都不改变状态、不占用幂等 key；成功
+        各域幂等缓存，也不为生成、恢复或重放追加任何审计/计费事件；不触发认证、
+        计量、容量推进或新的统计。任何失败都不改变任何域、不占用幂等 key；成功
         缓存首次规范包，同 key 同型同 text 重放不解析、不重验、不替换、原样
         返回缓存字节且不产生修改，异参（含异型）抛 ValueError。单次
         O(N log N) 时间、O(N) 辅助空间。
@@ -10237,6 +10595,8 @@ class Sessions:
         (
             stats_summary, total, success, fail_rows, user_rows, template_rows
         ) = parsed["stats"]
+        account_events, active_rows, account_refs = parsed["accounting"]
+        account_unknown_sids, _account_pool_refs = account_refs
 
         # 配置先于一切：目标当前 v10 配置摘要须与包一致，否则 StateError。
         if self._config_summary() != config_summary:
@@ -10291,6 +10651,35 @@ class Sessions:
                 raise ResourceError(
                     f"service checkpoint references unregistered user: {ident!r}"
                 )
+        # 计费引用（仅 v2）：事件或活动行引用未知会话，或事件引用未知地址池。
+        for sid in account_unknown_sids:
+            raise ResourceError(
+                f"service checkpoint accounting references unknown session: {sid!r}"
+            )
+        for pool_id in _account_pool_refs:
+            if pool_id not in self._pools:
+                raise ResourceError(
+                    f"service checkpoint accounting references unknown pool: "
+                    f"{pool_id!r}"
+                )
+
+        # 计费覆盖判定：包计费态（v1 缺失按空）与目标当前计费态不同，且目标
+        # 已有非空计费链或活动账时，拒绝整体替换。
+        package_accounting = {
+            "版本": 1,
+            "事件": [
+                self._account_event_dict(event) for event in account_events
+            ],
+            "活动": [
+                {"会话": sid, "累计字节": total, "最近计费时刻": last_account}
+                for sid, total, last_account in active_rows
+            ],
+            "尾哈希": account_events[-1][10] if account_events else "0" * 64,
+        }
+        if self._accounting_payload() != package_accounting and (
+            self._account_events or self._account_active
+        ):
+            raise StateError("计费")
 
         # 运行态覆盖判定：同摘要为空操作轨迹；否则目标运行态（会话、队项、事件
         # 或现存模板账本）必须为空，才允许整体替换。
@@ -10390,23 +10779,267 @@ class Sessions:
             ident: [p, d, o, byt] for ident, p, d, o, byt in template_rows
         }
 
+        # 计费（v1 包按空计费态；v2 包取链与活动行）：链整体替换，活动账用户
+        # 以恢复后的会话归属为准（结构校验已保证与事件用户一致）。
+        self._account_events = list(account_events)
+        self._account_tail = (
+            account_events[-1][10] if account_events else "0" * 64
+        )
+        self._account_active = {
+            sid: [total, self._sessions[sid]["user"], last_account]
+            for sid, total, last_account in active_rows
+        }
+
         result = self._service_checkpoint_text(now_ms, config_summary)
         self._service_restore_cache[key] = (text, result)
         return result
+
+    def _parse_accounting_section(self, raw, sessions, non_offline_sids):
+        """解析并全量校验 service v2 的“计费”子对象，返回
+        (事件十一元组列表, 活动行 (sid, 累计, 最近时刻) 列表, 引用集合,
+        规范计费 dict)；引用集合为 (未知会话 sid 集合, 引用地址池集合)。
+
+        结构、键序、类型、取值、排序、重复、链序号衔接、逐项哈希或 sid 生命
+        周期非法均抛 ValueError；事件或活动行引用运行态会话行之外的 sid 由
+        调用方按实例现状判 ResourceError。旧版本恢复后无开始事件的遗留在线
+        会话可仅有中间事件（甚至无事件、只在活动行携累计），故中间允许为某
+        sid 首条事件，活动行允许是运行态非下线会话集的子集；在链 sid 的活动
+        行须与链重放值逐字段一致。
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("计费 must be an object")
+        if list(raw) != ["版本", "事件", "活动", "尾哈希"]:
+            raise ValueError(
+                "计费 keys must be 版本/事件/活动/尾哈希 in order"
+            )
+        version = raw["版本"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(f"计费.版本 must be an int, got {type(version).__name__}")
+        if version != 1:
+            raise ValueError(f"计费.版本 must be 1, got {version}")
+        tail_hash = self._cp_hex64(raw["尾哈希"], "计费.尾哈希")
+        events_raw = raw["事件"]
+        active_raw = raw["活动"]
+        if not isinstance(events_raw, list):
+            raise ValueError("计费.事件 must be a list")
+        if not isinstance(active_raw, list):
+            raise ValueError("计费.活动 must be a list")
+
+        event_keys = [
+            "序号", "类型", "时刻", "会话", "用户", "地址池", "地址",
+            "累计字节", "原因", "前哈希", "哈希",
+        ]
+        # 沿链重放每 sid 生命周期：None=链中未见（遗留账），
+        # [累计, 最近时刻]=在账，False=已停止。
+        lifecycle = {}
+        events = []
+        referenced_pools = set()
+        unknown_sids = set()
+        prev_hash = "0" * 64
+        for expect, item in enumerate(events_raw, start=1):
+            if not isinstance(item, dict) or list(item) != event_keys:
+                raise ValueError(
+                    "计费.事件 item keys must be "
+                    "序号/类型/时刻/会话/用户/地址池/地址/累计字节/原因/"
+                    "前哈希/哈希 in order"
+                )
+            seq = self._cp_int(item["序号"], "计费.事件.序号", 1)
+            kind = item["类型"]
+            if not isinstance(kind, str) or kind not in _ACCOUNT_TYPES:
+                raise ValueError(
+                    f"计费.事件.类型 must be one of {_ACCOUNT_TYPES}, "
+                    f"got {kind!r}"
+                )
+            ev_now = self._cp_int(item["时刻"], "计费.事件.时刻", 0)
+            sid = self._cp_str(item["会话"], "计费.事件.会话")
+            user = self._cp_str(item["用户"], "计费.事件.用户")
+            pool_id = self._cp_plain_str(item["地址池"], "计费.事件.地址池")
+            address = self._cp_plain_str(item["地址"], "计费.事件.地址")
+            total = self._cp_int(item["累计字节"], "计费.事件.累计字节", 0)
+            reason = item["原因"]
+            if not isinstance(reason, str):
+                raise ValueError("计费.事件.原因 must be a str")
+            stored_prev = self._cp_hex64(item["前哈希"], "计费.事件.前哈希")
+            digest = self._cp_hex64(item["哈希"], "计费.事件.哈希")
+
+            if seq != expect:
+                raise ValueError(
+                    f"计费 event seq must be contiguous: want {expect}, got {seq}"
+                )
+            if stored_prev != prev_hash:
+                raise ValueError("计费 event 前哈希 does not link to previous event")
+            recomputed = self._account_hash(
+                seq, kind, ev_now, sid, user, pool_id, address, total, reason,
+                stored_prev,
+            )
+            if recomputed != digest:
+                raise ValueError(f"计费 event {seq} hash mismatch")
+
+            # 池址成对；非空池登记引用（存在性由调用方判），地址须规范 IPv4。
+            if (pool_id == "") != (address == ""):
+                raise ValueError(
+                    "计费.事件 地址池 and 地址 must be both empty or both set"
+                )
+            if pool_id != "":
+                _check_ip("计费.事件.地址", address)
+                referenced_pools.add(pool_id)
+
+            # 引用会话：sid 不在运行态会话行内记未知（调用方判 ResourceError）；
+            # 在册则用户须与其会话归属一致。
+            session_row = sessions.get(sid)
+            if session_row is None:
+                unknown_sids.add(sid)
+            elif user != session_row["用户"]:
+                raise ValueError(
+                    f"计费 event user {user!r} does not match session owner "
+                    f"{session_row['用户']!r} for {sid!r}"
+                )
+
+            state = lifecycle.get(sid)
+            if kind == _ACCOUNT_START:
+                if reason != "":
+                    raise ValueError("开始 event 原因 must be empty")
+                if total != 0:
+                    raise ValueError("开始 event 累计字节 must be 0")
+                if state is not None:
+                    raise ValueError(
+                        f"计费 开始 for {sid!r} must be its first event"
+                    )
+                lifecycle[sid] = [0, ev_now]
+            elif kind == _ACCOUNT_INTERIM:
+                if reason != "":
+                    raise ValueError("中间 event 原因 must be empty")
+                if state is False:
+                    raise ValueError(f"计费 中间 for {sid!r} after 停止")
+                if isinstance(state, list):
+                    if total < state[0]:
+                        raise ValueError(
+                            f"计费 中间 累计字节 for {sid!r} decreased"
+                        )
+                    if ev_now < state[1]:
+                        raise ValueError(
+                            f"计费 中间 时刻 for {sid!r} before its last "
+                            "accounting time"
+                        )
+                    state[0] = total
+                    state[1] = ev_now
+                else:
+                    # 遗留账（旧版本恢复的会话无开始事件）：中间可为首条。
+                    lifecycle[sid] = [total, ev_now]
+            else:
+                if reason not in _ACCOUNT_STOP_REASONS:
+                    raise ValueError(
+                        f"停止 event 原因 must be one of {_ACCOUNT_STOP_REASONS}, "
+                        f"got {reason!r}"
+                    )
+                if state is False:
+                    raise ValueError(f"重复停止 event for {sid!r}")
+                if isinstance(state, list):
+                    if total < state[0]:
+                        raise ValueError(
+                            f"计费 停止 累计字节 for {sid!r} below last interim total"
+                        )
+                # 链中未见（遗留账，旧版本恢复的会话无开始/中间事件）：停止
+                # 可为首条事件，累计仅须非负。
+                lifecycle[sid] = False
+            events.append(
+                (seq, kind, ev_now, sid, user, pool_id, address, total, reason,
+                 stored_prev, digest)
+            )
+            prev_hash = digest
+
+        if (events[-1][10] if events else "0" * 64) != tail_hash:
+            raise ValueError("计费.尾哈希 does not match the last event hash")
+
+        # 活动行：键序、类型、取值、按会话升序互异；在链 sid 与链重放态核对，
+        # 不在运行态非下线会话集的 sid 记未知（调用方判 ResourceError）。
+        active_rows = []
+        active_sids = set()
+        last_sid = None
+        active_keys = ["会话", "累计字节", "最近计费时刻"]
+        for item in active_raw:
+            if not isinstance(item, dict) or list(item) != active_keys:
+                raise ValueError(
+                    "计费.活动 item keys must be 会话/累计字节/最近计费时刻 in order"
+                )
+            sid = self._cp_str(item["会话"], "计费.活动.会话")
+            total = self._cp_int(item["累计字节"], "计费.活动.累计字节", 0)
+            last_account = self._cp_int(
+                item["最近计费时刻"], "计费.活动.最近计费时刻", 0
+            )
+            if sid in active_sids:
+                raise ValueError(f"duplicate active account: {sid!r}")
+            if last_sid is not None and sid <= last_sid:
+                raise ValueError("计费.活动 rows must be sorted by 会话 ascending")
+            last_sid = sid
+            active_sids.add(sid)
+            active_rows.append((sid, total, last_account))
+
+        for sid, total, last_account in active_rows:
+            if sid in non_offline_sids:
+                state = lifecycle.get(sid)
+                if state is False:
+                    raise ValueError(f"计费.活动 lists stopped session: {sid!r}")
+                if isinstance(state, list):
+                    # 链仅在开始/中间/停止处留痕，meter 通过字节不产生事件，
+                    # 故活动账允许较链末值增长（累计）或推进（最近时刻），但
+                    # 不得回退。
+                    if total < state[0] or last_account < state[1]:
+                        raise ValueError(
+                            f"计费.活动 totals for {sid!r} regress from the chain"
+                        )
+                # 链中未见的遗留账：累计/时刻仅须非负（cp_int 已保证）。
+            elif sid in sessions:
+                # 运行态中为下线墓碑却在活动账：结构矛盾。
+                raise ValueError(
+                    f"计费.活动 lists offline session: {sid!r}"
+                )
+            else:
+                # 完全未知会话引用，交由调用方判 ResourceError。
+                unknown_sids.add(sid)
+
+        # 链生命周期与运行态会话状态须一致：在账（开始/中间后无停止）会话在
+        # 运行态中必为非下线；已停止会话在运行态中必为下线墓碑。
+        for sid, state in lifecycle.items():
+            if sid in unknown_sids:
+                continue
+            if isinstance(state, list) and sid not in non_offline_sids:
+                raise ValueError(
+                    f"计费 chain leaves {sid!r} active but runtime session is "
+                    "offline"
+                )
+            if state is False and sid in non_offline_sids:
+                raise ValueError(
+                    f"计费 chain stops {sid!r} but runtime session is not offline"
+                )
+
+        canon_accounting = {
+            "版本": 1,
+            "事件": [self._account_event_dict(event) for event in events],
+            "活动": [
+                {"会话": sid, "累计字节": total, "最近计费时刻": last_account}
+                for sid, total, last_account in active_rows
+            ],
+            "尾哈希": events[-1][10] if events else "0" * 64,
+        }
+        return events, active_rows, (unknown_sids, referenced_pools), canon_accounting
 
     def _parse_service_checkpoint(self, text):
         """解析并全量校验跨域一致性检查点文本，返回含各域规范化行的 dict；
         任何文本非法均抛 ValueError。
 
-        顶层须恰含“版本/时刻/配置摘要/认证/运行态/故障/统计/摘要”且键序
-        如此；版本为 1，时刻为非 bool 非负 int，配置摘要与末摘要为 64 位小写
-        十六进制串。四个子对象分别重编码后沿用
+        接受版本 1（无“计费”域，计费态按空处理）与版本 2（统计后、摘要前
+        含“计费”域）。顶层键序分别为
+        “版本/时刻/配置摘要/认证/运行态/故障/统计/摘要”与
+        “版本/时刻/配置摘要/认证/运行态/故障/统计/计费/摘要”；版本为 1/2，
+        时刻为非 bool 非负 int，配置摘要与末摘要为 64 位小写十六进制串。
+        四个子对象分别重编码后沿用
         _parse_auth_checkpoint/_parse_runtime_checkpoint/
         _parse_fault_checkpoint/_parse_stats_checkpoint 全量校验（嵌套重键、
         键序、结构、类型、取值、排序、链、状态哈希与各层摘要），且认证、容量
         （运行态）与故障的时刻须统一等于顶层时刻；嵌入认证对象须为版本 2 规范
         形态（版本 1 不予接受）。各子对象原文重编码须与其规范形态逐字节一致，
-        末摘要须为用规范子对象重建的前七键紧凑 JSON（无 LF）UTF-8 字节的
+        末摘要须为用同版本规范子对象重建的紧凑 JSON（无 LF）UTF-8 字节的
         sha256 小写值（与原文排版无关）。仅做结构自洽与同刻校验；配置摘要、
         用户集合与各域引用由调用方按实例现状判定（StateError/ResourceError）。
         """
@@ -10416,24 +11049,40 @@ class Sessions:
             raise ValueError(f"service checkpoint is not valid JSON: {exc}") from exc
         if not isinstance(doc, dict):
             raise ValueError("service checkpoint top level must be an object")
-        if list(doc) != [
+        v1_keys = [
             "版本", "时刻", "配置摘要", "认证", "运行态", "故障", "统计", "摘要"
-        ]:
+        ]
+        v2_keys = [
+            "版本", "时刻", "配置摘要", "认证", "运行态", "故障", "统计",
+            "计费", "摘要",
+        ]
+        top_keys = list(doc)
+        if top_keys == v1_keys:
+            version = 1
+        elif top_keys == v2_keys:
+            version = 2
+        else:
             raise ValueError(
                 "service checkpoint top-level keys must be "
-                "版本/时刻/配置摘要/认证/运行态/故障/统计/摘要 in order"
+                "版本/时刻/配置摘要/认证/运行态/故障/统计/[计费/]摘要 in order"
             )
-        version = doc["版本"]
-        if isinstance(version, bool) or not isinstance(version, int):
-            raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-        if version != 1:
-            raise ValueError(f"版本 must be 1, got {version}")
+        version_value = doc["版本"]
+        if isinstance(version_value, bool) or not isinstance(version_value, int):
+            raise ValueError(
+                f"版本 must be an int, got {type(version_value).__name__}"
+            )
+        if version_value != version:
+            raise ValueError(
+                f"版本 {version_value} does not match its top-level shape"
+            )
         now_ms = self._cp_int(doc["时刻"], "时刻", 0)
         config_summary = self._cp_hex64(doc["配置摘要"], "配置摘要")
         top_summary = self._cp_hex64(doc["摘要"], "摘要")
         for name in ("认证", "运行态", "故障", "统计"):
             if not isinstance(doc[name], dict):
                 raise ValueError(f"{name} must be an object")
+        if version == 2 and not isinstance(doc["计费"], dict):
+            raise ValueError("计费 must be an object")
 
         def recode(sub):
             return json.dumps(sub, ensure_ascii=False, separators=(",", ":"))
@@ -10581,9 +11230,34 @@ class Sessions:
         if recode(raw_stats) != recode(canon_stats):
             raise ValueError("统计 must be a canonical stats checkpoint object")
 
-        # 末摘要：用规范子对象重建前七键。
+        # 计费：版本 2 必有“计费”域，版本 1 缺失按空计费态处理。
+        sessions_by_sid = {row["会话"]: row for row in sessions}
+        non_offline_sids = {
+            row["会话"]
+            for row in sessions
+            if row["状态"] != _STATE_OFFLINE
+        }
+        if version == 2:
+            (
+                account_events,
+                active_rows,
+                account_refs,
+                canon_accounting,
+            ) = self._parse_accounting_section(
+                doc["计费"], sessions_by_sid, non_offline_sids
+            )
+            if recode(doc["计费"]) != recode(canon_accounting):
+                raise ValueError(
+                    "计费 must be a canonical accounting checkpoint object"
+                )
+        else:
+            account_events = []
+            active_rows = []
+            account_refs = (set(), set())
+
+        # 末摘要：用同版本规范子对象重建顶层。
         canonical_top = {
-            "版本": 1,
+            "版本": version,
             "时刻": now_ms,
             "配置摘要": config_summary,
             "认证": canon_auth,
@@ -10591,12 +11265,15 @@ class Sessions:
             "故障": canon_fault,
             "统计": canon_stats,
         }
+        if version == 2:
+            canonical_top["计费"] = canon_accounting
         if hashlib.sha256(
             recode(canonical_top).encode("utf-8")
         ).hexdigest() != top_summary:
             raise ValueError("摘要 does not match the canonical service checkpoint")
 
         return {
+            "version": version,
             "now": now_ms,
             "config_summary": config_summary,
             "auth": (auth_summary, auth_rows),
@@ -10609,6 +11286,7 @@ class Sessions:
                 stats_summary, total, success, fail_rows, user_rows,
                 template_rows,
             ),
+            "accounting": (account_events, active_rows, account_refs),
         }
 
     @staticmethod
@@ -12975,11 +13653,15 @@ class Sessions:
                 # 仅改会话项与池租约值、不动会话表键，遍历中修改安全；O(S+Q)
                 # 时间、O(1) 辅助空间。下线墓碑不重复下线。
                 offline = 0
-                for session in self._sessions.values():
+                for force_sid, session in self._sessions.items():
                     if (
                         session["user"] == user
                         and session["state"] != _STATE_OFFLINE
                     ):
+                        # 计费停止（停用）须在清场前结账，按会话表迭代序。
+                        self._account_stop(
+                            force_sid, now_ms, _ACCOUNT_REASON_DISABLE
+                        )
                         session["state"] = _STATE_OFFLINE
                         session["deadline"] = 0
                         self._release(session)
