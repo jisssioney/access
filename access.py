@@ -30,7 +30,7 @@
   检查点（版本 2，顶层依次版本/时刻/配置摘要/认证/运行态/故障/统计/计费/
   摘要，末摘要盖前八键 UTF-8 字节；“计费”域为版本 1，含计费哈希链、按会话
   升序的活动会话累计与最近计费时刻及链尾哈希）：生成先验显式毫秒时钟再只
-  老化一次，随后从同一状态取当前 v10 配置规范摘要与认证（v2）、运行态
+  老化一次，随后从同一状态取当前 v11 配置规范摘要与认证（v2）、运行态
   （v1）、故障（v1）、统计（v1）、计费（v1）规范对象，除该次老化外只读、
   逐字节确定；恢复接受版本 1（无计费域，缺失计费态按空）与版本 2，在改任何
   状态前完成重键、键序、版本、类型、排序、各层摘要、计费链结构/顺序/哈希、
@@ -623,6 +623,75 @@ def _parse_config_templates(doc, version):
     return tuple(templates), tuple(user_templates)
 
 
+def _parse_config_template_pools(doc, pool_specs, templates):
+    """校验 v11 的模板地址池节，返回按模板标识升序的 (模板, 池序列) 元组。
+
+    每项为二元数组 [模板标识, [池标识, ...]]：模板标识与各池标识均为 str，
+    同一模板至多出现一次，模板与池都必须已定义，池序列长度 1..32 且池标识
+    互异（保持给出的优先顺序）；整节按模板标识 Unicode 升序。结构、类型、
+    数量、排序、重复或引用错误均抛 ValueError。
+    """
+    raw = doc["模板地址池"]
+    if not isinstance(raw, list):
+        raise ValueError(f"模板地址池 must be a list, got {type(raw).__name__}")
+    pool_ids = {pool_id for pool_id, *_rest in pool_specs}
+    template_ids = {template_id for template_id, *_rest in templates}
+    entries = []
+    seen = set()
+    for item in raw:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], list)
+        ):
+            raise ValueError(
+                "模板地址池 entries must be [template id, [pool id, ...]] lists"
+            )
+        template_id, pool_seq = item
+        try:
+            _check_credential("template id", template_id)
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
+        if template_id in seen:
+            raise ValueError(
+                f"duplicate template pool entry for template: {template_id!r}"
+            )
+        seen.add(template_id)
+        if template_id not in template_ids:
+            raise ValueError(f"unknown template id: {template_id!r}")
+        if not (1 <= len(pool_seq) <= _MAX_TEMPLATE_POOLS):
+            raise ValueError(
+                f"template pool sequence must contain 1..{_MAX_TEMPLATE_POOLS} "
+                f"pool ids, got {len(pool_seq)} for template {template_id!r}"
+            )
+        seq = []
+        seq_seen = set()
+        for pool_id in pool_seq:
+            if not isinstance(pool_id, str):
+                raise ValueError(
+                    f"template pool id must be a str, got {type(pool_id).__name__}"
+                )
+            try:
+                _check_credential("pool id", pool_id)
+            except TypeError as exc:
+                raise ValueError(str(exc)) from exc
+            if pool_id in seq_seen:
+                raise ValueError(
+                    f"duplicate pool id {pool_id!r} in sequence for template "
+                    f"{template_id!r}"
+                )
+            seq_seen.add(pool_id)
+            if pool_id not in pool_ids:
+                raise ValueError(f"unknown pool id: {pool_id!r}")
+            seq.append(pool_id)
+        entries.append((template_id, tuple(seq)))
+    template_ids_in_order = [template_id for template_id, _seq in entries]
+    if template_ids_in_order != sorted(template_ids_in_order):
+        raise ValueError("模板地址池 entries must be sorted by template id")
+    return tuple(entries)
+
+
 def _parse_config_capacity(doc, version):
     """校验容量节，返回 (队列上限, 最大等待毫秒, 队满策略)。
 
@@ -741,11 +810,13 @@ def _parse_config_doc(doc, default_auth=None):
     """由已解析对象文档校验并迁移为规范化 spec；任何错均抛 ValueError。
 
     spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
-    capacity, auth)，capacity 为 (队列上限, 最大等待毫秒, 队满策略)，auth 为
+    capacity, auth, template_pools)，capacity 为 (队列上限, 最大等待毫秒,
+    队满策略)，auth 为
     (最大失败, 锁定毫秒, 重试基数毫秒, 重试上限毫秒)；pools 为按标识升序的 (标识, cidr, reserved,
     static) 元组，reserved/static 已规范化排序；templates 为按标识升序的
     (标识, 限速, 突发, 配额, 周期毫秒, 会话上限, 排队优先级, 超限) 元组，
-    user_templates 为按用户升序的 (user, 标识) 元组。v1（版本=1）地址池为
+    user_templates 为按用户升序的 (user, 标识) 元组，template_pools 为按模板
+    标识升序的 (模板, 1..32 互异池标识优先序列) 元组。v1（版本=1）地址池为
     无标识单池对象，迁移为 default 池；v2（版本=2）地址池为池对象列表；
     v3（版本=3）增模板与用户模板；v4（版本=4）增容量背压（队列上限/最大
     等待毫秒）；v5（版本=5）增认证策略（最大失败/锁定毫秒）；v6（版本=6）
@@ -767,9 +838,18 @@ def _parse_config_doc(doc, default_auth=None):
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
-        raise ValueError(f"版本 must be 1..10, got {version}")
-    if version in (5, 6, 7, 8, 9, 10):
+    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+        raise ValueError(f"版本 must be 1..11, got {version}")
+    if version == 11:
+        if set(doc) != {
+            "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证",
+            "模板地址池",
+        }:
+            raise ValueError(
+                "config keys must be exactly "
+                "版本/会话/地址池/模板/用户模板/容量/认证/模板地址池"
+            )
+    elif version in (5, 6, 7, 8, 9, 10):
         if set(doc) != {
             "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"
         }:
@@ -852,10 +932,17 @@ def _parse_config_doc(doc, default_auth=None):
         auth = _parse_config_auth(doc, version)
     else:
         # v1-v4 迁移：认证补认证器当前两值；无默认（如升级包内嵌配置须为
-        # v8 规范形态）时拒绝。
+        # v11 规范形态）时拒绝。
         if default_auth is None:
             raise ValueError(f"config version must be {_CONFIG_VERSION}")
         auth = default_auth
+    if version >= 11:
+        template_pools = _parse_config_template_pools(
+            doc, pool_specs, templates
+        )
+    else:
+        # v1-v10 迁移：模板地址池列表为空，未列出的模板继续沿用 default 池。
+        template_pools = ()
     return (
         numbers["总数"],
         numbers["每用户"],
@@ -866,11 +953,12 @@ def _parse_config_doc(doc, default_auth=None):
         user_templates,
         capacity,
         auth,
+        template_pools,
     )
 
 
 def _config_payload(spec):
-    """由规范化 spec 构建 export/升级共用的 v10 配置 payload（固定键序与排序）。"""
+    """由规范化 spec 构建 export/升级共用的 v11 配置 payload（固定键序与排序）。"""
     (
         total,
         per,
@@ -881,6 +969,7 @@ def _config_payload(spec):
         user_templates,
         (queue_limit, max_wait_ms, queue_policy),
         (max_fail, lock_ms, retry_base_ms, retry_cap_ms),
+        template_pools,
     ) = spec
     pools = [
         {
@@ -929,11 +1018,15 @@ def _config_payload(spec):
             "重试基数毫秒": retry_base_ms,
             "重试上限毫秒": retry_cap_ms,
         },
+        "模板地址池": [
+            [template_id, list(pool_seq)]
+            for template_id, pool_seq in template_pools
+        ],
     }
 
 
 def _compact_config(spec):
-    """spec 的 v10 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
+    """spec 的 v11 配置紧凑 JSON 串（无尾 LF），export_config 与升级包共用。"""
     return json.dumps(
         _config_payload(spec), ensure_ascii=False, separators=(",", ":")
     )
@@ -958,8 +1051,8 @@ def _parse_upgrade_envelope(doc):
     """严格复核升级包对象，返回 (源版本, 目标版本, 改变, 摘要, spec)。
 
     文档须恰含“源版本/目标版本/改变/摘要/配置”五键（键序亦须如此），
-    源版本为 1..10 的非 bool int、目标版本恒为 10、改变为 bool 且等于
-    源版本 != 10、摘要为 str；配置须为能解析出 v10 spec 的对象，再将其
+    源版本为 1..11 的非 bool int、目标版本恒为 11、改变为 bool 且等于
+    源版本 != 11、摘要为 str；配置须为能解析出 v11 spec 的对象，再将其
     规范化重编码与文档原编码逐字节比对（拒键序/形态/值偏差），摘要须为
     规范配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写十六进制。任何不符
     均抛 ValueError。
@@ -984,8 +1077,8 @@ def _parse_upgrade_envelope(doc):
     summary = doc["摘要"]
     if isinstance(source, bool) or not isinstance(source, int):
         raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
-    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
-        raise ValueError(f"源版本 must be 1..10, got {source}")
+    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+        raise ValueError(f"源版本 must be 1..11, got {source}")
     if isinstance(target, bool) or not isinstance(target, int):
         raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
     if target != _CONFIG_VERSION:
@@ -1007,7 +1100,7 @@ def _parse_upgrade_envelope(doc):
     # 配置自 JSON 解析而来，再编码必成功；键序/排序/值偏差令两串不一致。
     original = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     if original != canonical:
-        raise ValueError("配置 must be a canonical v10 config object")
+        raise ValueError("配置 must be a canonical v11 config object")
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if summary != digest:
         raise ValueError("摘要 does not match the canonical config digest")
@@ -1240,7 +1333,9 @@ _MAX_TEMPLATE_SESSIONS = 10000
 _MAX_QUEUE_PRIORITY = 100
 # 有效优先级上界：min(1000, 基础 + 等待秒数)。
 _MAX_EFFECTIVE_PRIORITY = 1000
-_CONFIG_VERSION = 10
+_CONFIG_VERSION = 11
+# v11 模板地址池：每个模板的有序候选池序列长度 1..32。
+_MAX_TEMPLATE_POOLS = 32
 # 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
 # 最旧项，当前修订永不淘汰。
 _CONFIG_HISTORY_LIMIT = 256
@@ -1486,35 +1581,39 @@ class Sessions:
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
     AuthError/ResourceError/StateError/KeyError）及同参重放另记入防篡改
     审计链：逐事件 sha256 链接前项哈希，audit 查询、verify_audit 校验，
-    参数错与异参 key 重放不入链。export_config 导出 v10 配置 JSON（顶层键序
-    版本/会话/地址池/模板/用户模板/容量/认证；会话与地址池沿用 v2，模板按
+    参数错与异参 key 重放不入链。export_config 导出 v11 配置 JSON（顶层键序
+    版本/会话/地址池/模板/用户模板/容量/认证/模板地址池；会话与地址池沿用 v2，模板按
     标识升序、项键序标识/限速/突发/配额/周期毫秒/会话上限/排队优先级/超限
     （周期毫秒为非 bool 非负 int、0 不重置，会话上限 0 不限并发占用，占用为
     绑定模板用户的在线加挂起会话数，排队优先级为非 bool int 0..100）、用户
     模板按用户升序、容量为队列上限/最大等待毫秒/队满策略（策略 str 仅
     “拒绝/替换”）、认证为最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒，重试
-    两项同时为 0 或同时为正、上限不小于基数）；
+    两项同时为 0 或同时为正、上限不小于基数；模板地址池为按模板标识升序的
+    二元数组列表，项为 (模板, 1..32 个互异且已定义池标识的优先序列)，同模板
+    至多一项，未列模板与未绑定用户沿用 default 池）；
     upgrade_config(text,
-    target=10) 只读地把 v1..v10 配置升级为 v10 升级包 JSON（LF 尾紧凑；顶层
+    target=11) 只读地把 v1..v11 配置升级为 v11 升级包 JSON（LF 尾紧凑；顶层
     序/型源版本:int/目标版本:int/改变:bool/摘要:str/配置:object，改变=源版本
-    !=10，配置同 export_config 的 v10，摘要为配置紧凑编码 UTF-8 字节的
+    !=11，配置同 export_config 的 v11，摘要为配置紧凑编码 UTF-8 字节的
     sha256 小写值），text 非 str 或 target 非非 bool int 抛 TypeError，
-    target 只许 10，源版本限 1..10，解析、重键、键缺失/未知、结构/值/引用/
+    target 只许 11，源版本限 1..11，解析、重键、键缺失/未知、结构/值/引用/
     版本非法抛 ValueError，
     迁移沿 load_config 既有规则（v1 单池改 default、v1/v2 补空模板与用户模板、
     v1-v3 补容量 1024/0/拒绝、v1-v4 以认证器当前四值补认证、v1-v5 模板会话上限
     补 0、v1-v6 模板周期毫秒补 0、v1-v7 模板排队优先级补 0、v1-v8 容量队满
-    策略补“拒绝”、v1-v9 重试两项补 0、v10 只规范化），
+    策略补“拒绝”、v1-v9 重试两项补 0、v1-v10 模板地址池补空列表、v11 只
+    规范化），
     升级不改任何实例状态；
     load_config
-    直载 v1..v10 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
+    直载 v1..v11 配置或经严格复核（键序、字段、配置规范形态、摘要）的升级包，
     全验后原子替换并保存旧配置为唯一回滚点，升级包复核不符抛 ValueError，
-    引用错（用户模板引用未知用户或未知模板标识）抛 ValueError，上限、模板
+    引用错（用户模板引用未知用户或未知模板标识、模板地址池引用未知模板或
+    池）抛 ValueError，上限、模板
     占用、租约或队长承载不满足抛 ResourceError，失败不改配置、回滚点、会话、
     租约与运行态，
     提交替换认证策略但保留认证记录（凭据、失败计数、锁定与下次可试时刻，策略
     切换不重算）；
-    rollback_config 经同样校验恢复旧配置（含认证策略）并清除回滚点，无回滚点
+    rollback_config 经同样校验恢复旧配置（含认证策略与模板地址池）并清除回滚点，无回滚点
     抛 StateError。
     配置修订历史保留最近 256 个修订：构造态为修订 0，load_config/
     rollback_config/config_cas 及历史回退首次成功后生成并保存提交态新修订，
@@ -1540,8 +1639,9 @@ class Sessions:
     after!=-1 且该修订未保留抛 KeyError(after)；返回修订 > after 的升序前
     limit 项，顶层为“下个修订:int、项目:list”，无项下个修订=after，查询
     O(limit) 时空。
-    export/load/rollback 成功均返回 v10 配置 JSON，会话状态、期限、地址、租期与
-    旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续操作与查询。
+    export/load/rollback 成功均返回 v11 配置 JSON，会话状态、期限、地址、租期与
+    旧队项的等待/截止/入队序不受配置替换影响，新配置仅作用于后续自动选池、
+    尚未晋升的队项与后续查询；现有在线或挂起会话保留原池、地址与租期。
     qos(sid) 以 O(1) 返回
     在线会话用户所绑 QoS 模板的生效值。meter(key, sid, size, now_ms) 按
     会话用户所绑模板做令牌桶加配额计量，计量态为 (用户, 模板) 共享账本
@@ -1558,8 +1658,16 @@ class Sessions:
     结果为通过/拒绝/下线时按当时会话用户与当次模板标识各记一次统计
     （通过另计字节），配置热加载或回滚不迁移历史计数；meter_stats
     (now_ms, group) 老化后按用户或查询时生效绑定（未绑定归空串）汇总
-    历史计数与当前在线数。capacity(key, op, sid, args, now_ms) 在既有
-    认证、老化、上限与 default 池取址规则之上提供容量背压等待队列（队列
+    历史计数与当前在线数。v11 模板地址池驱动建立会话、批量上线、容量立即
+    建立、队列推进、容量预测与热均衡预演的统一有序选池：配置了池序列的绑定
+    用户按序检查候选池（至多 32 个），其他用户只检查 default；候选池处于
+    有效耗尽故障、没有动态地址，或该用户的专属静态地址正被占用时继续检查
+    下一池，首个可取址的池仍优先返回其静态址、否则数值最小动态址；全部不可
+    用时直接建立与批量项目得 ResourceError，允许等待的容量申请按既有规则
+    入队，推进时仍不可取址则保留队项且不阻挡后续可晋升项；选择与分配原子
+    提交，同一幂等键重放返回首次结果、不重新选址。capacity(key, op, sid,
+    args, now_ms) 在既有
+    认证、老化、上限与上述有序池取址规则之上提供容量背压等待队列（队列
     上限与最大等待由配置给定，默认 1024 项、不限等待）：申请等待超过非零
     最大等待在认证/老化之前即抛 ValueError（不入队、不记事件），可立即
     服务则原子建立、否则入队（队长达上限 ResourceError），取消仅
@@ -1698,7 +1806,7 @@ class Sessions:
     永久缓存首果（含参数异常），同型同参重放不老化、不改态，异参
     ValueError。首次合法先老化；逐项依次经后端（故障期按用户指数退避
     抛 BackendError，只改退避）、认证、全局与单用户容量、sid 唯一、
-    default 池与静态址规则建立，业务异常（AuthError/ResourceError/
+    模板有序候选池序列与静态址规则建立，业务异常（AuthError/ResourceError/
     StateError/BackendError/KeyError）不抛，项结果记其类名。非原子
     逐项提交，失败不影响后项；原子演算全部项，任一失败则批内不建
     会话/租约（已建者回滚释址），失败项记异常类名、余项记回滚；
@@ -1922,6 +2030,10 @@ class Sessions:
         # 优先级为推进老化提升的基础值 0..100；用户模板：user -> 标识。
         self._templates = {}
         self._user_templates = {}
+        # v11 模板地址池：模板标识 -> 按优先顺序的 1..32 个互异池标识元组。
+        # 绑定用户建立/晋升/预测/热均衡时按序取址，未列出的模板与未绑定用户
+        # 仅检查 default 池；配置热加载/回滚即时替换本映射，只影响后续选池。
+        self._template_pools = {}
         # 容量背压：队列上限（0 表示不限）、最大等待毫秒（0 表示不限）、
         # 队满策略（拒绝/替换）。
         self._queue_limit = _MAX_QUEUE
@@ -2571,26 +2683,80 @@ class Sessions:
         until = self._pool_fault.get(pool_id)
         return until is not None and now_ms < until
 
-    def _default_candidate(self, user, now_ms):
-        """判定 default 池此刻能否为 user 取址，不改动任何状态。
+    def _candidate_pool_seq(self, user, user_templates=None,
+                            template_pools=None):
+        """user 的有序候选池标识序列（按优先顺序），O(1)/O(1)。
 
-        返回 (pool_id, ip)：(None, None) 表示缺 default 池；
-        ("default", None) 表示有池但动态耗尽、静态址已占用或池处于耗尽
-        演练（now_ms < 注入截至）；ip 非 None 为可取址（动态仅窥堆顶、
-        不弹出），落库由 _commit_session 完成。
+        配置了模板地址池序列的绑定用户取该模板的 1..32 元组，其他用户（未
+        绑定或模板未列序列）只取 default 池。user_templates/template_pools
+        给定时按候选映射取值（热均衡预演用候选绑定），缺省取当前配置。
         """
-        pool = self._pools.get(_DEFAULT_POOL_ID)
-        if pool is None:
-            return None, None
-        if self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
-            return _DEFAULT_POOL_ID, None
+        bindings = (
+            self._user_templates if user_templates is None else user_templates
+        )
+        sequences = (
+            self._template_pools if template_pools is None else template_pools
+        )
+        template_id = bindings.get(user)
+        if template_id is not None:
+            seq = sequences.get(template_id)
+            if seq:
+                return seq
+        return (_DEFAULT_POOL_ID,)
+
+    @staticmethod
+    def _pool_candidate(pool, user, exhausted):
+        """判定单池此刻能否为 user 取址，不改动任何状态，O(1)/O(1)。
+
+        有效耗尽故障（now_ms < 注入截至）返回 None；否则可用时仍优先取该
+        用户在本池的专属静态地址（正被占用则本池不可取，不回落动态址），
+        否则窥动态空闲堆顶（不弹出；空堆即无动态地址）。落库弹堆由
+        _commit_session 完成。exhausted 由调用方给定时复用同一故障判定。
+        """
+        if exhausted:
+            return None
         ip_int = pool.static.get(user)
         if ip_int is None:
-            ip_int = pool.free[0] if pool.free else None
-        elif ip_int in pool.leases:
-            # 静态地址专属该用户，但同一时刻只能租给一个会话。
-            ip_int = None
-        return _DEFAULT_POOL_ID, ip_int
+            return pool.free[0] if pool.free else None
+        # 静态地址专属该用户，但同一时刻只能租给一个会话。
+        if ip_int in pool.leases:
+            return None
+        return ip_int
+
+    def _select_pool(self, user, now_ms, user_templates=None,
+                     template_pools=None):
+        """按模板有序候选池序列为 user 确定性选池取址，不改任何状态。
+
+        返回 (pool_id, ip_int)：配置了序列的绑定用户按序检查候选池，其他
+        用户只检查 default；候选池处于有效耗尽故障、没有动态地址，或该用户
+        的专属静态地址正被占用时继续检查下一池；首个可取址的池仍优先返回
+        其静态址，否则返回数值最小动态址（仅窥堆顶、不弹出）。全部不可用
+        时 ip_int 为 None（pool_id 为最后检查的池）；候选仅 default 且缺池
+        时返回 (None, None)。单次至多检查 32 个池，时间 O(P)、辅助 O(1)，
+        P 为候选池数。
+        """
+        seq = self._candidate_pool_seq(user, user_templates, template_pools)
+        if len(seq) == 1 and seq[0] == _DEFAULT_POOL_ID:
+            pool = self._pools.get(_DEFAULT_POOL_ID)
+            if pool is None:
+                return None, None
+            ip_int = self._pool_candidate(
+                pool,
+                user,
+                self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms),
+            )
+            return _DEFAULT_POOL_ID, ip_int
+        last_pool_id = seq[0]
+        for pool_id in seq:
+            # 配置校验保证序列中的池均已定义；配置替换后映射同步替换。
+            pool = self._pools[pool_id]
+            ip_int = self._pool_candidate(
+                pool, user, self._pool_is_exhausted(pool_id, now_ms)
+            )
+            if ip_int is not None:
+                return pool_id, ip_int
+            last_pool_id = pool_id
+        return last_pool_id, None
 
     def _commit_session(self, sid, user, pool_id, ip_int, now_ms):
         """全部校验通过后原子落库：登记租约（动态弹出堆顶）并建在线会话。
@@ -2637,20 +2803,13 @@ class Sessions:
         if sid in self._sessions:
             raise StateError(f"duplicate sid: {sid!r}")
 
-        # 建立须经 default 池分配地址；缺 default 池为 StateError。
-        pool_id, ip_int = self._default_candidate(user, now_ms)
+        # 按模板有序候选池序列取址：绑定且配置序列的用户按序检查后备池，
+        # 其他用户只检查 default；缺 default 池（零池且无序列可取）为
+        # StateError，全部候选池不可取址为 ResourceError。
+        pool_id, ip_int = self._select_pool(user, now_ms)
         if pool_id is None:
             raise StateError("no default pool: cannot establish session")
         if ip_int is None:
-            pool = self._pools[pool_id]
-            if self._pool_is_exhausted(pool_id, now_ms):
-                raise ResourceError("address pool exhausted")
-            static_ip = pool.static.get(user)
-            if static_ip is not None:
-                raise ResourceError(
-                    f"static address {ipaddress.IPv4Address(static_ip)} for {user!r} "
-                    "already in use"
-                )
             raise ResourceError("address pool exhausted")
 
         # 全部校验通过后再落库，杜绝失败残留。
@@ -5937,7 +6096,7 @@ class Sessions:
         首次合法调用先老化（在线期限到先挂起释址、租期到释址），随后依
         输入顺序逐项处理：先查后端（故障期按用户指数退避抛 BackendError，
         只改退避、不计故障统计），再沿用建立的认证、全局与单用户容量、
-        sid 唯一、default 池与静态址规则。业务异常（AuthError/
+        sid 唯一、模板有序候选池序列与静态址规则。业务异常（AuthError/
         ResourceError/StateError/BackendError/KeyError）不抛，项结果记
         其类名。非原子逐项提交，失败项不影响后项；原子演算全部项，任一
         失败则批内不建会话/租约（已建者回滚、释放地址租约），失败项记
@@ -6114,8 +6273,8 @@ class Sessions:
         self, sid, user, password, now_ms, total_count, per_user, per_template
     ):
         """批内单项建立：规则与 _establish 相同（认证→容量→模板占用→sid
-        唯一→default 池→静态址），但容量与模板占用计数由调用方按批增量
-        维护，故批处理整体为 O(S+B log A) 而非 O(B*S)。
+        唯一→模板有序候选池取址），但容量与模板占用计数由调用方按批增量
+        维护，故批处理整体为 O(S+B(P+log A)) 而非 O(B*S)。
 
         成功原子落库在线会话；失败抛既有业务异常，不留会话与租约残留。
         """
@@ -6142,20 +6301,13 @@ class Sessions:
         if sid in self._sessions:
             raise StateError(f"duplicate sid: {sid!r}")
 
-        # 建立须经 default 池分配地址；缺 default 池为 StateError。
-        pool_id, ip_int = self._default_candidate(user, now_ms)
+        # 按模板有序候选池序列取址：绑定且配置序列的用户按序检查后备池，
+        # 其他用户只检查 default；缺 default 池（零池且无序列可取）为
+        # StateError，全部候选池不可取址为 ResourceError。
+        pool_id, ip_int = self._select_pool(user, now_ms)
         if pool_id is None:
             raise StateError("no default pool: cannot establish session")
         if ip_int is None:
-            pool = self._pools[pool_id]
-            if self._pool_is_exhausted(pool_id, now_ms):
-                raise ResourceError("address pool exhausted")
-            static_ip = pool.static.get(user)
-            if static_ip is not None:
-                raise ResourceError(
-                    f"static address {ipaddress.IPv4Address(static_ip)} for {user!r} "
-                    "already in use"
-                )
             raise ResourceError("address pool exhausted")
 
         # 全部校验通过后再落库，杜绝失败残留。
@@ -8536,7 +8688,7 @@ class Sessions:
         # 截止对在线与排队一致：申请时刻 + 等待。
         deadline = now_ms + wait
         total_count, user_count = self._capacity_counts(user)
-        pool_id, ip_int = self._default_candidate(user, now_ms)
+        pool_id, ip_int = self._select_pool(user, now_ms)
         # 模板并发会话上限：占用为绑定该模板用户的在线加挂起会话数；超限
         # 不拒绝而排队（背压），由推进在占用回落后晋升。
         template_id = self._user_templates.get(user)
@@ -8627,12 +8779,13 @@ class Sessions:
         先摘除截止 <= now_ms 的到期队项（按入队序记超时事件）；存活项的有效
         优先级 = min(1000, 基础 + max(0, now_ms-申请时刻)//1000)，基础取推进
         时刻该用户绑定模板的排队优先级、未绑定为 0。存活项按有效优先级降序、
-        入队序升序依次尝试：受全局、单用户、模板上限或 default 池故障、地址
+        入队序升序依次尝试：受全局、单用户、模板上限或全部候选池（配置序列
+        按序检查，其他用户仅 default）故障、地址
         限制者留队并继续尝试后项，前项成功占用即时影响后项，仅成功项原子建立
         会话与租约。输出“在线”仅计在线会话；挂起会话不持址、不计在线，但仍
         占全局与单用户上限，晋升闸以非下线计数为准。余留队项保持原入队序；
         晋升事件按尝试序（同有效优先级即入队序）追加。
-        时间 O(Q log Q + S + Q log A)、辅助 O(Q)。
+        时间 O(Q log Q+QP+S+Q log A)、辅助 O(Q)，P 为候选池数（至多 32）。
         """
         # 超时（含同刻）：按入队序摘除截止 <= now_ms 者，记录入队序。
         timed_out = []
@@ -8683,7 +8836,7 @@ class Sessions:
                     not session_limit
                     or per_template.get(template_id, 0) < session_limit
                 )
-            pool_id, ip_int = self._default_candidate(user, now_ms)
+            pool_id, ip_int = self._select_pool(user, now_ms)
             if (
                 total_count < self._total
                 and per_user.get(user, 0) < self._per
@@ -8921,23 +9074,25 @@ class Sessions:
         任何资源）；存活项（含窗口外）按推进同口径的有效优先级
         （min(1000, 基础+max(0,now_ms-申请时刻)//1000)，基础取此刻用户绑定
         模板的排队优先级、未绑定为 0）降序、入队序升序依次模拟晋升，按全局
-        上限、单用户上限、模板并发上限及 default 池取址规则判定，前项晋升
-        对计数与地址的占用影响后项；窗口外存活项同样参与模拟，其占用可决定
-        窗口项的判定结果，但不输出。未晋升项
+        上限、单用户上限、模板并发上限及模板有序候选池序列取址规则判定
+        （配置序列的绑定用户按序检查候选池，其他用户只检查 default），前项
+        晋升对计数与地址的占用影响后项；窗口外存活项同样参与模拟，其占用可
+        决定窗口项的判定结果，但不输出。未晋升项
         的等待原因按固定次序取首个受阻项：全局（非下线会话数达全局上限）/
-        用户（达每用户上限）/模板（达模板会话上限）/无池（缺 default 池）/
-        池故障（default 池处于耗尽演练，now_ms < 注入截至）/地址（动态耗尽
-        或该用户专属静态址已租用）；静态址已占用时不回落动态址，与
-        _default_candidate 一致。
+        用户（达每用户上限）/模板（达模板会话上限）/无池（候选序列首个池
+        缺失；default 单列用户即缺 default 池）/池故障（首个不可用池处于
+        有效耗尽演练，now_ms < 注入截至）/地址（首个不可用池动态耗尽或该
+        用户专属静态址已租用）；静态址已占用时不回落本池动态址，与
+        _select_pool 一致。
 
         顶层键序/型为“时刻:int、剩余:int、项目:list”：项目按入队序取前
         limit 项（判定结果可由窗口外更高优先级项的模拟占用决定），剩余为未
         列队项数（O(1) 取队长）。项键序/型为“会话:str、用户:
         str、入队序:int、结果:str、原因:str”：结果仅“晋升/超时/等待”，
         原因依次为空串、“截止”、上述六个等待原因之一。时间
-        O(S+Q log Q)、辅助空间 O(U+T+Q)（S 为会话数、Q 为队项数、U/T 为
-        涉及用户/模板数；动态址全池可互换，仅记老化后空闲槽计数，静态址按
-        用户记持租，均不复制地址表或租约表）。
+        O(S+Q log Q+QP)、辅助空间 O(U+T+Q+P)（S 为会话数、Q 为队项数、
+        P 为池数，单次选池至多检查 32 个候选池；动态址全池可互换，各池仅记
+        老化后空闲槽计数，静态址按用户记持租，均不复制地址表或租约表）。
         """
         _check_int("now_ms", now_ms, 0)
         _check_int("limit", limit, 1)
@@ -8971,22 +9126,16 @@ class Sessions:
                 + "\n"
             )
 
-        # 模拟老化 + 非下线计数单扫 O(S)：不触碰实例会话。在线→挂起仍是非
-        # 下线，全局/用户/模板三类计数与老化前一致（挂起不持址但仍占上限）。
-        # 地址可用性无需逐址副本：动态址全池可互换，只需统计老化后空闲槽数；
-        # 静态址与用户一一对应，按用户记其静态址老化后是否仍被持租。
+        # 模拟老化 + 非下线计数单扫 O(S+P)：不触碰实例会话。在线→挂起仍是
+        # 非下线，全局/用户/模板三类计数与老化前一致（挂起不持址但仍占上限）。
+        # 地址可用性无需逐址副本：动态址全池可互换，各池只需老化后空闲槽
+        # 计数；静态址与用户一一对应，各池按用户记其静态址老化后是否持租。
         total_count = 0
         per_user = {}
         per_template = {}
-        pool = self._pools.get(_DEFAULT_POOL_ID)
-        dyn_released = 0
-        static_held = {}
-        static_ips = pool.static_ips if pool is not None else frozenset()
-        static_by_user = pool.static if pool is not None else {}
-        # default 静态址 -> 专属用户反查表（O(U)），供持租判定 O(1) 查找；
-        # 地址空间跨池可重叠，故仅在会话池恰为 default 时据此认租。
-        static_owner = {ip_int: held_user for held_user, ip_int in
-                        static_by_user.items()}
+        # pool_id -> 老化后动态空闲槽数；pool_id -> 持租静态址的用户集合。
+        dyn_free = {pool_id: len(pool.free) for pool_id, pool in self._pools.items()}
+        static_held = {pool_id: set() for pool_id in self._pools}
         for session in self._sessions.values():
             if session["state"] == _STATE_OFFLINE:
                 continue
@@ -8999,23 +9148,19 @@ class Sessions:
                     per_template.get(template_id, 0) + 1
                 )
             if session["state"] == _STATE_ONLINE and session["ip"] is not None:
+                pool_id = session["pool"]
                 aging = (
                     session["deadline"] <= now_ms
                     or session["lease"] <= now_ms
                 )
-                if session["pool"] != _DEFAULT_POOL_ID:
-                    continue
+                pool = self._pools[pool_id]
                 if aging:
                     # 老化释放：动态址回空闲槽；静态址退租后对其用户可用。
-                    if session["ip"] not in static_ips:
-                        dyn_released += 1
-                else:
-                    # 未老化且持租的 default 静态址仍专属其用户占用。
-                    held_user = static_owner.get(session["ip"])
-                    if held_user is not None:
-                        static_held[held_user] = True
-        # 老化后 default 动态空闲槽 = 现空闲堆 + 老化回槽（晋升逐槽扣减）。
-        dyn_free = len(pool.free) + dyn_released if pool is not None else 0
+                    if session["ip"] not in pool.static_ips:
+                        dyn_free[pool_id] += 1
+                elif pool.static.get(user) == session["ip"]:
+                    # 未老化且持租的专属静态址仍对其用户占用。
+                    static_held[pool_id].add(user)
 
         # 全部队项先判超时（不占资源），存活项（含窗口外）按推进同口径有效
         # 优先级排序后依次模拟，结果按 sid 暂存；输出仅渲染窗口，仍按入队序。
@@ -9062,25 +9207,44 @@ class Sessions:
                 and per_template.get(template_id, 0) >= session_limit
             ):
                 result, reason = "等待", "模板"
-            elif pool is None:
-                result, reason = "等待", "无池"
-            elif self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
-                result, reason = "等待", "池故障"
             else:
-                static_ip = static_by_user.get(user)
-                if static_ip is None:
-                    # 动态用户：有空闲槽即可取址（具体址不影响后续判定）。
-                    address_ok = dyn_free > 0
-                else:
-                    # 专属静态址：未被持租方可用，不回落动态址。
-                    address_ok = not static_held.get(user)
-                if not address_ok:
-                    result, reason = "等待", "地址"
-                else:
+                # 模板有序候选池序列：配置序列的绑定用户按序检查候选池，其他
+                # 用户只检查 default；耗尽故障、无动态址或专属静态址被占即
+                # 下一池。等待原因取首个受阻池的原因（default 单列用户口径
+                # 与旧版完全一致）：无池/池故障/地址。
+                chosen_pool = None
+                first_reason = None
+                for cand_pool_id in self._candidate_pool_seq(user):
+                    cand_pool = self._pools.get(cand_pool_id)
+                    if cand_pool is None:
+                        if first_reason is None:
+                            first_reason = "无池"
+                        continue
+                    if self._pool_is_exhausted(cand_pool_id, now_ms):
+                        if first_reason is None:
+                            first_reason = "池故障"
+                        continue
+                    static_ip = cand_pool.static.get(user)
                     if static_ip is None:
-                        dyn_free -= 1
+                        if dyn_free[cand_pool_id] <= 0:
+                            if first_reason is None:
+                                first_reason = "地址"
+                            continue
+                    elif user in static_held[cand_pool_id]:
+                        # 专属静态址被占：不回落本池动态址，转下一候选池。
+                        if first_reason is None:
+                            first_reason = "地址"
+                        continue
+                    chosen_pool = (cand_pool_id, static_ip)
+                    break
+                if chosen_pool is None:
+                    result, reason = "等待", first_reason
+                else:
+                    cand_pool_id, static_ip = chosen_pool
+                    if static_ip is None:
+                        dyn_free[cand_pool_id] -= 1
                     else:
-                        static_held[user] = True
+                        static_held[cand_pool_id].add(user)
                     total_count += 1
                     per_user[user] = per_user.get(user, 0) + 1
                     if template_id is not None:
@@ -9118,9 +9282,9 @@ class Sessions:
         key、now_ms 沿用 capacity 凭据/时钟约束；mode 仅“预检/执行”；changes
         为 1..1000 项 tuple，每项为 (种类, 目标, 值) 三元组，且 (种类, 目标)
         两两互异。种类仅三种：
-          - (“优先级”, 模板标识, v10 优先级)：值为非 bool int 0..100；
+          - (“优先级”, 模板标识, v11 优先级)：值为非 bool int 0..100；
           - (“绑定”, 用户, 模板标识或空串)：值为 str，空串表示解绑；
-          - (“容量”, 空串, v10 容量三元组)：目标须为 ""，值为
+          - (“容量”, 空串, v11 容量三元组)：目标须为 ""，值为
             (队列上限, 最大等待毫秒, 队满策略)，队列上限为非 bool int
             0..10000（0 不限）、最大等待毫秒为非 bool int >=0（0 不限）、
             队满策略仅“拒绝/替换”。
@@ -9135,12 +9299,13 @@ class Sessions:
         优先级算此刻有效值（与推进同口径
         min(1000, 基础+max(0,now_ms-申请时刻)//1000)），按 (有效值升序、
         入队序降序) 淘汰至候选队列上限（0 不限，不淘汰）；再按其反序
-        （有效值降序、入队序升序）把受全局/单用户/模板上限与 default 池取址
+        （有效值降序、入队序升序）把受全局/单用户/模板上限与候选绑定对应
+        的模板有序池序列取址
         约束者留队、依次晋升可承载项，受限项留队并继续后项。不老化既有会话、
         不记 capacity 事件、不动入队序号、不写审计。
 
         预检只读：全部演算仅在局部副本上进行，不改配置、修订、历史、回滚点、
-        会话与队列；执行原子提交：旧配置作回滚点，修订号加 1 并存 v10 快照，
+        会话与队列；执行原子提交：旧配置作回滚点，修订号加 1 并存 v11 快照，
         config_history 追加“加载”记录（目标 -1），不关联 audit；随后原子改
         队列、原子建立晋升会话与租约；任何承载前失败均不改实例。执行仅缓存
         首次成功：同 (mode, changes, now_ms) 同型同参重放原字节，异参抛
@@ -9181,7 +9346,7 @@ class Sessions:
                 if value != "" and value not in self._templates:
                     raise ResourceError(f"unknown template: {value!r}")
 
-        # 组候选 v10 spec；_build_pools 以候选绑定做模板占用承载（更小的目标
+        # 组候选 v11 spec；_build_pools 以候选绑定做模板占用承载（更小的目标
         # 队限由本接口自身超时/淘汰收敛，故跳过队长承载判定）。
         spec, bindings, tmpl_priority, tmpl_limit, queue_limit, max_wait_ms = (
             self._rebalance_candidate(changes)
@@ -9206,7 +9371,7 @@ class Sessions:
         )
 
         if mode == _CAP_REBALANCE_MODE_EXECUTE:
-            # 原子提交：先装候选配置（旧配置作回滚点、修订加 1、存 v10 快照、
+            # 原子提交：先装候选配置（旧配置作回滚点、修订加 1、存 v11 快照、
             # config_history 追加“加载”、目标 -1），再落实队列收敛与晋升；
             # 所有可能失败的承载校验均已在提交前通过，提交后不留失败路径。
             self._commit_config(
@@ -9365,11 +9530,12 @@ class Sessions:
                     )
 
     def _rebalance_candidate(self, changes):
-        """由当前 v10 spec 与变更组候选 spec 及演算视图，不改实例。
+        """由当前 v11 spec 与变更组候选 spec 及演算视图，不改实例。
 
         返回 (候选 spec, 候选绑定 dict, 候选模板优先级 dict, 候选队列上限,
         候选最大等待毫秒)。优先级仅改命中模板的排队优先级；绑定按用户覆盖或
-        解绑后重排；容量三元组至多一项，缺省沿用现值。
+        解绑后重排；容量三元组至多一项，缺省沿用现值。模板地址池序列不随
+        本接口变更，原样透传，候选绑定改绑后即按新模板的序列选池。
         """
         spec = self._current_spec()
         # spec 模板项：(标识,限速,突发,配额,周期毫秒,会话上限,排队优先级,超限)。
@@ -9413,6 +9579,7 @@ class Sessions:
             user_templates,
             (queue_limit, max_wait_ms, policy),
             spec[8],
+            spec[9],
         )
         return (candidate, bindings, tmpl_priority, tmpl_limit, queue_limit,
                 max_wait_ms)
@@ -9424,8 +9591,9 @@ class Sessions:
         队列条目复制为 [用户,申请时刻,等待,截止,入队序]；先按新最大等待缩短
         截止，再按入队序摘超时，再按 (有效值升序,入队序降序) 淘汰至队限，最后
         按反序（有效值降序、入队序升序）以计数/取址副本模拟晋升。晋升承载口径
-        同 capacity_forecast 但不老化：default 动态址以空闲槽计数、专属静态址
-        按用户记持租。
+        同 capacity_forecast 但不老化：各候选池动态址以空闲槽计数、专属静态址
+        按 (池,用户) 记持租；候选绑定改绑后按新模板的模板地址池序列选池。
+        晋升项记为 (sid, 选中池)，供 _rebalance_apply 按同一池落库。
         """
         queue = {
             sid: list(entry)
@@ -9470,7 +9638,9 @@ class Sessions:
         survivors = [sid for sid in survivors if sid not in evicted_set]
 
         # 晋升：候选绑定下的非下线计数（不老化，在线/挂起均占全局、单用户与
-        # 模板上限）；地址仅模拟 default 池当前空闲，不释放任何在租址。
+        # 模板上限）；地址按候选绑定的模板有序池序列模拟，不释放任何在租址。
+        # 各池动态空闲以槽计数、专属静态址按 (池,用户) 记持租，模拟晋升占用
+        # 即时影响后项；选中池记入计划，供落库按同一池取址。
         total_count = 0
         per_user = {}
         per_template = {}
@@ -9484,18 +9654,40 @@ class Sessions:
             if template_id is not None:
                 per_template[template_id] = per_template.get(template_id, 0) + 1
 
-        pool = self._pools.get(_DEFAULT_POOL_ID)
-        static_by_user = pool.static if pool is not None else {}
-        # 当前在租的 default 专属静态址 -> 其用户是否仍占用。
-        static_held = set()
-        if pool is not None:
-            for held_user, ip_int in static_by_user.items():
+        # 当前各池真实空闲动态槽与持租静态用户（不老化，即不回放在租址）。
+        dyn_free = {
+            pool_id: len(pool.free) for pool_id, pool in self._pools.items()
+        }
+        static_held = {pool_id: set() for pool_id in self._pools}
+        for pool_id, pool in self._pools.items():
+            for held_user, ip_int in pool.static.items():
                 if ip_int in pool.leases:
-                    static_held.add(held_user)
-        dyn_free = len(pool.free) if pool is not None else 0
-        pool_exhausted = (
-            pool is not None and self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms)
-        )
+                    static_held[pool_id].add(held_user)
+        exhausted = {
+            pool_id: self._pool_is_exhausted(pool_id, now_ms)
+            for pool_id in self._pools
+        }
+
+        def sim_candidate(user):
+            """候选绑定/模板池序列下模拟选池，返回 (pool_id, is_static) 或
+            None；规则与 _select_pool 一致（故障/无动态/静态占用转下一池）。"""
+            template_id = bindings.get(user)
+            if template_id is not None:
+                seq = self._template_pools.get(template_id) or (
+                    _DEFAULT_POOL_ID,
+                )
+            else:
+                seq = (_DEFAULT_POOL_ID,)
+            for cand_pool_id in seq:
+                cand_pool = self._pools.get(cand_pool_id)
+                if cand_pool is None or exhausted[cand_pool_id]:
+                    continue
+                static_ip = cand_pool.static.get(user)
+                if static_ip is None:
+                    if dyn_free[cand_pool_id] > 0:
+                        return cand_pool_id, False
+                elif user not in static_held[cand_pool_id]:
+                    return cand_pool_id, True
 
         promoted = []
         promoted_set = set()
@@ -9507,30 +9699,21 @@ class Sessions:
             session_limit = (
                 tmpl_limit.get(template_id, 0) if template_id is not None else 0
             )
-            servable = False
+            chosen = None
             if (
                 total_count < self._total
                 and per_user.get(user, 0) < self._per
                 and (not session_limit or per_template.get(template_id, 0)
                      < session_limit)
             ):
-                if pool is None:
-                    servable = False
-                elif pool_exhausted:
-                    servable = False
+                chosen = sim_candidate(user)
+            if chosen is not None:
+                chosen_pool_id, is_static = chosen
+                if is_static:
+                    static_held[chosen_pool_id].add(user)
                 else:
-                    static_ip = static_by_user.get(user)
-                    if static_ip is None:
-                        servable = dyn_free > 0
-                    else:
-                        servable = user not in static_held
-                    if servable:
-                        if static_ip is None:
-                            dyn_free -= 1
-                        else:
-                            static_held.add(user)
-            if servable:
-                promoted.append(sid)
+                    dyn_free[chosen_pool_id] -= 1
+                promoted.append((sid, chosen_pool_id))
                 promoted_set.add(sid)
                 total_count += 1
                 per_user[user] = per_user.get(user, 0) + 1
@@ -9548,8 +9731,9 @@ class Sessions:
     def _rebalance_apply(self, now_ms, max_wait_ms, plan):
         """候选配置已安装后把演算决策落实到实例队列并原子建立晋升会话。
 
-        截止缩短、摘除超时与淘汰项、余留项保持原入队序；晋升按决策序经真实
-        default 池取址落库（_commit_session），不记 capacity 事件、不动入队序。
+        截止缩短、摘除超时与淘汰项、余留项保持原入队序；晋升按演算记录的
+        (sid, 池) 经指定池取址落库（静态址优先，否则最小动态址，与
+        _commit_session 同口径），不记 capacity 事件、不动入队序。
         """
         # 截止缩短（与演算同式）。
         if max_wait_ms != 0:
@@ -9566,14 +9750,20 @@ class Sessions:
             sid for sid in self._queue_order if sid not in removed
         ]
 
-        # 晋升：演算已确保按序承载，落库取址与计数口径与之一致。
-        for sid in plan["晋升"]:
+        # 晋升：演算已确保按序承载并确定了池，落库从该池取址（优先用户专属
+        # 静态址，否则窥最小动态址；弹堆由 _commit_session 完成），口径与
+        # _select_pool/_commit_session 一致；显式时钟与同态输入保证演算与
+        # 落库逐址一致。
+        for sid, pool_id in plan["晋升"]:
             entry = self._capacity_queue[sid]
             user = entry[0]
-            pool_id, ip_int = self._default_candidate(user, now_ms)
+            pool = self._pools[pool_id]
+            ip_int = pool.static.get(user)
+            if ip_int is None:
+                ip_int = pool.free[0]
             self._commit_session(sid, user, pool_id, ip_int, now_ms)
             del self._capacity_queue[sid]
-        promoted_set = set(plan["晋升"])
+        promoted_set = {sid for sid, _pool_id in plan["晋升"]}
         self._queue_order = [
             sid for sid in self._queue_order if sid not in promoted_set
         ]
@@ -9581,14 +9771,15 @@ class Sessions:
     @staticmethod
     def _render_rebalance(mode, now_ms, revision, plan):
         """键序/型：时刻:int、模式:str、修订:int、超时/淘汰/晋升:list（sid 串
-        按各事件序）、剩余:int；基线紧凑 JSON，LF 结尾。"""
+        按各事件序）、剩余:int；基线紧凑 JSON，LF 结尾。晋升项在计划中为
+        (sid, 池)，输出仅列 sid 串并保持演算尝试序。"""
         payload = {
             "时刻": now_ms,
             "模式": mode,
             "修订": revision,
             "超时": list(plan["超时"]),
             "淘汰": list(plan["淘汰"]),
-            "晋升": list(plan["晋升"]),
+            "晋升": [sid for sid, _pool_id in plan["晋升"]],
             "剩余": len(plan["剩余"]),
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -10573,11 +10764,11 @@ class Sessions:
 
         先校验显式毫秒时钟（非 bool 非负 int：类型错 TypeError、取值错
         ValueError），且只执行一次既有老化（_age），随后从同一状态取得当前
-        v10 配置的规范摘要与各域对象；除本次老化外只读：不认证、不计量、不
+        v11 配置的规范摘要与各域对象；除本次老化外只读：不认证、不计量、不
         推进容量、不新增统计、不写任何审计/计费事件、不动各域幂等缓存，也不
         导出或清空配置与配置历史。顶层键固定依次为
         “版本/时刻/配置摘要/认证/运行态/故障/统计/计费/摘要”，版本恒为 2；
-        配置摘要为当前 v10 配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写值；
+        配置摘要为当前 v11 配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写值；
         认证沿用同刻 auth_checkpoint 的版本 2 规范对象，运行态沿用同刻
         runtime_checkpoint 对象（容量时刻等于顶层时刻），故障沿用同刻
         fault_checkpoint 对象，统计沿用 stats_checkpoint 对象，计费为版本 1
@@ -10652,7 +10843,7 @@ class Sessions:
         account_events, active_rows, account_refs = parsed["accounting"]
         account_unknown_sids, _account_pool_refs = account_refs
 
-        # 配置先于一切：目标当前 v10 配置摘要须与包一致，否则 StateError。
+        # 配置先于一切：目标当前 v11 配置摘要须与包一致，否则 StateError。
         if self._config_summary() != config_summary:
             raise StateError("配置")
 
@@ -11368,7 +11559,8 @@ class Sessions:
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
         模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒,
-        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒)。"""
+        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒, 重试基数毫秒,
+        重试上限毫秒)，模板地址池为按模板标识升序的 (模板, 池优先序列)。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -11388,6 +11580,10 @@ class Sessions:
             (user, self._user_templates[user])
             for user in sorted(self._user_templates)
         )
+        template_pools = tuple(
+            (template_id, self._template_pools[template_id])
+            for template_id in sorted(self._template_pools)
+        )
         return (
             self._total,
             self._per,
@@ -11398,10 +11594,11 @@ class Sessions:
             user_templates,
             (self._queue_limit, self._max_wait_ms, self._queue_policy),
             self._auth.policy(),
+            template_pools,
         )
 
     def export_config(self):
-        """导出当前配置为 v10 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
+        """导出当前配置为 v11 JSON（LF 结尾），O(n log n + S + Q)/O(n)。
 
         顶层键序为“版本/会话/地址池/模板/用户模板/容量/认证”；会话键序为
         “总数/每用户/空闲毫秒/租期毫秒”；地址池为按标识升序的列表，项键序为
@@ -11416,19 +11613,19 @@ class Sessions:
         """
         return _compact_config(self._current_spec()) + "\n"
 
-    def upgrade_config(self, text, target=10):
-        """只读地将 v1..v10 配置文本升级到 target（仅支持 10），返回升级包 JSON。
+    def upgrade_config(self, text, target=11):
+        """只读地将 v1..v11 配置文本升级到 target（仅支持 11），返回升级包 JSON。
 
         text 须为 str、target 须为非 bool int，否则抛 TypeError；源版本限
-        1..10 且 target 只许 10；JSON 解析、重复键、键缺失或未知、结构、值、
+        1..11 且 target 只许 11；JSON 解析、重复键、键缺失或未知、结构、值、
         引用或版本非法均抛 ValueError。迁移沿既有规则：v1 单池改 default，
         v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0, 拒绝)，v1-v4 以
-        认证器当前两值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒
+        认证器当前四值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期毫秒
         补 0，v1-v7 模板排队优先级补 0，v1-v8 容量队满策略补“拒绝”，
-        v1-v9 重试两项补 0，v10 只规范化。返回基线格式的 LF 尾紧凑 JSON：
+        v1-v9 重试两项补 0，v1-v10 模板地址池补空列表，v11 只规范化。返回基线格式的 LF 尾紧凑 JSON：
         顶层序/型为“源版本:int、目标版本:int、改变:bool、摘要:str、配置:
         object”，改变 = 源版本 != 9；配置逐层键序、类型与排序同
-        export_config() 的 v10；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
+        export_config() 的 v11；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
         sha256 小写值。升级只读，不触碰任何实例状态；时/空上界 O(n log n)/
         O(n)。
         """
@@ -11475,6 +11672,7 @@ class Sessions:
             user_templates,
             (queue_limit, _max_wait_ms, _queue_policy),
             _auth_policy,
+            _template_pools,
         ) = spec
         total_count = 0
         per_user = {}
@@ -11595,6 +11793,7 @@ class Sessions:
             user_templates,
             (queue_limit, max_wait_ms, queue_policy),
             (max_fail, lock_ms, retry_base_ms, retry_cap_ms),
+            template_pools,
         ) = spec
         self._total = total
         self._per = per
@@ -11610,6 +11809,12 @@ class Sessions:
             in templates
         }
         self._user_templates = dict(user_templates)
+        # v11 模板地址池：模板标识 -> 有序候选池元组；热加载/回滚即时替换，
+        # 只影响后续自动选池与尚未晋升的队项，现有在线/挂起会话保留原池址。
+        self._template_pools = {
+            template_id: tuple(pool_seq)
+            for template_id, pool_seq in template_pools
+        }
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
         self._queue_policy = queue_policy
@@ -11716,9 +11921,9 @@ class Sessions:
         return spec, self._build_pools(spec)
 
     def load_config(self, text):
-        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v10 JSON。
+        """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v11 JSON。
 
-        直载 v1..v10 配置，或加载 upgrade_config 产出的升级包；升级包须复核
+        直载 v1..v11 配置，或加载 upgrade_config 产出的升级包；升级包须复核
         键序、字段、配置规范形态与摘要，任一不符抛 ValueError。text 非 str
         抛 TypeError；JSON 解析、重复/未知/缺失键、结构、类型、值、重复项或
         引用（用户模板引用未注册用户或未知模板标识）错抛 ValueError；上限、
@@ -11744,7 +11949,7 @@ class Sessions:
         return self.export_config()
 
     def rollback_config(self):
-        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v10 JSON。
+        """经同样校验恢复唯一回滚点配置并清除回滚点，返回恢复后的 v11 JSON。
 
         无回滚点抛 StateError；校验失败（ResourceError）不改配置、回滚点、
         历史或运行态，回滚点保留；成功清除回滚点并将配置修订号加 1，生成
@@ -11789,7 +11994,7 @@ class Sessions:
 
         left/right 须为非 bool 非负 int：类型错抛 TypeError，负值抛
         ValueError；校验后依 left、right 次序在保留窗口（最近 256 项）查找，
-        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v10
+        未保留（已淘汰或超过当前修订）抛 KeyError(修订)。比较两份规范 v11
         配置：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或两侧节点
         JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再下探，
         同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer：
@@ -11912,14 +12117,14 @@ class Sessions:
         JSON；不老化、不缓存、不审计，不改配置、修订、历史、回滚点及任何运行
         态，同态同参逐字节相同。
 
-        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v10 配置或经
+        text 非 str 抛 TypeError；接受与 load_config 相同的 v1..v11 配置或经
         严格复核的升级包，解析、重键、键集/键序、结构、类型、值、排序或引用
         错抛 ValueError，当前会话上限、模板占用、队长或在租租约不能承载抛
         ResourceError；校验次序与 load_config 完全一致（共用 _parse_config_text：
         先解析/迁移并复核升级包，再校验用户模板引用，最后做承载校验），承载
         校验只构造临时池表、不触碰实例状态。
 
-        预检文本先规范化为 v10 spec，再与当前配置（_current_spec() 的规范 v10
+        预检文本先规范化为 v11 spec，再与当前配置（_current_spec() 的规范 v11
         形态）递归比较：对象取键并集逐键递归，数组按索引逐项递归；一侧缺失或
         两侧节点 JSON 类型不同（bool 与数值不同型）即在当前路径记一项且不再
         下探，同型容器继续递归，同型叶值仅在不同时记一项。路径为 JSON Pointer
@@ -11930,7 +12135,7 @@ class Sessions:
 
         顶层键序/型为“修订:int、当前摘要:str、目标摘要:str、改变:bool、
         变更:list、摘要:str”；修订与当前摘要沿 config_revision（修订号、当前
-        export 去 LF 的 sha256），目标摘要为规范 v10 对象紧凑编码 UTF-8 字节的
+        export 去 LF 的 sha256），目标摘要为规范 v11 对象紧凑编码 UTF-8 字节的
         sha256 小写值，摘要覆盖前五键（前五键同法编码之 UTF-8 字节 sha256），
         改变恰为变更列表非空。时间 O(n log n + S + Q + D log D)、辅助空间
         O(n + D)（外加两份规范配置），n 为配置规模、S/Q 为会话与等待队列规模、
@@ -13261,7 +13466,7 @@ class Sessions:
         缓存但不审计。
 
         首次合法调用分别执行既有 load_config(text)/rollback_config()/
-        upgrade_config(text, 10)：成功原样返回其 JSON；加载时配置非法抛
+        upgrade_config(text, 11)：成功原样返回其 JSON；加载时配置非法抛
         ValueError、承载冲突抛 ResourceError、无回滚点抛 StateError，升级只读
         （不触碰配置、运行态与回滚点），异常类型与 args 一并缓存。除缓存、
         审计外，失败不得改变配置、回滚点、用户、会话、租约、队列、统计或故障态。
@@ -14760,7 +14965,8 @@ class Sessions:
 # - stats-delta：顶层键依次 users/base/current，同样注册 users 后只读调用
 #   Sessions.stats_delta；
 # - session-run：顶层键依次 users/config/requests/query_ms，在全新实例中
-#   注册 users、加载版本 10 配置（须含 default 池），依序调用 Sessions.do，
+#   注册 users、加载版本 11 配置（v1..v10 沿规则迁移，须含 default 池），
+#   依序调用 Sessions.do，
 #   时间只取请求自带 now_ms；业务失败记录后继续，最后按 query_ms 取会话
 #   全量查询与地址池统计，输出版本/项目/会话/地址池/摘要。
 # 成功把返回值原字节写 stdout（退出 0、stderr 空），失败 stdout 空、
@@ -15006,8 +15212,9 @@ def _check_run_users(users):
 
 
 def _check_run_config(config, registered_users=None):
-    """校验 session-run 的 config：须为版本 10 配置对象（load_config 的键、
-    结构与取值规则）且含 default 地址池。config 非 object 抛 TypeError；
+    """校验 session-run 的 config：须为版本 11 配置对象（load_config 的键、
+    结构与取值规则）且含 default 地址池；v1..v10 沿既有规则迁移（模板地址
+    池补空）。config 非 object 抛 TypeError；
     版本、键集/键序、结构、类型、值、引用、排序/重复或缺 default 池抛
     ValueError。registered_users 给定时，用户模板引用的用户须在其中，
     否则按引用非法抛 ValueError。仅做静态形态校验，不触碰任何实例。返回
@@ -15156,7 +15363,8 @@ def _parse_cli_run_request(raw):
     raw 须为 UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许
     空白；编码、JSON、重键、顶层形态、键集或键序错抛 ValueError。users
     为按用户名 Unicode 码点升序且互异的 [user, password] 二元数组；
-    config 为版本 10 配置对象且含 default 池；requests 为 1..1000 个会话
+    config 为版本 11 配置对象（v1..v10 沿规则迁移）且含 default 池；
+    # requests 为 1..1000 个会话
     请求对象；query_ms 为非 bool 非负 int。类型错抛 TypeError，其余形态/
     取值/排序/重复/配置非法抛 ValueError。
     """
@@ -15180,7 +15388,7 @@ def _parse_cli_run_request(raw):
 
 
 def _run_session_run(users, config, requests, query_ms):
-    """在全新实例中注册 users、加载 v10 配置并依序执行 Sessions.do。
+    """在全新实例中注册 users、加载版本 11 配置（v1..v10 沿规则迁移）并依序执行 Sessions.do。
 
     注册与配置加载均已在输入校验阶段静态通过，此处不会失败。时间只取
     各请求自带 now_ms：业务失败（AuthError/ResourceError/StateError/
@@ -15196,7 +15404,7 @@ def _run_session_run(users, config, requests, query_ms):
     for user, password in users:
         auth.add(user, password)
     sessions = Sessions(auth, 1, 1, 0, lease_ms=1)
-    # v10 直载：键、结构、引用、承载力与 default 池均已静态校验，必成功。
+    # v11（或迁移后的 v1..v10）直载：键、结构、引用、承载力与 default 池均已静态校验，必成功。
     config_text = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     sessions.load_config(config_text)
 
