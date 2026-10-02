@@ -156,7 +156,7 @@
   或统计、不写既有审计链；合法首调与同参重放逐项写批量防篡改审计链（操作
   “批量保活”）。
 - Sessions.batch_audit(after=0,limit=100) 批量操作防篡改审计只读查询：返回
-  上述五类批量合法首调与同参重放逐项追加的独立哈希链（与 audit 的接管/do
+  上述六类批量合法首调与同参重放逐项追加的独立哈希链（与 audit 的接管/do
   链相互独立）。after/limit 为非 bool int，after<0 或 limit∉1..1000 分别抛
   TypeError/ValueError；只读返回序号>after 的前 limit 项，顶层键序
   “下个序号/事件”，空页游标为 after。事件键序“序号/时刻/键/操作/原子/会话/
@@ -211,6 +211,25 @@
   成功首果与成功同参重放写防篡改审计链（用户停用/用户启用，会话=user，
   成功/重放），参数错及业务异常不审计。
   停用态不随配置加载/回滚与检查点恢复改变。
+- Sessions.batch_user_admin 批量用户管理：key 沿用凭据，items 为 1..1000 个
+  (op,user,force) 三元组 tuple、op 仅停用/启用、user 沿凭据约束且互异、
+  force 为 bool 且启用仅 False，now_ms 为非 bool 非负 int，atomic 为 bool；
+  容器/项目/字段类型错 TypeError，空批次/超量/非法凭据/重复用户/负时刻/
+  非法操作 ValueError，整批参数错不占 key、不写审计、不改状态。合法首果按
+  key 独立永久缓存，同型同参重放逐字节返回首果且不重复改变业务状态，异参
+  ValueError。合法批次不老化，逐项沿用 user_admin 业务语义：未知用户记
+  KeyError，非强制停用遇该用户在线/挂起会话或排队队项记 StateError，成功的
+  强制停用释放全部租约、下线全部非下线会话、删除全部排队队项并产生既有
+  “停用”计费停止事件，启用及同态操作保持现有结果。非原子按输入序处理，
+  失败项不影响后项；原子先判定全部项、仅全部可成功才一次提交，任一失败时
+  失败项保留实际异常类名、余项记“回滚”，停用集合、会话、租约、队列、计费
+  链及全部计数保持调用前状态。提交后的计费事件按项目输入序排列，同一用户
+  的会话按会话标识 Unicode 码点升序排列。合法首调与同参重放按输入序逐项
+  写批量防篡改审计链（操作“批量用户管理”，会话字段=用户名）并投影到
+  compliance 链，不写单操作 audit 链。返回键序 时刻/原子/结果/项目 的 LF 尾
+  紧凑 JSON，结果仅成功/部分成功/失败/回滚，项键序 操作/用户/结果/下线/
+  取消，失败与回滚项两个计数均为 0；单批 O(B+Q+S log S) 时间、O(B+Q+S)
+  空间（B≤1000，Q 为排队项数，S 为会话数）。
 - Sessions.fault_plan 批量故障演练计划：key 沿用凭据，mode 仅预检/执行，
   steps 为 1..1000 项 (domain,target,op,value) 四元组；域仅后端/池/超时、
   op 仅注入/恢复，后端/超时 target 为 "" 且各唯一，池 target 沿标识且互异，
@@ -1463,13 +1482,22 @@ _BATCH_CRED_PARTIAL = "部分成功"
 _BATCH_CRED_FAILED = "失败"
 _BATCH_ITEM_ROTATE = "轮换"
 
-# 五类批量操作（上线/下线/迁移/保活/凭据轮换）入独立防篡改审计链
+# batch_user_admin 批量用户管理：顶层结果仅 成功/部分成功/失败/回滚；成功项
+# 结果“成功”（沿用 user_admin 成功语义），非原子失败项取实际异常类名
+# （KeyError/StateError），原子回滚时可成功项记“回滚”。
+_BATCH_ADMIN_COMMIT = "成功"
+_BATCH_ADMIN_PARTIAL = "部分成功"
+_BATCH_ADMIN_FAILED = "失败"
+_BATCH_ITEM_ADMIN = "成功"
+
+# 六类批量操作（上线/下线/迁移/保活/凭据轮换/用户管理）入独立防篡改审计链
 # batch_audit 的操作名。
 _BATCH_AUDIT_ONLINE = "批量上线"
 _BATCH_AUDIT_OFFLINE = "批量下线"
 _BATCH_AUDIT_MIGRATE = "批量迁移"
 _BATCH_AUDIT_KEEPALIVE = "批量保活"
 _BATCH_AUDIT_CREDENTIAL = "批量凭据轮换"
+_BATCH_AUDIT_USER_ADMIN = "批量用户管理"
 # 批量审计首次事件结果取项目结果（提交/部分/回滚），重放事件结果恒为“重放”。
 _BATCH_AUDIT_REPLAY = "重放"
 
@@ -1871,7 +1899,7 @@ class Sessions:
     链 batch_audit（操作“批量迁移”），参数错与异参 key 不记。返回键序时刻/
     原子/结果/项目的 LF 尾紧凑 JSON，结果仅提交/部分/回滚，项为会话/结果
     （迁移/业务异常类名/回滚）。首次 O(S+B log A) 时间、O(B) 辅助空间，重放 O(B)。
-    batch_audit(after=0, limit=100) 只读返回五类批量操作的独立防篡改审计链：
+    batch_audit(after=0, limit=100) 只读返回六类批量操作的独立防篡改审计链：
     after/limit 为非 bool int，after<0 或 limit∉1..1000 分别抛
     TypeError/ValueError；取序号>after 的前 limit 项，查询不老化不改态、
     O(limit) 时空。顶层键序下个序号/事件（空页游标为 after），事件键序序号/
@@ -1956,6 +1984,28 @@ class Sessions:
     原序号指认首次、结果“重放”。停用态不随配置加载/回滚或
     creplay/runtime_restore 改变。首次
     O(S+Q) 时间、O(1) 辅助空间，重放 O(1)。
+    batch_user_admin(key, items, now_ms, atomic=False) 批量停用/启用用户：
+    key 沿用凭据约束，items 为 1..1000 个 (op, user, force) 三元组 tuple，
+    op 仅停用/启用、user 沿凭据约束且批内互异、force 为 bool 且启用仅
+    False，now_ms 为非 bool 非负 int，atomic 为 bool；容器/项目/字段类型错
+    TypeError，空批次/超量/非法凭据/重复用户/负时刻/非法操作 ValueError，
+    整批参数错不占 key、不写审计、不改状态。验 key 后以独立域永久缓存合法
+    首果：同型同参重放逐字节返回首果、不重复改变业务状态，异参 ValueError。
+    合法批次不老化，逐项沿用 user_admin 业务语义：未知用户记 KeyError，非
+    强制停用遇该用户在线/挂起会话或排队队项记 StateError，成功的强制停用
+    释放全部租约、下线全部非下线会话、删除全部排队队项并产生既有“停用”
+    计费停止事件，启用及同态操作下线/取消恒 0；业务失败入项结果而不抛。
+    非原子按输入序逐项提交，失败项不影响后项；原子先判定全部项，仅全部
+    可成功才一次提交，任一失败时失败项保留实际异常类名、其余可成功项记
+    “回滚”，停用集合、会话、租约、队列、计费链及全部计数保持调用前状态，
+    不留部分清退。提交后的计费事件按项目输入顺序排列，同一用户的会话按
+    会话标识 Unicode 码点升序排列。合法首调与同参重放均按输入序逐项写
+    batch_audit（操作“批量用户管理”，会话字段取用户名）并投影 compliance
+    链，首调记录项目结果（成功/回滚/实际异常类名）、原序号 0，重放记
+    “重放”、原序号指认对应首项，不写单操作 audit 链。返回键序
+    “时刻/原子/结果/项目”的 LF 尾紧凑 JSON，结果仅成功/部分成功/失败/回滚，
+    项目依输入顺序、项键序“操作/用户/结果/下线/取消”，失败与回滚项两个
+    计数均为 0。单批 O(B+Q+S log S) 时间、O(B+Q+S) 辅助空间，重放 O(B)。
     do 另受理挂起/恢复：挂起 args 须为 None 否则 ValueError，先老化，
     未知 sid 抛 KeyError、非在线抛 StateError，置挂起、期限 0 并释址
     退租；恢复 args 为 (pool, password) 二元 tuple（非 tuple 抛
@@ -2179,10 +2229,10 @@ class Sessions:
         # pool_fault/timeout_fault/batch_offline/batch_online/keepalive
         # 分域：key -> (items, now_ms, atomic, outcome)。
         self._batch_migrate_cache = {}
-        # 五类批量操作（batch_online/batch_offline/batch_migrate/keepalive/
-        # batch_credential_change）的独立防篡改审计链：事件十元组序列（序号自
+        # 六类批量操作（batch_online/batch_offline/batch_migrate/keepalive/
+        # batch_credential_change/batch_user_admin）的独立防篡改审计链：事件十元组序列（序号自
         # 1）与末项哈希（空链为 64 个 0，即首项前哈希）。与 do 等所用的
-        # _chain_events（audit）相互独立，批量操作不写既有审计链。五类各持
+        # _chain_events（audit）相互独立，批量操作不写既有审计链。六类各持
         # key -> 该 key 合法首调首批事件的首序号索引（各缓存已按 key 分域，
         # 同名 key 跨操作不互相指认），供逐项重放指认对应首次事件；事件始终
         # 追加到同一条批量链。
@@ -2225,6 +2275,11 @@ class Sessions:
         self._disabled_users = set()
         self._user_admin_cache = {}
         self._user_admin_chain_index = {}
+        # batch_user_admin 批量用户管理的重放缓存，与其余各域独立：
+        # key -> (items, now_ms, atomic, 结果 JSON)；仅合法首果占位，参数错
+        # （TypeError/ValueError）不占 key；原序号索引亦独立分域。
+        self._batch_user_admin_cache = {}
+        self._batch_user_admin_chain_index = {}
         # quota_restore 共享 QoS 账本恢复的重放缓存，与其余各域独立：
         # key -> (text, outcome)；仅首次成功缓存，失败（含参数错）不占 key。
         self._quota_restore_cache = {}
@@ -6997,7 +7052,7 @@ class Sessions:
             index[key] = first_seq
 
     def batch_audit(self, after=0, limit=100):
-        """返回批量操作（上线/下线/迁移/保活/凭据轮换）防篡改审计事件 JSON。
+        """返回批量操作（上线/下线/迁移/保活/凭据轮换/用户管理）防篡改审计事件 JSON。
 
         只读、查询不老化、不改状态，O(limit) 时空。取序号 > after 的前 limit
         项。after/limit 须为非 bool 的 int：类型不符抛 TypeError，after<0 或
@@ -14055,6 +14110,359 @@ class Sessions:
     def _render_batch_credential(now_ms, atomic, result, items):
         # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
         # 结果为 str，项目为项（用户/结果）列表，依输入顺序。
+        payload = {
+            "时刻": now_ms,
+            "原子": atomic,
+            "结果": result,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def batch_user_admin(self, key, items, now_ms, atomic=False):
+        """一次停用/启用多个用户，返回 LF 结尾的紧凑 JSON 字符串。
+
+        key 沿用凭据约束；items 为含 1..1000 个 (op, user, force) 三元组
+        tuple 的 tuple，op 仅停用/启用，user 沿用凭据约束且同一用户不得
+        重复，force 为 bool 且启用仅允许 force=False；now_ms 为非 bool 非负
+        int，atomic 为 bool。容器、项目或字段类型不符抛 TypeError；空批次、
+        超量、非法凭据、重复用户、负时刻及非法操作（含启用 force=True）
+        抛 ValueError。整批参数错误不认证、不改状态、不占用幂等键、不写
+        审计；同 key 此后以合法参数首调仍按首次处理。key 有效后以独立域
+        永久缓存合法首果：同型同参重放逐字节返回首果、不重复改变业务状态，
+        异参复用抛 ValueError。
+
+        合法批次不触发老化，逐项沿用 user_admin 的业务语义：未知用户记
+        KeyError；非强制停用（停用且 force=False）遇该用户在线/挂起会话或
+        排队队项记 StateError，状态不变；强制停用原子下线其全部非下线会话
+        （期限清零、释放地址租约）并删除其全部排队队项，会话下线前按会话
+        标识 Unicode 码点升序产生既有原因“停用”的计费停止事件；启用与同态操作成功且
+        下线/取消恒 0。业务异常写入项目结果而不从批量入口抛出。
+
+        非原子模式按输入顺序逐项处理：未知用户记 KeyError、非强制停用被
+        在途项阻挡记 StateError，失败项不影响后项；成功项逐项提交。原子
+        模式先在同一初始快照上判定全部项目（前项失败不阻止后项判定；批内
+        用户互异，各项作用域互不相交）：
+        失败项保留自身实际异常类名，可成功项不预演、不改动任何状态，任一
+        失败即整批不提交，使停用集合、会话、租约、队列、计费链及全部计数
+        自然保持调用前状态，
+        可成功项改记“回滚”，不留部分清退；全部可成功才一次提交。两种
+        模式都不老化。合法首调与同参重放均按输入序逐项写独立的批量防
+        篡改审计链 batch_audit（操作“批量用户管理”，会话字段取用户名）：
+        首调逐项结果取项目结果（成功/回滚/实际异常类名）、原序号 0；重放
+        逐项记“重放”、原序号指认对应首次事件；不写单操作 audit 链。
+
+        返回顶层键序“时刻/原子/结果/项目”：结果仅成功（全部成功）、部分
+        成功（非原子有成功有失败）、失败（非原子全失败）、回滚（原子有
+        失败）；项目保持输入顺序，项键序“操作/用户/结果/下线/取消”，下线
+        为本次成功停用强制下线的非下线会话数、取消为删除的排队队项数
+        （启用与同态成功恒 0），失败与回滚项两个计数均为 0。单批时间
+        O(B+Q+S log S)、辅助空间 O(B+Q+S)（B ≤ 1000，Q 为排队项数，S 为
+        会话数），重放 O(B)。
+        """
+        _check_credential("key", key)
+
+        cached = self._batch_user_admin_cache.get(key)
+        if cached is not None:
+            # 重放：不老化、不改态；合法首果的同参重放按输入序逐项记“重放”，
+            # 原序号指认对应首次事件。
+            c_items, c_now_ms, c_atomic, c_output = cached
+            if not _strict_equal(
+                (items, now_ms, atomic), (c_items, c_now_ms, c_atomic)
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            origin = self._batch_user_admin_chain_index.get(key)
+            if origin is not None:
+                self._batch_chain_record(
+                    key,
+                    _BATCH_AUDIT_USER_ADMIN,
+                    [entry[1] for entry in c_items],
+                    c_atomic,
+                    now_ms,
+                    origin,
+                    self._batch_user_admin_chain_index,
+                )
+            return c_output
+
+        # 新 key：余参校验失败不占幂等键、不改态、不审计。
+        self._validate_batch_user_admin_params(items, now_ms, atomic)
+
+        # 整批一次预聚合判定视图，使总时间为 O(B+Q+S log S) 而非逐项扫描。
+        active_sids, queued_sids = self._batch_user_admin_views()
+        if atomic:
+            results, all_ok = self._batch_user_admin_atomic(
+                items, now_ms, active_sids, queued_sids
+            )
+        else:
+            results, all_ok = self._batch_user_admin_sequential(
+                items, now_ms, active_sids, queued_sids
+            )
+
+        if all_ok:
+            result = _BATCH_ADMIN_COMMIT
+        elif atomic:
+            result = _BATCH_ROLLBACK
+        else:
+            # 非原子：有成功项为部分成功，全失败为失败。
+            any_ok = any(entry["结果"] == _BATCH_ITEM_ADMIN for entry in results)
+            result = _BATCH_ADMIN_PARTIAL if any_ok else _BATCH_ADMIN_FAILED
+        output = self._render_batch_user_admin(now_ms, atomic, result, results)
+        self._batch_user_admin_cache[key] = (items, now_ms, atomic, output)
+        # 合法首调：按输入序逐项追加首次事件，会话字段取用户名，结果取各
+        # 项目结果（原子回滚后可成功项已为“回滚”）、原序号 0。
+        self._batch_chain_record(
+            key,
+            _BATCH_AUDIT_USER_ADMIN,
+            [entry[1] for entry in items],
+            atomic,
+            now_ms,
+            0,
+            self._batch_user_admin_chain_index,
+            [entry["结果"] for entry in results],
+        )
+        return output
+
+    @staticmethod
+    def _validate_batch_user_admin_params(items, now_ms, atomic):
+        """校验 batch_user_admin 三参数：类型错先于取值/长度/重复错。
+
+        items 须为 tuple，含 1..1000 个 (op, user, force) 三元组 tuple：
+        op 为 str 且仅停用/启用，user 满足凭据约束且互异，force 为 bool 且
+        启用仅允许 False；now_ms 为非 bool 非负 int；atomic 为 bool。类型
+        阶段先查容器/各项/各字段/now_ms/atomic 的类型（field 0、1 为 str，
+        field 2 为 bool）；取值阶段依序查项长度、op 取值、user 凭据、
+        启用 force、now_ms 下界、项数上下界、user 重复。
+        """
+        # 类型阶段：任一类型错先于任何取值错抛出。项长度属于取值阶段，故
+        # 字段类型按存在性逐项探，不在类型阶段下标越界。
+        if not isinstance(items, tuple):
+            raise TypeError(f"items must be a tuple, got {type(items).__name__}")
+        for item in items:
+            if not isinstance(item, tuple):
+                raise TypeError(
+                    f"item must be a tuple, got {type(item).__name__}"
+                )
+            if len(item) >= 1 and not isinstance(item[0], str):
+                raise TypeError(
+                    f"op must be a str, got {type(item[0]).__name__}"
+                )
+            if len(item) >= 2 and not isinstance(item[1], str):
+                raise TypeError(
+                    f"user must be a str, got {type(item[1]).__name__}"
+                )
+            if len(item) >= 3 and not isinstance(item[2], bool):
+                raise TypeError(
+                    f"force must be a bool, got {type(item[2]).__name__}"
+                )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
+
+        # 取值阶段：项长度、操作、凭据、启用 force、下界、项数、重复用户。
+        for item in items:
+            if len(item) != 3:
+                raise ValueError(
+                    "item must be a 3-tuple (op, user, force), "
+                    f"got {len(item)} items"
+                )
+            if item[0] not in (_ADMIN_OP_DISABLE, _ADMIN_OP_ENABLE):
+                raise ValueError(
+                    f"op must be one of 停用/启用, got {item[0]!r}"
+                )
+            _check_credential("user", item[1])
+            if item[0] == _ADMIN_OP_ENABLE and item[2]:
+                raise ValueError("force must be False for 启用")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (1 <= len(items) <= _BATCH_MAX_SIDS):
+            raise ValueError(
+                f"items must contain 1..{_BATCH_MAX_SIDS} items, got {len(items)}"
+            )
+        users = [item[1] for item in items]
+        if len(set(users)) != len(users):
+            raise ValueError("items must not contain duplicate user")
+
+    def _batch_user_admin_views(self):
+        """为整批用户管理预聚合判定视图：一次扫描会话表与队列，避免逐项
+        O(S+Q)。返回 (active_sids, queued_sids)：active_sids 为
+        user -> 该用户全部非下线会话 sid（按 Unicode 码点升序）的 tuple；
+        queued_sids 为 user -> 其排队队项 sid（按入队序）的 tuple。
+        总时间 O(S log S+Q)（各用户排序之和不逾 S log S）、空间 O(S+Q)。
+        """
+        collected = {}
+        for sid, session in self._sessions.items():
+            if session["state"] != _STATE_OFFLINE:
+                collected.setdefault(session["user"], []).append(sid)
+        active_sids = {
+            user: tuple(sorted(sids)) for user, sids in collected.items()
+        }
+        queued = {}
+        for queued_sid in self._queue_order:
+            user = self._capacity_queue[queued_sid][0]
+            queued.setdefault(user, []).append(queued_sid)
+        queued_sids = {user: tuple(sids) for user, sids in queued.items()}
+        return active_sids, queued_sids
+
+    def _batch_user_admin_classify(self, op, user, force, active_sids, queued_sids):
+        """对单项做 user_admin 业务判定（不改任何状态，O(1) 查表）。
+
+        返回 (ok, kind, sids)：未知用户为 (False, "KeyError", None)；非强制
+        停用遇该用户非下线会话或排队队项为 (False, "StateError", None)；
+        可成功项为 (True, "成功", sids)，sids 为预聚合视图中该用户全部非
+        下线会话（Unicode 码点升序 tuple，可能为空）。
+        """
+        if user not in self._auth:
+            return False, KeyError.__name__, None
+        if op == _ADMIN_OP_ENABLE:
+            return True, _BATCH_ITEM_ADMIN, ()
+        sids = active_sids.get(user, ())
+        if not force and (sids or queued_sids.get(user)):
+            return False, StateError.__name__, None
+        return True, _BATCH_ITEM_ADMIN, sids
+
+    def _batch_user_admin_apply(self, op, user, force, now_ms, sids, queued):
+        """对已判定可成功的单项执行提交（调用方保证判定基于调用前预聚合
+        视图；批内用户互异，他项不触及其会话与队项）：停用加入停用集合；
+        强制停用按给定 sid 序列（Unicode 码点升序）逐会话先结账（原因
+        “停用”）再置下线、清期限、释放地址租约，并删除其全部排队队项
+        （仅删队项映射，_queue_order 的压缩由调用方整批一次性完成）；启用
+        自停用集合移除。返回 (下线数, 取消数)；不记 capacity 事件、不老化。
+        """
+        if op == _ADMIN_OP_ENABLE:
+            self._disabled_users.discard(user)
+            return 0, 0
+        if force:
+            offline = 0
+            # 计费停止（停用）须在清场前结账；同用户会话按会话标识 Unicode
+            # 码点升序，使停止事件次序确定。批内不老化、用户互异，sids 中
+            # 各会话判定后仍为非下线。
+            for force_sid in sids:
+                session = self._sessions[force_sid]
+                self._account_stop(force_sid, now_ms, _ACCOUNT_REASON_DISABLE)
+                session["state"] = _STATE_OFFLINE
+                session["deadline"] = 0
+                self._release(session)
+                offline += 1
+            cancelled = 0
+            for queued_sid in queued:
+                del self._capacity_queue[queued_sid]
+                cancelled += 1
+        else:
+            offline = 0
+            cancelled = 0
+        self._disabled_users.add(user)
+        return offline, cancelled
+
+    def _batch_user_admin_compress_queue(self):
+        """整批提交后一次性压缩 _queue_order：剔除已删队项，保留余项入队
+        序。O(Q) 时间、O(Q) 空间。"""
+        survivors = [
+            sid for sid in self._queue_order if sid in self._capacity_queue
+        ]
+        self._queue_order[:] = survivors
+
+    def _batch_user_admin_sequential(self, items, now_ms, active_sids, queued_sids):
+        """非原子逐项处理：按输入顺序判定并提交，失败项不影响后项。
+
+        判定全部基于调用前预聚合视图：批内用户互异，前项仅改动其自身用户
+        的会话与队项，后项用户的视图保持准确。业务异常（KeyError/
+        StateError）不抛：项结果记异常类名，下线/取消为 0。返回
+        (results, all_ok)。
+        """
+        results = []
+        all_ok = True
+        for op, user, force in items:
+            ok, kind, sids = self._batch_user_admin_classify(
+                op, user, force, active_sids, queued_sids
+            )
+            if not ok:
+                results.append(
+                    {
+                        "操作": op,
+                        "用户": user,
+                        "结果": kind,
+                        "下线": 0,
+                        "取消": 0,
+                    }
+                )
+                all_ok = False
+                continue
+            offline, cancelled = self._batch_user_admin_apply(
+                op, user, force, now_ms, sids, queued_sids.get(user, ())
+            )
+            results.append(
+                {
+                    "操作": op,
+                    "用户": user,
+                    "结果": _BATCH_ITEM_ADMIN,
+                    "下线": offline,
+                    "取消": cancelled,
+                }
+            )
+        # 成功强制停用删除的队项映射已逐项移除，最后一次压缩入队序。
+        self._batch_user_admin_compress_queue()
+        return results, all_ok
+
+    def _batch_user_admin_atomic(self, items, now_ms, active_sids, queued_sids):
+        """原子批量用户管理：先在同一初始快照上判定全部项，全可成功才一次
+        提交，任一失败则整批不提交。
+
+        判定阶段不改态：前项失败不阻止后项判定，全部项目基于调用前预聚合
+        视图独立判定（批内用户互异，各项作用域互不相交）。任一失败即什么
+        都不提交：停用集合、会话、租约、队列与计费链均保持调用前状态，
+        失败项保留实际异常类名、可成功项改记“回滚”，两类项的下线/取消均
+        为 0。全部可成功才按输入顺序逐项一次提交；提交后的计费停止事件按
+        项目输入顺序排列，同一用户的多个会话按会话标识 Unicode 码点升序
+        结账。返回 (results, all_ok)。
+        """
+        # 判定阶段。
+        judged = []
+        all_ok = True
+        for op, user, force in items:
+            ok, kind, sids = self._batch_user_admin_classify(
+                op, user, force, active_sids, queued_sids
+            )
+            judged.append((op, user, force, ok, kind, sids))
+            if not ok:
+                all_ok = False
+
+        results = []
+        if not all_ok:
+            # 任一失败：什么都不提交，业务态自然保持调用前状态；可成功项
+            # 记“回滚”，失败项保留实际异常类名，计数均为 0。
+            for op, user, _force, ok, kind, _sids in judged:
+                results.append(
+                    {
+                        "操作": op,
+                        "用户": user,
+                        "结果": kind if not ok else _BATCH_ROLLBACK,
+                        "下线": 0,
+                        "取消": 0,
+                    }
+                )
+            return results, False
+
+        # 全部可成功：唯一提交点，按输入顺序逐项提交，最后一次压缩入队序。
+        for op, user, force, _ok, _kind, sids in judged:
+            offline, cancelled = self._batch_user_admin_apply(
+                op, user, force, now_ms, sids, queued_sids.get(user, ())
+            )
+            results.append(
+                {
+                    "操作": op,
+                    "用户": user,
+                    "结果": _BATCH_ITEM_ADMIN,
+                    "下线": offline,
+                    "取消": cancelled,
+                }
+            )
+        self._batch_user_admin_compress_queue()
+        return results, True
+
+    @staticmethod
+    def _render_batch_user_admin(now_ms, atomic, result, items):
+        # 顶层键序：时刻、原子、结果、项目；时刻为 int，原子为 bool，
+        # 结果为 str，项目为项（操作/用户/结果/下线/取消）列表，依输入序。
         payload = {
             "时刻": now_ms,
             "原子": atomic,
