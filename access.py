@@ -16849,18 +16849,26 @@ class Sessions:
 #   注册 users、加载版本 12 配置（须含 default 池），依序调用 Sessions.do，
 #   时间只取请求自带 now_ms；业务失败记录后继续，最后按 query_ms 取会话
 #   全量查询与地址池统计，输出版本/项目/会话/地址池/摘要。
+# - capacity-run：信封与 session-run 同构，唯 requests 为容量请求（op 仅
+#   申请/取消/推进；申请 args 为 [用户名,口令,等待毫秒]，取消/推进 args 为
+#   null，推进 sid 恒为空串），依序调用 Sessions.capacity；业务失败记录后
+#   继续，最后以 query_ms 调 capacity_stats 驱动老化、再取 sessions 全量
+#   第一页，输出版本/项目/会话/容量/摘要。
 # 成功把返回值原字节写 stdout（退出 0、stderr 空），失败 stdout 空、
 # stderr 写 LF 尾紧凑 JSON {"错误":<子命令名>,"类型":<异常类名>}，
 # TypeError/ValueError 退出 2、ResourceError 退出 3、StateError 退出 4；
 # 缺失或未知子命令按 stats-merge 名写 ValueError 信封（退出 2）。同输入
 # 逐字节同结果。stats-merge/stats-delta 时间 O(L+n log n)、空间 O(L+n)，
 # L 为输入字节长度、n 为 users 与检查点明细总数；session-run 时间
-# O(L+A+R(S+log A)+S log S)、空间 O(L+U+R+S+A)。
+# O(L+A+R(S+log A)+S log S)、空间 O(L+U+R+S+A)；capacity-run 时间
+# O(L+R(Q log Q+S+Q log A)+S log S)、空间 O(L+U+R+S+Q+A)（Q 队项数、
+# A 地址总数）。
 # ---------------------------------------------------------------------------
 
 _CLI_MERGE_COMMAND = "stats-merge"
 _CLI_DELTA_COMMAND = "stats-delta"
 _CLI_RUN_COMMAND = "session-run"
+_CLI_CAPACITY_RUN_COMMAND = "capacity-run"
 _CLI_MERGE_REQUEST_KEYS = ("key", "users", "base", "left", "right")
 _CLI_DELTA_REQUEST_KEYS = ("users", "base", "current")
 _CLI_RUN_REQUEST_KEYS = ("users", "config", "requests", "query_ms")
@@ -16869,7 +16877,8 @@ _CLI_USERS_MAX = 10000
 _CLI_RUN_REQUESTS_MIN = 1
 _CLI_RUN_REQUESTS_MAX = 1000
 # session-run 每个会话必由 requests 建立，故会话数不超过请求数；全量查询
-# 一页（limit 上限 1000）即可取全。
+# 一页（limit 上限 1000）即可取全。capacity-run 同理（每次申请至多建一个
+# 会话，取消/推进不新建），同页取全。
 _CLI_RUN_QUERY_LIMIT = _CLI_RUN_REQUESTS_MAX
 _CLI_RUN_OPS = (
     _OP_ESTABLISH,
@@ -16881,6 +16890,8 @@ _CLI_RUN_OPS = (
     _OP_RESUME,
     _OP_OFFLINE,
 )
+# capacity-run 仅回放容量背压三操作。
+_CLI_CAPACITY_RUN_OPS = (_OP_APPLY, _OP_CANCEL, _OP_ADVANCE)
 _CLI_RUN_ITEM_KEYS = ("key", "op", "sid", "args", "now_ms")
 # 失败信封的退出码：参数类错误 2、资源错误 3、状态错误 4。
 _CLI_EXIT_CODES = {
@@ -17268,6 +17279,147 @@ def _parse_cli_run_request(raw):
     return users, config, parsed_requests, query_ms
 
 
+def _capacity_run_args(index, op, args):
+    """把容量请求的 args 转为 Sessions.capacity 原接口参数。
+
+    申请须为恰含 [用户名, 口令, 等待毫秒] 的数组（用户名/口令为凭据
+    字符串、等待为非 bool 正 int），转为三元 tuple；取消/推进须为 null，
+    且推进的 sid 须为空串（sid 本体由调用方校验）。非数组容器（tuple 等）
+    为 ValueError，非数组标量为 TypeError，长度/字段类型/取值错分别为
+    ValueError/TypeError/ValueError。仅做静态形态校验：不依赖配置的最大
+    等待上界（运行时由 capacity 既有语义判定，超限记为业务失败）。
+    """
+    if op == _OP_APPLY:
+        if isinstance(args, tuple):
+            raise ValueError(
+                f"requests[{index}].args must be an array, not a tuple"
+            )
+        if not isinstance(args, list):
+            raise TypeError(
+                f"requests[{index}].args must be an array, "
+                f"got {type(args).__name__}"
+            )
+        if len(args) != 3:
+            raise ValueError(
+                f"requests[{index}].args must have exactly 3 items, "
+                f"got {len(args)}"
+            )
+        user = _run_args_to_tuple_cred(index, 0, "user", args[0])
+        password = _run_args_to_tuple_cred(index, 1, "password", args[1])
+        wait = args[2]
+        # 与 capacity 验参同口径：bool 归 TypeError、非 int 归 TypeError、
+        # 非正归 ValueError。
+        _check_int(f"requests[{index}].args[2]", wait, 1)
+        return user, password, wait
+    if args is not None:
+        if isinstance(args, (list, tuple)):
+            raise ValueError(
+                f"requests[{index}].args must be null for {op!r}"
+            )
+        raise TypeError(
+            f"requests[{index}].args must be null for {op!r}, "
+            f"got {type(args).__name__}"
+        )
+    return None
+
+
+def _check_capacity_run_requests(requests):
+    """校验 capacity-run 的 requests：1..1000 个对象，键依次且仅为
+    key/op/sid/args/now_ms；key 沿凭据约束；op 仅申请/取消/推进；申请 sid
+    沿凭据约束、args 为 [用户名,口令,等待] 三元数组，取消 sid 沿凭据约束、
+    args 为 null，推进 sid 须为空串、args 为 null；now_ms 为非 bool 非负
+    int。返回 [(key, op, sid, args_tuple, now_ms), ...]，保持请求顺序。
+    requests 非 list 抛 TypeError；长度、键集/键序、op、sid/args 形态或
+    取值错抛 ValueError，字段类型错抛 TypeError。
+    """
+    if not isinstance(requests, list):
+        raise TypeError(
+            f"requests must be an array, got {type(requests).__name__}"
+        )
+    if not (
+        _CLI_RUN_REQUESTS_MIN
+        <= len(requests)
+        <= _CLI_RUN_REQUESTS_MAX
+    ):
+        raise ValueError(
+            f"requests must contain {_CLI_RUN_REQUESTS_MIN}.."
+            f"{_CLI_RUN_REQUESTS_MAX} items, got {len(requests)}"
+        )
+    parsed = []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise TypeError(
+                f"requests[{index}] must be an object, "
+                f"got {type(request).__name__}"
+            )
+        if list(request) != list(_CLI_RUN_ITEM_KEYS):
+            raise ValueError(
+                "requests[%d] keys must be exactly and in order: "
+                "key, op, sid, args, now_ms" % index
+            )
+        key = request["key"]
+        op = request["op"]
+        sid = request["sid"]
+        args = request["args"]
+        now_ms = request["now_ms"]
+        _check_credential(f"requests[{index}].key", key)
+        if not isinstance(op, str):
+            raise TypeError(
+                f"requests[{index}].op must be a string, "
+                f"got {type(op).__name__}"
+            )
+        if op not in _CLI_CAPACITY_RUN_OPS:
+            raise ValueError(
+                f"requests[{index}].op must be one of "
+                f"{_CLI_CAPACITY_RUN_OPS}, got {op!r}"
+            )
+        if op == _OP_ADVANCE:
+            if not isinstance(sid, str):
+                raise TypeError(
+                    f"requests[{index}].sid must be a string, "
+                    f"got {type(sid).__name__}"
+                )
+            if sid != "":
+                raise ValueError(
+                    f'requests[{index}].sid must be "" for 推进, got {sid!r}'
+                )
+        else:
+            _check_credential(f"requests[{index}].sid", sid)
+        args_tuple = _capacity_run_args(index, op, args)
+        _check_int(f"requests[{index}].now_ms", now_ms, 0)
+        parsed.append((key, op, sid, args_tuple, now_ms))
+    return parsed
+
+
+def _parse_cli_capacity_run_request(raw):
+    """解析 capacity-run 请求字节，返回 (users, config, requests, query_ms)。
+
+    信封与 session-run 同构（顶层键依次且仅为 users/config/requests/
+    query_ms，users 与版本 12 config 沿用 session-run 规则），唯 requests
+    为 1..1000 个容量请求（见 _check_capacity_run_requests）。raw 须为
+    UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许空白；编码、
+    JSON、重键、顶层形态、键集或键序错抛 ValueError。字段类型错抛
+    TypeError，其余形态/取值/排序/重复/配置非法抛 ValueError。
+    """
+    text = _decode_cli_request(raw)
+    doc = _decode_cli_object(text)
+    if list(doc) != list(_CLI_RUN_REQUEST_KEYS):
+        raise ValueError(
+            "request keys must be exactly and in order: "
+            "users, config, requests, query_ms"
+        )
+    users = doc["users"]
+    config = doc["config"]
+    requests = doc["requests"]
+    query_ms = doc["query_ms"]
+    _check_run_users(users)
+    registered_users = {user for user, _password in users}
+    _check_run_config(config, registered_users)
+    parsed_requests = _check_capacity_run_requests(requests)
+    _check_int("query_ms", query_ms, 0)
+    return users, config, parsed_requests, query_ms
+
+
 def _run_session_run(users, config, requests, query_ms):
     """在全新实例中注册 users、加载 v12 配置并依序执行 Sessions.do。
 
@@ -17347,6 +17499,89 @@ def _run_session_run(users, config, requests, query_ms):
     )
 
 
+def _run_capacity_run(users, config, requests, query_ms):
+    """在全新实例中注册 users、加载 v12 配置并依序执行 Sessions.capacity。
+
+    注册与配置加载均已在输入校验阶段静态通过，此处不会失败。时间只取
+    各请求自带 now_ms：业务失败（AuthError/ResourceError/StateError/
+    KeyError/BackendError，以及同 key 异参复用与等待超配置上界的
+    ValueError/TypeError）记录异常类名后继续，排队、超时、取址、认证、
+    事件与幂等副作用沿用 Sessions.capacity 既有语义（同 key 同参重放原
+    结果），失败不留半分配状态。全部结束后先以 query_ms 调用
+    capacity_stats（驱动末次老化），再取 Sessions.sessions 全量第一页
+    （只读视图），组装 LF 尾紧凑 JSON：顶层键序版本/项目/会话/容量/摘要，
+    版本 1；项目保持请求顺序，项键序序号/结果/输出/类型，成功输出为
+    capacity 原返回对象、类型为空串，失败输出为 null、类型为异常类名；
+    摘要为前四顶层字段紧凑编码 UTF-8 字节的 SHA-256 小写值。
+    """
+    auth = Authenticator(1, 0)
+    for user, password in users:
+        auth.add(user, password)
+    sessions = Sessions(auth, 1, 1, 0, lease_ms=1)
+    # v12 直载：键、结构、引用、承载力与 default 池均已静态校验，必成功。
+    config_text = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    sessions.load_config(config_text)
+
+    items = []
+    for index, (key, op, sid, args, now_ms) in enumerate(requests):
+        try:
+            output_text = sessions.capacity(key, op, sid, args, now_ms)
+        except (
+            AuthError,
+            ResourceError,
+            StateError,
+            KeyError,
+            BackendError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            # 业务失败统一记异常类名后继续。请求形态已在执行前静态校验，
+            # 故执行期出现的 ValueError/TypeError 只可能是幂等域冲突
+            # （同 key 异参复用）或等待超过配置最大等待上界（capacity 验参
+            # 依赖实例配置，无法在信封阶段静态判定），属业务结果而非输入
+            # 非法；排队、超时、取址与幂等副作用沿用 capacity 既有语义，
+            # 失败不留半分配。
+            items.append(
+                {
+                    "序号": index,
+                    "结果": False,
+                    "输出": None,
+                    "类型": type(exc).__name__,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "序号": index,
+                    "结果": True,
+                    "输出": json.loads(output_text),
+                    "类型": "",
+                }
+            )
+
+    # 容量统计：capacity_stats 先按 query_ms 老化一次再统计（末次老化由此
+    # 驱动）；随后取会话全量查询（sessions 为只读视图，不老化、不写状态）。
+    capacity_view = json.loads(sessions.capacity_stats(query_ms))
+    # 每次申请至多建立一个会话、取消/推进不新建，会话与队项总数不超过请求
+    # 数（<=1000），单页取全。
+    sessions_view = json.loads(
+        sessions.sessions(query_ms, "", _CLI_RUN_QUERY_LIMIT)
+    )
+
+    document = {
+        "版本": 1,
+        "项目": items,
+        "会话": sessions_view,
+        "容量": capacity_view,
+    }
+    head = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    document["摘要"] = hashlib.sha256(head.encode("utf-8")).hexdigest()
+    return (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+
+
 def _write_cli_error(command, exc):
     """向 stderr 写 LF 尾紧凑 JSON 信封，键序“错误/类型”，UTF-8 字节。"""
     envelope = json.dumps(
@@ -17359,7 +17594,8 @@ def _write_cli_error(command, exc):
 
 
 def main(argv):
-    """命令行分派：受理无额外参数的 stats-merge、stats-delta 与 session-run。
+    """命令行分派：受理无额外参数的 stats-merge、stats-delta、session-run
+    与 capacity-run。
 
     缺失或未知子命令（含多余参数）沿用 stats-merge 名写 ValueError
     信封，退出 2；其余失败信封的“错误”取实际子命令名。
@@ -17371,6 +17607,7 @@ def main(argv):
             _CLI_MERGE_COMMAND,
             _CLI_DELTA_COMMAND,
             _CLI_RUN_COMMAND,
+            _CLI_CAPACITY_RUN_COMMAND,
         )
     ):
         _write_cli_error(_CLI_MERGE_COMMAND, ValueError("missing or unknown subcommand"))
@@ -17384,9 +17621,12 @@ def main(argv):
         elif command == _CLI_DELTA_COMMAND:
             users, base, current = _parse_cli_delta_request(raw)
             result = _run_stats_delta(users, base, current)
-        else:
+        elif command == _CLI_RUN_COMMAND:
             users, config, requests, query_ms = _parse_cli_run_request(raw)
             result = _run_session_run(users, config, requests, query_ms)
+        else:
+            users, config, requests, query_ms = _parse_cli_capacity_run_request(raw)
+            result = _run_capacity_run(users, config, requests, query_ms)
     except (TypeError, ValueError, ResourceError, StateError) as exc:
         # 失败：stdout 保持空，信封仅含命令名与异常类名。
         _write_cli_error(command, exc)

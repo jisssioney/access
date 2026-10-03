@@ -64,6 +64,29 @@
   ResourceError 退出 3、StateError 退出 4。相同输入逐字节同输出，时间
   O(L+A+R(S+log A)+S log S)、空间 O(L+U+R+S+A)（L 输入字节数、U 用户数、
   R 请求数、S 会话数、A 地址总数）。
+- `python access.py capacity-run`（不带额外参数）：stdin 读入 UTF-8 JSON
+  对象，对象前不得有空白、尾部仅许空白，信封与 session-run 同构——顶层键
+  依次且仅为 `users,config,requests,query_ms`，users 与版本 12 config 沿用
+  session-run 规则。`requests` 为 1..1000 个对象，键依次且仅为
+  `key,op,sid,args,now_ms`，op 仅 申请/取消/推进；申请的 args 为
+  `[用户名,口令,等待毫秒]`（等待为非 bool 正 int，是否超配置最大等待上界
+  由执行期按业务失败判定），取消与推进的 args 为 null，推进的 sid 恒为空
+  串，申请/取消 sid 沿凭据约束，now_ms 为非 bool 非负 int。先完整校验信封
+  （非法不处理任何请求），再注册用户、加载配置并依序调用 `Sessions.capacity`，
+  时间只取各请求的 now_ms：认证、资源、状态、未知会话、后端故障及同 key
+  异参复用等业务失败只记异常类名后继续，既有排队、超时、取址与幂等语义不
+  变，失败不留半分配；同 key 同参重放原结果。结束后以 query_ms 调
+  `capacity_stats` 驱动末次老化，再取 `Sessions.sessions` 全量第一页（只读
+  视图）。成功 stdout 为 LF 尾紧凑 JSON，顶层键序 `版本,项目,会话,容量,摘要`，
+  版本 1；项目保持顺序，项键序 `序号,结果,输出,类型`，成功结果为 true、
+  输出为 capacity 原返回对象、类型为空串，失败结果为 false、输出为 null、
+  类型为异常类名；摘要为前四字段紧凑编码 UTF-8 字节的 SHA-256 小写值。合法
+  信封即使含项目失败也退出 0、stderr 空；编码、JSON、重键、键序、类型、数量、
+  配置或参数形态非法时 stdout 为空，stderr 写键序 `错误,类型`（错误值为
+  capacity-run）的 LF 尾紧凑 JSON，TypeError/ValueError 退出 2、
+  ResourceError 退出 3、StateError 退出 4。相同输入逐字节同输出，时间
+  O(L+R(Q log Q+S+Q log A)+S log S)、空间 O(L+U+R+S+Q+A)（L 输入字节数、
+  U 用户数、R 请求数、S 会话数、Q 队项数、A 地址总数）。
 
 ## 测试
 
