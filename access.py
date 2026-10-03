@@ -269,6 +269,28 @@
   JSON UTF-8 字节的 sha256 小写值；LF 尾紧凑。时间
   O(S+Q+K+CP+P log P)、辅助空间 O(CP+K)，C/P/K 为场景数/池并集数/步骤
   总数。
+- Sessions.pool_drain(key, op, source, targets, now_ms, limit)/pool_drain_status
+  (source, now_ms) 提供可恢复的地址池排空：op 仅 开始/推进/取消，targets 为
+  1..个互异且不含源池的目标池（按调用序选址），limit 1..1000；开始后源池
+  停止承接建立、恢复、无址接管、容量晋升及模板后备选池产生的新 IPv4 分配
+  （任何排水源池作为候选/目标均不可用），已有会话、IPv6 前缀与队列不变；
+  推进先按 now_ms 老化一次，再按会话标识 Unicode 码点序处理源池中仍持有效
+  IPv4 租约的前 limit 项，按目标序沿用静态绑定优先、保留址不可动态分配、
+  池故障（耗尽演练或目标自身排空）不可用的规则选首个可用址，成功才释旧址并
+  重置 IPv4 租期，空闲期限/QoS/计费/IPv6 租约不变，无承载项记 ResourceError
+  且原址不变、他项继续，源池无有效持址会话即“已排空”并仍拒新分配直至取消；
+  取消只恢复后续选址、不迁回已迁出会话。类型错 TypeError，空目标/重复/源池
+  混入/非法操作/负时刻/limit 越界 ValueError，未知池 KeyError，同源不同目标
+  顺序再次开始或推进/取消目标序列不符 StateError；失败不改状态、租约、缓存
+  与审计。成功首果以独立域缓存（同键同参逐字节 LF 尾紧凑 JSON，顶层键序
+  时刻/源池/状态/剩余/项目，项键序 会话/目标池/结果；异参 ValueError），三种
+  操作的成功首果及同参重放逐项写批量防篡改审计链（操作“地址池排空”，原子
+  恒 False，无项目的开始/取消/空推进记一条源池事件）并投影合规链。配置变更
+  删除排空中的源池或其目标池抛 ResourceError 且原子保持原状。运行态检查点
+  向后兼容地在配额后追加“排空”节（无排空逐字节一致，旧版本恢复视为无排空
+  池，引用未知池 ResourceError，恢复失败全域原子不变）。pool_drain_status
+  只读、不老化不改态，键序 源池/状态/剩余。单次推进
+  O(S log S+limit log A)、辅助 O(S+limit)。
 所有时间均由调用方以显式时钟（毫秒整数）驱动。
 """
 
@@ -1925,6 +1947,25 @@ _ADMIN_OP_DISABLE = "停用"
 _ADMIN_OP_ENABLE = "启用"
 _ADMIN_DISABLED = "停用"
 _ADMIN_ENABLED = "启用"
+
+# pool_drain 可恢复地址池排空：op 仅 开始/推进/取消；排空状态仅
+# 排空中（开始后、仍有源池持址会话）/已排空（推进后源池无有效持址会话，
+# 仍拒绝新分配直至取消）。取消后状态记录移除。
+_DRAIN_OP_START = "开始"
+_DRAIN_OP_ADVANCE = "推进"
+_DRAIN_OP_CANCEL = "取消"
+_DRAIN_OPS = (_DRAIN_OP_START, _DRAIN_OP_ADVANCE, _DRAIN_OP_CANCEL)
+_DRAIN_STATE_DRAINING = "排空中"
+_DRAIN_STATE_DRAINED = "已排空"
+_DRAIN_STATE_CANCELLED = "已取消"
+_DRAIN_STATES = (_DRAIN_STATE_DRAINING, _DRAIN_STATE_DRAINED)
+_DRAIN_MIN_LIMIT = 1
+_DRAIN_MAX_LIMIT = 1000
+# pool_drain 推进成功项的项结果（沿用 do 迁移结果），失败项固定
+# ResourceError；成功首果与同参重放逐项写独立批量防篡改审计链的操作名。
+_DRAIN_ITEM_MOVED = _BATCH_ITEM_MIGRATE
+_DRAIN_ITEM_FAILED = "ResourceError"
+_BATCH_AUDIT_DRAIN = "地址池排空"
 # user_admin 入防篡改审计链的操作名。
 _ADMIN_CHAIN_DISABLE = "用户停用"
 _ADMIN_CHAIN_ENABLE = "用户启用"
@@ -2861,6 +2902,22 @@ class Sessions:
         # key -> (sid, now_ms, 结果 JSON)；仅首次成功缓存，失败不占 key。
         self._account_interim_cache = {}
 
+        # 可恢复地址池排空：源池 -> [状态, (目标池, ...)]。状态仅
+        # 排空中/已排空（_DRAIN_STATES）；目标池序列互异、不含源池、按调用
+        # 优先序，开始后不可更改（同源以不同目标顺序再次开始抛 StateError）。
+        # 开始后源池停止承接建立、恢复、接管、容量晋升及模板后备选池产生的
+        # 新 IPv4 分配；已排空仍拒绝新分配，直至取消。取消只移除记录、恢复
+        # 后续选址，不迁回已迁出会话。
+        self._drains = {}
+        # pool_drain 的重放缓存，与其余各域独立：
+        # key -> (op, source, targets, now_ms, limit, outcome)。三种操作的
+        # 成功首果（含开始态冲突 StateError）缓存；参数错（TypeError/
+        # ValueError）与未知池 KeyError 是否缓存沿三操作约定（见 pool_drain）。
+        self._pool_drain_cache = {}
+        # pool_drain 在批量审计链的各操作 key -> 首批事件首序号索引，供同参
+        # 重放逐项指认首次事件；与其余批量操作索引分域，同名 key 不互指。
+        self._pool_drain_chain_index = {}
+
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
 
@@ -3339,6 +3396,10 @@ class Sessions:
             last_pool_id = pool_id
             if self._pool_is_exhausted(pool_id, now_ms):
                 continue
+            # 排空中（含已排空）的池不承接自动选址产生的新 IPv4 分配：与耗尽
+            # 演练同样跳到下一候选池；既有会话租约与从该池迁出不受影响。
+            if pool_id in self._drains:
+                continue
             ip_int = self._pool_candidate_address(pool, user)
             if ip_int is not None:
                 return pool_id, ip_int
@@ -3549,6 +3610,10 @@ class Sessions:
                 continue
             present = True
             if self._pool_is_exhausted(pool_id, now_ms):
+                continue
+            # 排空中（含已排空）的池不承接新 IPv4 分配，与耗尽演练同口径
+            # 跳过（容量预测/热均衡演算须反映此不可用）。
+            if pool_id in self._drains:
                 continue
             non_exhausted = True
             static_ip = pool.static.get(user)
@@ -3906,7 +3971,10 @@ class Sessions:
             pool = self._pools.get(_DEFAULT_POOL_ID)
             if pool is None:
                 raise StateError("no default pool: cannot assign address")
-            if self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms):
+            if (
+                self._pool_is_exhausted(_DEFAULT_POOL_ID, now_ms)
+                or _DEFAULT_POOL_ID in self._drains
+            ):
                 raise ResourceError("address pool exhausted")
             ip_int = pool.static.get(user)
             if ip_int is None:
@@ -4042,8 +4110,9 @@ class Sessions:
             raise AuthError(f"authentication not ok for user {user!r}: {status}")
 
         # 取址：耗尽演练期该池视为无址；静态址专属该用户但同时只能租给
-        # 一个会话；非静态用户取池内最小动态空闲址。
-        if self._pool_is_exhausted(pool_id, now_ms):
+        # 一个会话；非静态用户取池内最小动态空闲址。排空中（含已排空）的池
+        # 不承接恢复产生的新 IPv4 分配，与耗尽演练同为 ResourceError。
+        if self._pool_is_exhausted(pool_id, now_ms) or pool_id in self._drains:
             raise ResourceError("address pool exhausted")
         ip_int = pool.static.get(user)
         if ip_int is None:
@@ -10952,6 +11021,324 @@ class Sessions:
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    # -- 可恢复地址池排空 -----------------------------------------------
+
+    def pool_drain(self, key, op, source, targets, now_ms, limit):
+        """可恢复的地址池排空，返回 LF 结尾紧凑 JSON。
+
+        key 沿用凭据约束；op 仅 开始/推进/取消；source 为源池标识（沿凭据
+        约束），targets 为 1..个互异且不含源池的目标池标识 tuple（按调用序为
+        选址优先序）；now_ms 为非 bool 非负 int；limit 为非 bool int 且
+        1..1000（每次推进最多处理的会话数）。类型错抛 TypeError，空目标列表、
+        重复目标、源池混入目标、非法操作、负时刻或 limit 越界抛 ValueError，
+        源池或任一目标池未知抛 KeyError（校验次序：类型→取值→未知池→状态）。
+
+        开始：源池进入“排空中”，此后停止承接建立、恢复、无址接管、容量晋升
+        及模板后备选池产生的新 IPv4 分配（任何在排空的池都不接收新分配，含
+        另一排水源池作为目标的情形）；已有会话、IPv6 前缀与队列保持原状。
+        对同一源池以不同目标顺序（或目标集）再次开始抛 StateError；同序同集
+        重开始为空操作成功。推进：先按 now_ms 完成一次既有老化，再按会话标识
+        Unicode 码点顺序处理仍在源池持有有效 IPv4 租约的前 limit 项；每项按
+        目标池顺序，沿用静态绑定优先、保留地址不可动态分配、池故障（耗尽演练
+        或目标自身在排空）不可用的规则选首个可用地址，成功后才释放旧地址并把
+        IPv4 租期重置为 now_ms+lease_ms，空闲期限、QoS 账本、计费累计与 IPv6
+        租约均不变；没有目标可承载时该项结果固定为 ResourceError、原地址与
+        租期不变，其他项继续，不留双占用或半释放。源池无有效持址会话后状态变
+        为“已排空”，仍拒绝新分配直至取消。取消：移除排空记录、恢复后续选址，
+        不迁回已迁出的会话，状态记“已取消”。
+
+        仅成功结果以独立域缓存（失败不改状态、租约、缓存与审计）：同键同参
+        重放返回逐字节相同的 JSON，异参复用抛 ValueError；三种操作的成功首果
+        及同参重放逐项（无项目的开始/取消/空推进记一条源池事件）写入既有批量
+        防篡改审计链（操作“地址池排空”，原子恒 False）并投影到合规链。返回
+        顶层键序 时刻/源池/状态/剩余/项目，项键序 会话/目标池/结果；失败项
+        目标池为空串。单次推进 O(S log S+limit log A)、辅助 O(S+limit)。
+        """
+        _check_credential("key", key)
+
+        cached = self._pool_drain_cache.get(key)
+        if cached is not None:
+            c_op, c_source, c_targets, c_now_ms, c_limit, output = cached
+            if not _strict_equal(
+                (op, source, targets, now_ms, limit),
+                (c_op, c_source, c_targets, c_now_ms, c_limit),
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 成功同参重放：按首果项目逐记入批量链（结果“重放”、原序号逐项
+            # 指认首次事件），不老化、不改态，原样返回首果字节。
+            self._drain_record_chain(
+                key, c_op, c_source, c_now_ms, output, replay=True
+            )
+            return output
+
+        # 新 key：任何失败（含状态冲突）均不占 key、不改状态/租约/审计。
+        self._validate_drain_params(op, source, targets, now_ms, limit)
+        targets = tuple(targets)
+
+        # 未知池：源池先于各目标池（按给定目标序）。
+        if source not in self._pools:
+            raise KeyError(f"unknown pool: {source!r}")
+        for target in targets:
+            if target not in self._pools:
+                raise KeyError(f"unknown target pool: {target!r}")
+
+        if op == _DRAIN_OP_START:
+            output = self._drain_start(source, targets, now_ms)
+        elif op == _DRAIN_OP_ADVANCE:
+            output = self._drain_advance(source, targets, now_ms, limit)
+        else:
+            output = self._drain_cancel(source, targets, now_ms)
+
+        self._pool_drain_cache[key] = (
+            op, source, targets, now_ms, limit, output
+        )
+        self._drain_record_chain(key, op, source, now_ms, output, replay=False)
+        return output
+
+    def _validate_drain_params(self, op, source, targets, now_ms, limit):
+        """pool_drain 参数两阶段校验：类型错 TypeError 先于任何取值/状态错。"""
+        # 类型阶段。
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if not isinstance(source, str):
+            raise TypeError(f"source must be a str, got {type(source).__name__}")
+        if not isinstance(targets, tuple):
+            raise TypeError(
+                f"targets must be a tuple, got {type(targets).__name__}"
+            )
+        for target in targets:
+            if not isinstance(target, str):
+                raise TypeError(
+                    f"target pool must be a str, got {type(target).__name__}"
+                )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+
+        # 取值阶段。
+        if op not in _DRAIN_OPS:
+            raise ValueError(f"op must be one of {_DRAIN_OPS}, got {op!r}")
+        _check_credential("source", source)
+        if len(targets) == 0:
+            raise ValueError("targets must contain at least one target pool")
+        for target in targets:
+            _check_credential("target pool", target)
+        if len(set(targets)) != len(targets):
+            raise ValueError("targets must not contain duplicate pool")
+        if source in targets:
+            raise ValueError("source pool must not be among the target pools")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (_DRAIN_MIN_LIMIT <= limit <= _DRAIN_MAX_LIMIT):
+            raise ValueError(
+                f"limit must be in {_DRAIN_MIN_LIMIT}..{_DRAIN_MAX_LIMIT}, "
+                f"got {limit}"
+            )
+
+    def _drain_holders(self, source, now_ms):
+        """源池中此刻持有有效 IPv4 租约的在线会话标识，按 Unicode 码点升序。
+
+        不老化；有效即在线、池为源池、持址且租期 > now_ms（挂起/下线/已到期
+        待老化的会话不计）。O(S log S) 时间、O(S) 辅助空间；仅供推进按码点
+        序取前 limit 项。
+        """
+        holders = [
+            sid
+            for sid, session in self._sessions.items()
+            if (
+                session["state"] == _STATE_ONLINE
+                and session["pool"] == source
+                and session["ip"] is not None
+                and session["lease"] > now_ms
+            )
+        ]
+        holders.sort()
+        return holders
+
+    def _drain_holder_count(self, source, now_ms):
+        """源池此刻有效持址会话数（口径同 _drain_holders），O(S) 时间、
+        O(1) 辅助空间；仅供开始/取消/状态取“剩余”，无需排序。"""
+        count = 0
+        for session in self._sessions.values():
+            if (
+                session["state"] == _STATE_ONLINE
+                and session["pool"] == source
+                and session["ip"] is not None
+                and session["lease"] > now_ms
+            ):
+                count += 1
+        return count
+
+    @staticmethod
+    def _render_drain(now_ms, source, state, remaining, items):
+        """顶层键序 时刻/源池/状态/剩余/项目；项键序 会话/目标池/结果。"""
+        payload = {
+            "时刻": now_ms,
+            "源池": source,
+            "状态": state,
+            "剩余": remaining,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _drain_start(self, source, targets, now_ms):
+        """开始排空：已存在同序同集记录为空操作，异序/异集 StateError；不老化。"""
+        record = self._drains.get(source)
+        if record is not None:
+            if tuple(targets) != record[1]:
+                raise StateError(
+                    f"pool {source!r} is already draining with a different target "
+                    "order"
+                )
+            # 同序同集重开始：幂等空操作，回报当前状态与剩余持址数。
+            state = record[0]
+        else:
+            self._drains[source] = [_DRAIN_STATE_DRAINING, tuple(targets)]
+            state = _DRAIN_STATE_DRAINING
+        remaining = self._drain_holder_count(source, now_ms)
+        return self._render_drain(now_ms, source, state, remaining, [])
+
+    def _drain_cancel(self, source, targets, now_ms):
+        """取消排空：目标序列须与开始时一致，否则 StateError；不老化、不迁回。"""
+        record = self._drains.get(source)
+        if record is None:
+            raise StateError(f"pool {source!r} is not being drained")
+        if tuple(targets) != record[1]:
+            raise StateError(
+                f"drain of {source!r} was started with a different target order"
+            )
+        remaining = self._drain_holder_count(source, now_ms)
+        del self._drains[source]
+        return self._render_drain(
+            now_ms, source, _DRAIN_STATE_CANCELLED, remaining, []
+        )
+
+    def _drain_choose_target(self, user, targets, now_ms):
+        """按目标池序为 user 选首个可用 (目标池, 地址 int, 是否静态)；全不可用
+        返回 None。
+
+        跳过：自身正在排空的池（任何排水源池不接收新 IPv4 分配）、处于有效
+        耗尽故障的池；静态绑定优先（该用户专属静态址被占用即试下一池，不回落
+        本池动态址）；非静态用户取池内数值最小动态空闲址（保留与静态地址从不
+        入动态堆）。只窥视、不改任何水位。
+        """
+        for target in targets:
+            if target in self._drains:
+                continue
+            pool = self._pools[target]
+            if self._pool_is_exhausted(target, now_ms):
+                continue
+            static_ip = pool.static.get(user)
+            if static_ip is not None:
+                if static_ip in pool.leases:
+                    continue
+                return target, static_ip, True
+            if pool.free:
+                return target, pool.free[0], False
+        return None
+
+    def _drain_advance(self, source, targets, now_ms, limit):
+        """推进一次：先老化，再按码点序迁移前 limit 个有效持址会话。"""
+        record = self._drains.get(source)
+        if record is None:
+            raise StateError(f"pool {source!r} is not being drained")
+        if tuple(targets) != record[1]:
+            raise StateError(
+                f"drain of {source!r} was started with a different target order"
+            )
+
+        # 先完成一次既有老化（到期挂起/退租），与其他写接口一致。
+        self._age(now_ms)
+
+        items = []
+        holders = self._drain_holders(source, now_ms)
+        for sid in holders[:limit]:
+            session = self._sessions[sid]
+            user = session["user"]
+            choice = self._drain_choose_target(user, targets, now_ms)
+            if choice is None:
+                # 无目标可承载：原地址与租期不变，固定 ResourceError，继续后项。
+                items.append(
+                    {"会话": sid, "目标池": "", "结果": _DRAIN_ITEM_FAILED}
+                )
+                continue
+            target, new_ip, is_static = choice
+            target_pool = self._pools[target]
+            source_pool = self._pools[source]
+            old_ip = session["ip"]
+
+            # 全部判定通过：先登记新租约（动态弹堆、静态仅登记），再释旧址
+            # （动态回源池堆、静态仅退租），最后改会话。目标池与源池互异、
+            # 步骤皆为不失败的本地操作，故不会双占用或半释放。
+            if not is_static:
+                heapq.heappop(target_pool.free)
+            target_pool.leases[new_ip] = sid
+            del source_pool.leases[old_ip]
+            if old_ip not in source_pool.static_ips:
+                heapq.heappush(source_pool.free, old_ip)
+            session["ip"] = new_ip
+            session["pool"] = target
+            # 仅重置 IPv4 租期；空闲期限、QoS 账本、计费累计与 IPv6 租约不变。
+            session["lease"] = now_ms + self._lease_ms
+            items.append(
+                {"会话": sid, "目标池": target, "结果": _DRAIN_ITEM_MOVED}
+            )
+
+        remaining = self._drain_holder_count(source, now_ms)
+        state = (
+            _DRAIN_STATE_DRAINED if remaining == 0 else _DRAIN_STATE_DRAINING
+        )
+        record[0] = state
+        return self._render_drain(now_ms, source, state, remaining, items)
+
+    def _drain_record_chain(self, key, op, source, now_ms, output, replay):
+        """把一次成功排空（首果或同参重放）逐项写入批量审计链并投影合规链。
+
+        有项目（推进处理了会话）时逐会话记一条，会话字段取 sid、首果结果取
+        项目结果（迁移/ResourceError）；无项目（开始/取消/空推进）记一条，
+        会话字段取源池、结果取返回状态。首调原序号 0，重放结果恒“重放”并由
+        _batch_chain_record 逐项指认对应首次事件。
+        """
+        doc = json.loads(output)
+        items = doc["项目"]
+        if items:
+            sids = [item["会话"] for item in items]
+            results = [item["结果"] for item in items]
+        else:
+            sids = [source]
+            results = [doc["状态"]]
+        origin = 0 if not replay else self._pool_drain_chain_index[key]
+        self._batch_chain_record(
+            key,
+            _BATCH_AUDIT_DRAIN,
+            sids,
+            False,
+            now_ms,
+            origin,
+            self._pool_drain_chain_index,
+            results,
+        )
+
+    def pool_drain_status(self, source, now_ms):
+        """只读查询某源池的排空状态与剩余持址数，返回 LF 结尾紧凑 JSON。
+
+        source 沿凭据约束，now_ms 为非 bool 非负 int；不老化、不改态、不缓存、
+        不审计。未知池 KeyError，该池无排空记录 StateError。剩余为此刻在源池
+        持有有效 IPv4 租约（租期 > now_ms）的在线会话数。键序
+        源池/状态/剩余。
+        """
+        _check_credential("source", source)
+        _check_int("now_ms", now_ms, 0)
+        if source not in self._pools:
+            raise KeyError(f"unknown pool: {source!r}")
+        record = self._drains.get(source)
+        if record is None:
+            raise StateError(f"pool {source!r} is not being drained")
+        remaining = self._drain_holder_count(source, now_ms)
+        payload = {"源池": source, "状态": record[0], "剩余": remaining}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _checkpoint_session_row(self, sid, session):
         """构造单个会话检查点行：双栈会话（dual）在租期后以固定键序追加
         IPv6池/IPv6前缀/IPv6租期（无在租前缀时三值为 ""/""/0）；纯 IPv4
@@ -11795,11 +12182,15 @@ class Sessions:
         return self.capacity_stats(now_ms)
 
     def _runtime_payload(self, now_ms):
-        """组装运行态检查点文档 dict（顶层键序：版本/时刻/容量/配额/摘要）。
+        """组装运行态检查点文档 dict（无排空时顶层键序：版本/时刻/容量/配额/
+        摘要；存在排空时于配额后、摘要前插入“排空”）。
 
         容量为同刻 clog 对象（其时刻等于顶层时刻），配额为同刻
-        quota_checkpoint 对象；摘要为前四键紧凑 JSON（无 LF）UTF-8 字节的
-        sha256 小写十六进制串。纯渲染，不老化、不改态。
+        quota_checkpoint 对象；排空为按源池 Unicode 升序的项（项键序
+        源池/状态/目标，目标为开始时的有序目标池列表）。摘要为除末键外全部
+        键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。无排空时形态
+        与基线逐字节一致（旧版本检查点缺“排空”，恢复时视为无排空池）。纯渲染，
+        不老化、不改态。
         """
         doc = {
             "版本": 1,
@@ -11807,6 +12198,15 @@ class Sessions:
             "容量": self._checkpoint_payload(now_ms),
             "配额": json.loads(self._quota_checkpoint_text()),
         }
+        if self._drains:
+            doc["排空"] = [
+                {
+                    "源池": source,
+                    "状态": record[0],
+                    "目标": list(record[1]),
+                }
+                for source, record in sorted(self._drains.items())
+            ]
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return doc
@@ -11860,7 +12260,7 @@ class Sessions:
             raise TypeError(f"text must be a str, got {type(text).__name__}")
 
         # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
-        now_ms, events, sessions, queued, quota_rows, summary = (
+        now_ms, events, sessions, queued, quota_rows, drain_rows, summary = (
             self._parse_runtime_checkpoint(text)
         )
 
@@ -11905,13 +12305,28 @@ class Sessions:
                     f"令牌 for {(user, template_id)!r} exceeds template bucket "
                     f"capacity {(template[0] + template[1]) * 1000}"
                 )
+        # 排空气载力：源池与各目标池均须为现存池。
+        for drain_source, _state, drain_targets in drain_rows:
+            if drain_source not in self._pools:
+                raise ResourceError(
+                    f"runtime checkpoint references unknown drain pool: "
+                    f"{drain_source!r}"
+                )
+            for drain_target in drain_targets:
+                if drain_target not in self._pools:
+                    raise ResourceError(
+                        "runtime checkpoint references unknown drain target "
+                        f"pool: {drain_target!r}"
+                    )
 
         # 覆盖状态（StateError）：目标持有待替换的会话（含墓碑）、排队项、
-        # 事件或现存模板账本，且摘要与包不同（同摘要已在上方空操作返回）。
+        # 事件、现存模板账本或排空记录，且摘要与包不同（同摘要已在上方空操作
+        # 返回）。
         if (
             self._sessions
             or self._capacity_queue
             or self._capacity_events
+            or self._drains
             or any(
                 template_id in self._templates
                 for _user, template_id in self._meter_ledgers
@@ -11955,6 +12370,12 @@ class Sessions:
         for user, template_id, used, last, tokens in quota_rows:
             new_ledgers[(user, template_id)] = [used, last, tokens]
         self._meter_ledgers = new_ledgers
+        # 排空态按检查点整体替换（旧版本检查点无排平行为空）；池存在性已在
+        # 上方承载校验通过。
+        self._drains = {
+            drain_source: [drain_state, tuple(drain_targets)]
+            for drain_source, drain_state, drain_targets in drain_rows
+        }
 
         result = self._runtime_checkpoint_text(now_ms)
         self._runtime_restore_cache[key] = (text, result)
@@ -11962,15 +12383,20 @@ class Sessions:
 
     def _parse_runtime_checkpoint(self, text):
         """解析并全量校验运行态检查点文本，返回 (时刻, 事件七元组, 会话行,
-        排队行, 配额行, 摘要)；任何文本非法均抛 ValueError。
+        排队行, 配额行, 排平行, 摘要)；任何文本非法均抛 ValueError。
 
-        顶层须恰含“版本/时刻/容量/配额/摘要”且键序如此；版本为 1，时刻为
+        顶层键序恰为“版本/时刻/容量/配额/摘要”（基线，无排空）或
+        “版本/时刻/容量/配额/排空/摘要”（含排空）；版本为 1，时刻为
         非 bool 非负 int，容量/配额分别沿用 clog/quota_checkpoint 对象契约
         （嵌套键序按原文校验后，经 _parse_checkpoint/_parse_quota_checkpoint
         全量校验），容量时刻
-        须等于顶层时刻，摘要须为规范化前四键紧凑 JSON（无 LF）UTF-8 字节的
-        sha256 小写值（与原文排版无关）。仅做结构自洽校验；用户注册、模板
-        存在、令牌桶容、上限与池址承载力由 runtime_restore 判定。
+        须等于顶层时刻，摘要须为规范化除末键外各键紧凑 JSON（无 LF）UTF-8
+        字节的 sha256 小写值（与原文排版无关）。排空为按源池升序的列表，项
+        键序源池/状态/目标：源池为凭据 str，状态仅排空中/已排空，目标为
+        1..个互异且不含源池的凭据 str（保持开始时的优先顺序）。旧版本（无
+        “排空”键）恢复时排平行为空，即视为无排空池。仅做结构自洽校验；用户
+        注册、模板存在、令牌桶容、上限、池址与排空池引用的承载力由
+        runtime_restore 判定。
         """
         try:
             doc = json.loads(text, object_pairs_hook=_unique_object)
@@ -11978,11 +12404,18 @@ class Sessions:
             raise ValueError(f"runtime checkpoint is not valid JSON: {exc}") from exc
         if not isinstance(doc, dict):
             raise ValueError("runtime checkpoint top level must be an object")
-        # 键集与键序：恰为“版本/时刻/容量/配额/摘要”且依此序（dict 保序）。
-        if list(doc) != ["版本", "时刻", "容量", "配额", "摘要"]:
+        # 键集与键序：无排空为基线五键，含排空为配额后插入“排空”的六键。
+        base_keys = ["版本", "时刻", "容量", "配额", "摘要"]
+        with_drain_keys = ["版本", "时刻", "容量", "配额", "排空", "摘要"]
+        top_keys = list(doc)
+        if top_keys == base_keys:
+            has_drain = False
+        elif top_keys == with_drain_keys:
+            has_drain = True
+        else:
             raise ValueError(
                 "runtime checkpoint top-level keys must be "
-                "版本/时刻/容量/配额/摘要 in order"
+                "版本/时刻/容量/配额/[排空/]摘要 in order"
             )
         version = doc["版本"]
         if isinstance(version, bool) or not isinstance(version, int):
@@ -11995,6 +12428,11 @@ class Sessions:
             raise ValueError("容量 must be an object")
         if not isinstance(doc["配额"], dict):
             raise ValueError("配额 must be an object")
+
+        # 排平行结构自洽校验（池是否存在交由 runtime_restore 判 ResourceError）。
+        drain_rows = []
+        if has_drain:
+            drain_rows = self._parse_drain_section(doc["排空"])
 
         # 嵌套键序按原文校验（dict 保序），先于规范化与摘要重算：容量顶层
         # 及事件/会话/排队各项沿用 clog 键序，配额沿用 quota_checkpoint
@@ -12044,7 +12482,8 @@ class Sessions:
             json.dumps(doc["配额"], ensure_ascii=False, separators=(",", ":"))
         )
 
-        # 摘要：用规范化行重建前四键（数值相等即与生成方基线逐字节一致）。
+        # 摘要：用规范化行重建除末键外各键（数值相等即与生成方基线逐字节
+        # 一致），含排空时在配额后插入规范化排平行。
         canonical_capacity = {
             "时刻": cap_now,
             "事件": [
@@ -12069,10 +12508,79 @@ class Sessions:
             "容量": canonical_capacity,
             "配额": {"版本": 1, "账本": [list(row) for row in quota_rows]},
         }
+        canonical_drains = None
+        if has_drain:
+            canonical_drains = [
+                {"源池": source, "状态": state, "目标": list(targets)}
+                for source, state, targets in drain_rows
+            ]
+            canonical_head["排空"] = canonical_drains
         blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
         if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
             raise ValueError("摘要 does not match the canonical runtime checkpoint")
-        return now_ms, events, sessions, queued, quota_rows, summary
+        return (
+            now_ms, events, sessions, queued, quota_rows, drain_rows, summary
+        )
+
+    def _parse_drain_section(self, raw):
+        """校验运行态检查点的“排空”节，返回 (源池, 状态, 目标 tuple) 列表。
+
+        须为列表；项恰含 源池/状态/目标 三键且依此序；源池为凭据 str，状态
+        仅排空中/已排空，目标为非空 list（JSON 无 tuple，规范化后为列表）、
+        各项为凭据 str、互异且不含源池；源池按 Unicode 码点升序且不重复。
+        任何不符抛 ValueError。
+        """
+        if not isinstance(raw, list):
+            raise ValueError("排空 must be a list")
+        if not raw:
+            # 键存在即承载非空排空态：无排空池的规范包不含“排空”键，空列表
+            # 既无法由生成端产生，也会令规范化往返丢键，故拒绝。
+            raise ValueError("排空 must be non-empty when present")
+        rows = []
+        last_source = None
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict) or list(item) != ["源池", "状态", "目标"]:
+                raise ValueError(
+                    "排空 item keys must be 源池/状态/目标 in order"
+                )
+            source = item["源池"]
+            state = item["状态"]
+            targets = item["目标"]
+            if not isinstance(source, str):
+                raise ValueError(
+                    f"排空[{index}].源池 must be a str, got "
+                    f"{type(source).__name__}"
+                )
+            _check_credential("排空源池", source)
+            if not isinstance(state, str) or state not in _DRAIN_STATES:
+                raise ValueError(
+                    f"排空[{index}].状态 must be one of {_DRAIN_STATES}, "
+                    f"got {state!r}"
+                )
+            if not isinstance(targets, list) or not targets:
+                raise ValueError(
+                    f"排空[{index}].目标 must be a non-empty list"
+                )
+            for target in targets:
+                if not isinstance(target, str):
+                    raise ValueError(
+                        f"排空[{index}] target must be a str, got "
+                        f"{type(target).__name__}"
+                    )
+                _check_credential("排空目标池", target)
+            if len(set(targets)) != len(targets):
+                raise ValueError(
+                    f"排空[{index}] targets must not contain duplicates"
+                )
+            if source in targets:
+                raise ValueError(
+                    f"排空[{index}] source must not be among its targets"
+                )
+            if last_source is not None and not (source > last_source):
+                raise ValueError("排空 rows must be sorted by 源池 and unique")
+            last_source = source
+            rows.append((source, state, tuple(targets)))
+        return rows
 
     def _accounting_payload(self):
         """组装计费检查点文档 dict（顶层键序：版本/事件/活动/尾哈希）。
@@ -12204,7 +12712,7 @@ class Sessions:
         config_summary = parsed["config_summary"]
         auth_summary, auth_rows = parsed["auth"]
         (
-            rt_summary, events, sessions, queued, quota_rows
+            rt_summary, events, sessions, queued, quota_rows, drain_rows
         ) = parsed["runtime"]
         (
             until, backoff_rows, fail_pair, pool_rows, waiting, trigger
@@ -12260,6 +12768,19 @@ class Sessions:
                 raise ResourceError(
                     f"service checkpoint references unknown pool: {pool_id!r}"
                 )
+        # 排空气载：源池与各目标池均须现存。
+        for drain_source, _state, drain_targets in drain_rows:
+            if drain_source not in self._pools:
+                raise ResourceError(
+                    f"service checkpoint references unknown drain pool: "
+                    f"{drain_source!r}"
+                )
+            for drain_target in drain_targets:
+                if drain_target not in self._pools:
+                    raise ResourceError(
+                        "service checkpoint references unknown drain target "
+                        f"pool: {drain_target!r}"
+                    )
         # 统计引用：用户失败行与用户计量行的标识须注册；模板计量不验引用。
         for user, _a, _r, _st, _b in fail_rows:
             if user not in self._auth:
@@ -12308,6 +12829,7 @@ class Sessions:
             self._sessions
             or self._capacity_queue
             or self._capacity_events
+            or self._drains
             or any(
                 template_id in self._templates
                 for _user, template_id in self._meter_ledgers
@@ -12371,6 +12893,13 @@ class Sessions:
             pool_id: pool_until for pool_id, pool_until in pool_rows
         }
         self._timeout_at = trigger if waiting else None
+
+        # 排空态按运行态检查点整体替换（旧版本运行态无排平行为空，即视为无
+        # 排空池）；池存在性已在上方承载校验通过。
+        self._drains = {
+            drain_source: [drain_state, tuple(drain_targets)]
+            for drain_source, drain_state, drain_targets in drain_rows
+        }
 
         self._establish_total = total
         self._establish_success = success
@@ -12727,9 +13256,11 @@ class Sessions:
                 "认证 must be a canonical version 2 auth checkpoint object"
             )
 
-        # 运行态：解析返回 (时刻, 事件七元组, 会话行, 排队行, 配额行, 摘要)。
+        # 运行态：解析返回 (时刻, 事件七元组, 会话行, 排队行, 配额行,
+        # 排平行, 摘要)；旧版本运行态无“排空”，排平行为空。
         (
-            runtime_now, events, sessions, queued, quota_rows, rt_summary
+            runtime_now, events, sessions, queued, quota_rows, drain_rows,
+            rt_summary,
         ) = self._parse_runtime_checkpoint(recode(raw_runtime))
         if runtime_now != now_ms:
             raise ValueError(
@@ -12762,6 +13293,12 @@ class Sessions:
             },
             "配额": {"版本": 1, "账本": [list(row) for row in quota_rows]},
         }
+        if drain_rows:
+            canon_runtime["排空"] = [
+                {"源池": drain_source, "状态": drain_state,
+                 "目标": list(drain_targets)}
+                for drain_source, drain_state, drain_targets in drain_rows
+            ]
         canon_runtime["摘要"] = hashlib.sha256(
             recode(canon_runtime).encode("utf-8")
         ).hexdigest()
@@ -12882,7 +13419,9 @@ class Sessions:
             "now": now_ms,
             "config_summary": config_summary,
             "auth": (auth_summary, auth_rows),
-            "runtime": (rt_summary, events, sessions, queued, quota_rows),
+            "runtime": (
+                rt_summary, events, sessions, queued, quota_rows, drain_rows
+            ),
             "fault": (
                 fault_summary, until, backoff_rows, fail_pair, pool_rows,
                 waiting, trigger,
@@ -13069,6 +13608,20 @@ class Sessions:
             v6_pool_specs,
             _template_v6_pool_order,
         ) = spec
+        # 排空中的源池与其全部目标池均不得被配置变更删除：删除任一相关池即
+        # 不可承载（ResourceError），配置原子保持原状（本方法不改任何状态）。
+        new_pool_ids = {pool_id for pool_id, _cidr, _r, _s in pool_specs}
+        for drain_source, (_state, drain_targets) in self._drains.items():
+            if drain_source not in new_pool_ids:
+                raise ResourceError(
+                    f"new config deletes draining source pool {drain_source!r}"
+                )
+            for drain_target in drain_targets:
+                if drain_target not in new_pool_ids:
+                    raise ResourceError(
+                        "new config deletes target pool "
+                        f"{drain_target!r} of drain on {drain_source!r}"
+                    )
         total_count = 0
         per_user = {}
         for session in self._sessions.values():
