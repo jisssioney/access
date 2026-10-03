@@ -152,14 +152,15 @@ class ConfigV10Test(unittest.TestCase):
         }
         return json.dumps(doc, ensure_ascii=False)
 
-    def test_export_is_v11_with_four_auth_fields(self):
+    def test_export_is_current_version_with_four_auth_fields(self):
         _auth, s = make_sessions()
         doc = json.loads(s.export_config())
-        self.assertEqual(doc["版本"], 11)
+        self.assertEqual(doc["版本"], 12)
         self.assertEqual(
-            list(doc)[-1], "模板地址池"
+            list(doc)[-1], "模板 IPv6 池"
         )
         self.assertEqual(doc["模板地址池"], [])
+        self.assertEqual(doc["IPv6 前缀池"], [])
         self.assertEqual(
             list(doc["认证"]),
             ["最大失败", "锁定毫秒", "重试基数毫秒", "重试上限毫秒"],
@@ -203,10 +204,13 @@ class ConfigV10Test(unittest.TestCase):
         doc = json.loads(s.export_config())
         doc["版本"] = 9
         del doc["模板地址池"]
+        del doc["IPv6 前缀池"]
+        del doc["模板 IPv6 池"]
         doc["认证"] = {"最大失败": 2, "锁定毫秒": 500}
         loaded = json.loads(s.load_config(json.dumps(doc, ensure_ascii=False)))
-        self.assertEqual(loaded["版本"], 11)
+        self.assertEqual(loaded["版本"], 12)
         self.assertEqual(loaded["模板地址池"], [])
+        self.assertEqual(loaded["IPv6 前缀池"], [])
         self.assertEqual(loaded["认证"], {
             "最大失败": 2, "锁定毫秒": 500,
             "重试基数毫秒": 0, "重试上限毫秒": 0,
@@ -226,12 +230,13 @@ class ConfigV10Test(unittest.TestCase):
         }, ensure_ascii=False)
         env = json.loads(s.upgrade_config(v1))
         self.assertEqual((env["源版本"], env["目标版本"], env["改变"]),
-                         (1, 11, True))
-        self.assertEqual(env["配置"]["版本"], 11)
+                         (1, 12, True))
+        self.assertEqual(env["配置"]["版本"], 12)
         self.assertEqual(env["配置"]["模板地址池"], [])
+        self.assertEqual(env["配置"]["IPv6 前缀池"], [])
         self.assertEqual(env["配置"]["认证"]["重试基数毫秒"], 0)
         self.assertEqual(env["配置"]["认证"]["重试上限毫秒"], 0)
-        # 摘要是规范 v11 配置紧凑编码的 sha256。
+        # 摘要是规范当前版本配置紧凑编码的 sha256。
         canonical = compact(env["配置"])
         self.assertEqual(
             env["摘要"],

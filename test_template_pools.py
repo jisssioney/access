@@ -1,4 +1,4 @@
-"""版本 11 模板地址池：有序候选池选择与后备切换的端到端测试。"""
+"""模板地址池：有序候选池选择与后备切换的端到端测试。"""
 
 import hashlib
 import io
@@ -52,7 +52,9 @@ def template_entry(template_id, limit=0, priority=0):
 def base_config(pools, templates=(), user_templates=(), template_pools=(),
                 total=100, per=10):
     return {
-        "版本": 11,
+        "版本": 12,
+        "IPv6 前缀池": [],
+        "模板 IPv6 池": [],
         "会话": {"总数": total, "每用户": per, "空闲毫秒": 100000,
                 "租期毫秒": 100000},
         "地址池": pools,
@@ -116,11 +118,11 @@ class ConfigV11ModelTest(unittest.TestCase):
     def test_export_shape_key_order_and_empty_default(self):
         s = make_sessions()
         doc = json.loads(s.export_config())
-        self.assertEqual(doc["版本"], 11)
+        self.assertEqual(doc["版本"], 12)
         self.assertEqual(
             list(doc),
             ["版本", "会话", "地址池", "模板", "用户模板", "容量", "认证",
-             "模板地址池"],
+             "模板地址池", "IPv6 前缀池", "模板 IPv6 池"],
         )
         self.assertEqual(doc["模板地址池"], [])
 
@@ -212,10 +214,15 @@ class ConfigV11ModelTest(unittest.TestCase):
         doc2["多余"] = 1
         with self.assertRaises(ValueError):
             load(s, doc2)
+        # v12 要求恰含两个新节；缺一节即键集不符。
         doc3 = base_config(pools=[pool_entry("default")])
-        doc3["版本"] = 12
+        del doc3["IPv6 前缀池"]
         with self.assertRaises(ValueError):
             load(s, doc3)
+        doc4 = base_config(pools=[pool_entry("default")])
+        doc4["版本"] = 13
+        with self.assertRaises(ValueError):
+            load(s, doc4)
 
     def test_upgrade_v1_to_v11_fills_empty_section(self):
         s = make_sessions()
@@ -228,12 +235,12 @@ class ConfigV11ModelTest(unittest.TestCase):
         envelope = json.loads(s.upgrade_config(v1))
         self.assertEqual(
             (envelope["源版本"], envelope["目标版本"], envelope["改变"]),
-            (1, 11, True),
+            (1, 12, True),
         )
         cfg = envelope["配置"]
-        self.assertEqual(cfg["版本"], 11)
+        self.assertEqual(cfg["版本"], 12)
         self.assertEqual(cfg["模板地址池"], [])
-        self.assertEqual(list(cfg)[-1], "模板地址池")
+        self.assertEqual(list(cfg)[-1], "模板 IPv6 池")
         canonical = compact(cfg)
         self.assertEqual(
             envelope["摘要"],
@@ -245,10 +252,13 @@ class ConfigV11ModelTest(unittest.TestCase):
         doc = json.loads(s.export_config())
         doc["版本"] = 10
         del doc["模板地址池"]
+        del doc["IPv6 前缀池"]
+        del doc["模板 IPv6 池"]
         envelope = json.loads(s.upgrade_config(compact(doc)))
-        self.assertEqual(envelope["目标版本"], 11)
+        self.assertEqual(envelope["目标版本"], 12)
         self.assertIs(envelope["改变"], True)
         self.assertEqual(envelope["配置"]["模板地址池"], [])
+        self.assertEqual(envelope["配置"]["IPv6 前缀池"], [])
 
     def test_canonical_encoding_required_in_envelope(self):
         s = make_sessions()

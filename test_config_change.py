@@ -89,7 +89,10 @@ class ConfigChangeLoadTest(unittest.TestCase):
         out = s.config_change("L", "加载", text, 100)
         self.assertEqual(out, text)
         self.assertTrue(out.endswith("\n"))
-        self.assertNotIn(" ", out.strip())
+        # 紧凑编码：无分隔符空白（v12 起键名“IPv6 前缀池”本身含空格，
+        # 属键名字面量而非排版空白）。
+        self.assertNotIn(", ", out)
+        self.assertNotIn('": ', out)
         self.assertEqual(ops(s), [(1, "配置加载", "", "成功", 0)])
         self.assertTrue(s.verify_audit())
         # 同参重放返回同串，记重放成功，原序号指 1
