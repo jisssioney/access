@@ -481,6 +481,313 @@ def _parse_config_pool(obj):
     return (str(network), canonical_reserved, canonical_static)
 
 
+def _v6_prefix_str(value):
+    """规范 IPv6 委派前缀串（主机位零），如 2001:db8::/56。"""
+    return str(value)
+
+
+def _check_v6_prefix(name, value, network=None, delegated_len=None):
+    """校验规范 IPv6 前缀串，返回其 int。
+
+    value 须为 str、可解析为 IPv6Network、主机位为零（strict）、写法规范
+    （str(network)==value）。network/delegated_len 给定时，前缀长度须恰为
+    delegated_len（按委派长度对齐）且网络地址须位于 network 内（位于池内）。
+    类型不符 TypeError，格式/对齐/越界不符 ValueError。
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {type(value).__name__}")
+    try:
+        parsed = ipaddress.IPv6Network(value, strict=True)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a canonical IPv6 network with zero host bits: "
+            f"{value!r}"
+        ) from exc
+    if str(parsed) != value:
+        raise ValueError(f"{name} must be a canonical IPv6 prefix: {value!r}")
+    if delegated_len is not None and parsed.prefixlen != delegated_len:
+        raise ValueError(
+            f"{name} must have prefix length {delegated_len}, got {parsed.prefixlen}"
+        )
+    if network is not None:
+        if int(parsed.network_address) < int(network.network_address) or int(
+            parsed.broadcast_address
+        ) > int(network.broadcast_address):
+            raise ValueError(
+                f"{name} {value!r} is not inside pool {str(network)!r}"
+            )
+    return int(parsed.network_address)
+
+
+def _check_v6_pool(pool):
+    """校验 IPv6 前缀池五元组 (pool_id, aggregate, delegated_len, reserved,
+    static)，返回解析后的池数据 (pool_id, network, delegated_len,
+    reserved_ints, static_map, static_ints)。
+
+    aggregate 为主机位零的规范 IPv6 网串；delegated_len 为非 bool int，
+    不得短于聚合前缀长度且不得超过 128。reserved 为规范委派前缀串元组，
+    static 为 (user, 委派前缀串) 对元组。保留项与静态项均须按委派长度对齐、
+    位于聚合池内且彼此不冲突（不重复、保留集与静态集不交）；静态用户唯一，
+    静态前缀互不重复。
+    """
+    if not isinstance(pool, tuple):
+        raise TypeError(
+            f"v6 pool must be a tuple, got {type(pool).__name__}"
+        )
+    if len(pool) != 5:
+        raise ValueError(
+            f"v6 pool must be a 5-tuple, got {len(pool)} items"
+        )
+    pool_id, aggregate, delegated_len, reserved, static = pool
+    _check_credential("v6 pool id", pool_id)
+    if not isinstance(aggregate, str):
+        raise TypeError(
+            f"aggregate must be a str, got {type(aggregate).__name__}"
+        )
+    try:
+        network = ipaddress.IPv6Network(aggregate, strict=True)
+    except ValueError as exc:
+        raise ValueError(
+            "aggregate must be a canonical IPv6 network with zero host bits: "
+            f"{aggregate!r}"
+        ) from exc
+    if str(network) != aggregate:
+        raise ValueError(f"aggregate must be canonical: {aggregate!r}")
+    if isinstance(delegated_len, bool) or not isinstance(delegated_len, int):
+        raise TypeError(
+            f"delegated length must be an int, got {type(delegated_len).__name__}"
+        )
+    if not (network.prefixlen <= delegated_len <= _V6_MAX_PREFIXLEN):
+        raise ValueError(
+            "delegated length must be >= aggregate prefix length "
+            f"{network.prefixlen} and <= {_V6_MAX_PREFIXLEN}, got {delegated_len}"
+        )
+
+    if not isinstance(reserved, tuple):
+        raise TypeError(
+            f"reserved must be a tuple, got {type(reserved).__name__}"
+        )
+    reserved_ints = set()
+    for prefix_str in reserved:
+        prefix_int = _check_v6_prefix(
+            "reserved IPv6 prefix", prefix_str, network, delegated_len
+        )
+        if prefix_int in reserved_ints:
+            raise ValueError(f"duplicate reserved IPv6 prefix: {prefix_str!r}")
+        reserved_ints.add(prefix_int)
+
+    if not isinstance(static, tuple):
+        raise TypeError(f"static must be a tuple, got {type(static).__name__}")
+    static_map = {}
+    static_ints = set()
+    for pair in static:
+        if not isinstance(pair, tuple):
+            raise TypeError(
+                f"static entry must be a (user, prefix) tuple, got {type(pair).__name__}"
+            )
+        if len(pair) != 2:
+            raise ValueError(
+                f"static entry must be a 2-tuple (user, prefix), got {len(pair)} items"
+            )
+        user, prefix_str = pair
+        _check_credential("static user", user)
+        prefix_int = _check_v6_prefix(
+            "static IPv6 prefix", prefix_str, network, delegated_len
+        )
+        if user in static_map:
+            raise ValueError(f"duplicate static user: {user!r}")
+        if prefix_int in static_ints:
+            raise ValueError(f"duplicate static IPv6 prefix: {prefix_str!r}")
+        if prefix_int in reserved_ints:
+            raise ValueError(
+                f"static IPv6 prefix {prefix_str!r} must not be in reserved set"
+            )
+        static_map[user] = prefix_int
+        static_ints.add(prefix_int)
+
+    return (
+        pool_id, network, delegated_len, reserved_ints, static_map, static_ints
+    )
+
+
+def _parse_config_v6_pools(obj):
+    """校验 v12 “IPv6前缀池”节，返回按标识升序的前缀池规范元组。
+
+    每项为对象，键恰为“标识/聚合前缀/委派长度/保留前缀/静态绑定”（键序在
+    规范重编码比对时约束）：标识沿用凭据约束且全表唯一；聚合前缀为规范
+    IPv6 网串；委派长度为非 bool int，不短于聚合前缀且不超过 128；保留前缀
+    为按委派长度对齐、位于池内的规范 IPv6 前缀串列表（规范化按数值升序）；
+    静态绑定为 [user, 前缀] 串对列表（规范化按 user 升序），同样按委派长度
+    对齐、位于池内，且与保留项及其他静态项互不冲突。结构、类型、值、重复、
+    排序或对齐/越界错均抛 ValueError。
+    """
+    if not isinstance(obj, list):
+        raise ValueError(
+            f"{_V6_POOLS_KEY} must be a list, got {type(obj).__name__}"
+        )
+    specs = []
+    seen_ids = set()
+    for item in obj:
+        if not isinstance(item, dict) or set(item) != {
+            "标识", "聚合前缀", "委派长度", "保留前缀", "静态绑定"
+        }:
+            raise ValueError(
+                "IPv6 pool entry keys must be exactly "
+                "标识/聚合前缀/委派长度/保留前缀/静态绑定"
+            )
+        pool_id = item["标识"]
+        try:
+            _check_credential("IPv6 pool id", pool_id)
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
+        if pool_id in seen_ids:
+            raise ValueError(f"duplicate IPv6 pool id: {pool_id!r}")
+        seen_ids.add(pool_id)
+        aggregate = item["聚合前缀"]
+        delegated_len = item["委派长度"]
+        raw_reserved = item["保留前缀"]
+        raw_static = item["静态绑定"]
+        if isinstance(delegated_len, bool) or not isinstance(delegated_len, int):
+            raise ValueError(
+                f"委派长度 must be an int, got {type(delegated_len).__name__}"
+            )
+        if not isinstance(raw_reserved, list) or not all(
+            isinstance(part, str) for part in raw_reserved
+        ):
+            raise ValueError("保留前缀 must be a list of IPv6 prefix strings")
+        if not isinstance(raw_static, list):
+            raise ValueError(f"静态绑定 must be a list, got {type(raw_static).__name__}")
+        pairs = []
+        for entry in raw_static:
+            if (
+                not isinstance(entry, list)
+                or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or not isinstance(entry[1], str)
+            ):
+                raise ValueError("静态绑定 entries must be [user, prefix] string pairs")
+            pairs.append((entry[0], entry[1]))
+        parsed = _check_v6_pool(
+            (
+                pool_id,
+                aggregate,
+                delegated_len,
+                tuple(raw_reserved),
+                tuple(pairs),
+            )
+        )
+        _pid, network, dlen, reserved_ints, static_map, _static_ints = parsed
+        canonical_reserved = tuple(
+            str(ipaddress.IPv6Network((prefix_int, dlen)))
+            for prefix_int in sorted(reserved_ints)
+        )
+        canonical_static = tuple(
+            (
+                user,
+                str(ipaddress.IPv6Network((static_map[user], dlen))),
+            )
+            for user in sorted(static_map)
+        )
+        specs.append(
+            (
+                pool_id,
+                str(network),
+                dlen,
+                canonical_reserved,
+                canonical_static,
+            )
+        )
+    specs.sort(key=lambda item: item[0])
+    return tuple(specs)
+
+
+def _parse_template_v6_pools(raw, v6_pool_specs, templates):
+    """校验 v12 “模板IPv6池”节，返回按模板标识升序的 (模板标识, 前缀池序列)
+    元组；序列为 1..32 个互异前缀池标识的 tuple，保持文档优先序。
+
+    结构、类型、数量、排序、重复或引用错均抛 ValueError，规则同
+    _parse_template_pools。
+    """
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"{_TEMPLATE_V6_POOLS_KEY} must be a list, got {type(raw).__name__}"
+        )
+    pool_ids = {pool_id for pool_id, *_rest in v6_pool_specs}
+    template_ids = {template_id for template_id, *_rest in templates}
+    entries = []
+    previous_template = None
+    seen_templates = set()
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError(
+                f"{_TEMPLATE_V6_POOLS_KEY} entries must be "
+                "[模板标识, [前缀池标识...]] pairs"
+            )
+        template_id, pool_sequence = item
+        if not isinstance(template_id, str):
+            raise ValueError(
+                f"{_TEMPLATE_V6_POOLS_KEY} template id must be a str, "
+                f"got {type(template_id).__name__}"
+            )
+        try:
+            _check_credential("template v6 pool template id", template_id)
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
+        if template_id in seen_templates:
+            raise ValueError(
+                f"duplicate template in {_TEMPLATE_V6_POOLS_KEY}: {template_id!r}"
+            )
+        if previous_template is not None and template_id <= previous_template:
+            raise ValueError(
+                f"{_TEMPLATE_V6_POOLS_KEY} must be sorted by template id: "
+                f"{template_id!r} after {previous_template!r}"
+            )
+        seen_templates.add(template_id)
+        previous_template = template_id
+        if template_id not in template_ids:
+            raise ValueError(
+                f"{_TEMPLATE_V6_POOLS_KEY} references unknown template: "
+                f"{template_id!r}"
+            )
+        if not isinstance(pool_sequence, list):
+            raise ValueError(
+                f"{_TEMPLATE_V6_POOLS_KEY} pool sequence must be a list, "
+                f"got {type(pool_sequence).__name__}"
+            )
+        if not (1 <= len(pool_sequence) <= _MAX_TEMPLATE_POOL_CHOICES):
+            raise ValueError(
+                f"{_TEMPLATE_V6_POOLS_KEY} pool sequence for {template_id!r} "
+                f"must contain 1..{_MAX_TEMPLATE_POOL_CHOICES} pool ids, "
+                f"got {len(pool_sequence)}"
+            )
+        sequence = []
+        seen_pools = set()
+        for pool_id in pool_sequence:
+            if not isinstance(pool_id, str):
+                raise ValueError(
+                    f"{_TEMPLATE_V6_POOLS_KEY} pool id must be a str, "
+                    f"got {type(pool_id).__name__}"
+                )
+            try:
+                _check_credential("template v6 pool id", pool_id)
+            except TypeError as exc:
+                raise ValueError(str(exc)) from exc
+            if pool_id in seen_pools:
+                raise ValueError(
+                    f"duplicate v6 pool {pool_id!r} in {_TEMPLATE_V6_POOLS_KEY} "
+                    f"sequence for {template_id!r}"
+                )
+            seen_pools.add(pool_id)
+            if pool_id not in pool_ids:
+                raise ValueError(
+                    f"{_TEMPLATE_V6_POOLS_KEY} references unknown IPv6 pool: "
+                    f"{pool_id!r}"
+                )
+            sequence.append(pool_id)
+        entries.append((template_id, tuple(sequence)))
+    return tuple(entries)
+
+
 def _parse_config_templates(doc, version):
     """校验 v3+ 的模板与用户模板，返回规范化 (templates, user_templates)。
 
@@ -760,10 +1067,14 @@ def _parse_config_doc(doc, default_auth=None):
     """由已解析对象文档校验并迁移为规范化 spec；任何错均抛 ValueError。
 
     spec 为 (total, per, idle_ms, lease_ms, pools, templates, user_templates,
-    capacity, auth, template_pool_order)，capacity 为 (队列上限, 最大等待毫秒,
+    capacity, auth, template_pool_order, v6_pools, template_v6_pool_order)，
+    capacity 为 (队列上限, 最大等待毫秒,
     队满策略)，auth 为
     (最大失败, 锁定毫秒, 重试基数毫秒, 重试上限毫秒)，template_pool_order 为
-    按模板标识升序的 (模板标识, (池标识...)) 元组（每项 1..32 个互异池标识）；
+    按模板标识升序的 (模板标识, (池标识...)) 元组（每项 1..32 个互异池标识），
+    v6_pools 为按标识升序的 (标识, 聚合前缀, 委派长度, 保留前缀, 静态绑定)
+    元组（保留/静态已规范化排序），template_v6_pool_order 为按模板标识升序的
+    (模板标识, (前缀池标识...)) 元组（每项 1..32 个互异前缀池标识）；
     pools 为按标识升序的 (标识, cidr, reserved,
     static) 元组，reserved/static 已规范化排序；templates 为按标识升序的
     (标识, 限速, 突发, 配额, 周期毫秒, 会话上限, 排队优先级, 超限) 元组，
@@ -777,15 +1088,21 @@ def _parse_config_doc(doc, default_auth=None):
     键序 队列上限/最大等待毫秒/队满策略）；v10（版本=10）认证节增重试基数
     毫秒/重试上限毫秒（非 bool 非负 int，同时为 0 或同时为正，上限不小于
     基数，键序 最大失败/锁定毫秒/重试基数毫秒/重试上限毫秒）；v11（版本=11）
-    在认证节后新增“模板地址池”（顶层末位键，固定键序）：按模板标识升序的
+    在认证节后新增“模板地址池”（固定键序）：按模板标识升序的
     二元数组列表，每项 [模板标识, [池标识...]]，池序列为 1..32 个互异且已
-    定义的池标识，同一模板至多出现一次，模板标识须已定义。v1/v2 迁移
+    定义的池标识，同一模板至多出现一次，模板标识须已定义；v12（版本=12）
+    在末位新增“IPv6前缀池”与“模板IPv6池”两节（顶层键序
+    …/模板地址池/IPv6前缀池/模板IPv6池）：前缀池对象键序
+    标识/聚合前缀/委派长度/保留前缀/静态绑定，委派长度不短于聚合前缀且不
+    超过 128，保留与静态项按委派长度对齐、位于池内且彼此不冲突；模板 IPv6
+    池节为按模板标识升序的 [模板标识, [前缀池标识...]] 二元数组列表，每项
+    1..32 个互异且已定义的前缀池标识。v1/v2 迁移
     时模板、用户模板为空；v1-v3 迁移时容量补默认 (1024, 0, 拒绝)；v1-v8
     迁移时队满策略补“拒绝”；v1-v4 迁移时认证补 default_auth（认证器当前
     四值，缺省 None 时拒绝非 v5+ 文档）；v1-v5 迁移时模板会话上限补 0；
     v1-v6 迁移时模板周期毫秒补 0；v1-v7 迁移时模板排队优先级补 0；v8 只
     规范化容量旧两键；v1-v9 迁移时重试两项补 0（无退避）；v1-v10 升级时
-    模板地址池列表补空。重复/未知/缺失
+    模板地址池列表补空；v1-v11 升级时两节 IPv6 配置补空。重复/未知/缺失
     键、结构、类型、数量、排序、值、引用或版本错均抛 ValueError。
     """
     if not isinstance(doc, dict):
@@ -793,12 +1110,21 @@ def _parse_config_doc(doc, default_auth=None):
     version = doc.get("版本")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"版本 must be an int, got {type(version).__name__}")
-    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
-        raise ValueError(f"版本 must be 1..11, got {version}")
+    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        raise ValueError(f"版本 must be 1..12, got {version}")
     _config_keys_v5 = (
         "版本", "会话", "地址池", "模板", "用户模板", "容量", "认证"
     )
-    if version == 11:
+    if version == 12:
+        if set(doc) != set(_config_keys_v5) | {
+            _TEMPLATE_POOLS_KEY, _V6_POOLS_KEY, _TEMPLATE_V6_POOLS_KEY
+        }:
+            raise ValueError(
+                "config keys must be exactly "
+                "版本/会话/地址池/模板/用户模板/容量/认证/模板地址池/"
+                "IPv6前缀池/模板IPv6池"
+            )
+    elif version == 11:
         if set(doc) != set(_config_keys_v5) | {_TEMPLATE_POOLS_KEY}:
             raise ValueError(
                 "config keys must be exactly "
@@ -896,6 +1222,15 @@ def _parse_config_doc(doc, default_auth=None):
     else:
         # v1-v10 迁移：模板地址池列表为空，全部自动取址沿用 default 池。
         template_pool_order = ()
+    if version >= 12:
+        v6_pool_specs = _parse_config_v6_pools(doc[_V6_POOLS_KEY])
+        template_v6_pool_order = _parse_template_v6_pools(
+            doc[_TEMPLATE_V6_POOLS_KEY], v6_pool_specs, templates
+        )
+    else:
+        # v1-v11 迁移：两节 IPv6 配置补空，保持纯 IPv4 行为。
+        v6_pool_specs = ()
+        template_v6_pool_order = ()
     return (
         numbers["总数"],
         numbers["每用户"],
@@ -907,6 +1242,8 @@ def _parse_config_doc(doc, default_auth=None):
         capacity,
         auth,
         template_pool_order,
+        v6_pool_specs,
+        template_v6_pool_order,
     )
 
 
@@ -999,7 +1336,7 @@ def _parse_template_pools(raw, pool_specs, templates):
 
 
 def _config_payload(spec):
-    """由规范化 spec 构建 export/升级共用的 v11 配置 payload（固定键序与排序）。"""
+    """由规范化 spec 构建 export/升级共用的 v12 配置 payload（固定键序与排序）。"""
     (
         total,
         per,
@@ -1011,6 +1348,8 @@ def _config_payload(spec):
         (queue_limit, max_wait_ms, queue_policy),
         (max_fail, lock_ms, retry_base_ms, retry_cap_ms),
         template_pool_order,
+        v6_pool_specs,
+        template_v6_pool_order,
     ) = spec
     pools = [
         {
@@ -1020,6 +1359,16 @@ def _config_payload(spec):
             "静态": [[user, ip] for user, ip in static],
         }
         for pool_id, cidr, reserved, static in pool_specs
+    ]
+    v6_pools = [
+        {
+            "标识": pool_id,
+            "聚合前缀": aggregate,
+            "委派长度": delegated_len,
+            "保留前缀": list(reserved),
+            "静态绑定": [[user, prefix] for user, prefix in static],
+        }
+        for pool_id, aggregate, delegated_len, reserved, static in v6_pool_specs
     ]
     return {
         "版本": _CONFIG_VERSION,
@@ -1063,6 +1412,11 @@ def _config_payload(spec):
             [template_id, list(pool_sequence)]
             for template_id, pool_sequence in template_pool_order
         ],
+        _V6_POOLS_KEY: v6_pools,
+        _TEMPLATE_V6_POOLS_KEY: [
+            [template_id, list(pool_sequence)]
+            for template_id, pool_sequence in template_v6_pool_order
+        ],
     }
 
 
@@ -1092,8 +1446,8 @@ def _parse_upgrade_envelope(doc):
     """严格复核升级包对象，返回 (源版本, 目标版本, 改变, 摘要, spec)。
 
     文档须恰含“源版本/目标版本/改变/摘要/配置”五键（键序亦须如此），
-    源版本为 1..11 的非 bool int、目标版本恒为 11、改变为 bool 且等于
-    源版本 != 11、摘要为 str；配置须为能解析出 v11 spec 的对象，再将其
+    源版本为 1..12 的非 bool int、目标版本恒为 12、改变为 bool 且等于
+    源版本 != 12、摘要为 str；配置须为能解析出 v12 spec 的对象，再将其
     规范化重编码与文档原编码逐字节比对（拒键序/形态/值偏差），摘要须为
     规范配置紧凑编码（无 LF）UTF-8 字节的 sha256 小写十六进制。任何不符
     均抛 ValueError。
@@ -1118,8 +1472,8 @@ def _parse_upgrade_envelope(doc):
     summary = doc["摘要"]
     if isinstance(source, bool) or not isinstance(source, int):
         raise ValueError(f"源版本 must be an int, got {type(source).__name__}")
-    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
-        raise ValueError(f"源版本 must be 1..11, got {source}")
+    if source not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        raise ValueError(f"源版本 must be 1..12, got {source}")
     if isinstance(target, bool) or not isinstance(target, int):
         raise ValueError(f"目标版本 must be an int, got {type(target).__name__}")
     if target != _CONFIG_VERSION:
@@ -1141,7 +1495,7 @@ def _parse_upgrade_envelope(doc):
     # 配置自 JSON 解析而来，再编码必成功；键序/排序/值偏差令两串不一致。
     original = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
     if original != canonical:
-        raise ValueError("配置 must be a canonical v11 config object")
+        raise ValueError("配置 must be a canonical v12 config object")
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if summary != digest:
         raise ValueError("摘要 does not match the canonical config digest")
@@ -1374,12 +1728,25 @@ _MAX_TEMPLATE_SESSIONS = 10000
 _MAX_QUEUE_PRIORITY = 100
 # 有效优先级上界：min(1000, 基础 + 等待秒数)。
 _MAX_EFFECTIVE_PRIORITY = 1000
-_CONFIG_VERSION = 11
+_CONFIG_VERSION = 12
 # v11 新增顶层键“模板地址池”：按模板标识升序的二元数组列表
 # [[模板标识, [池标识...]], ...]，每项池序列为 1..32 个互异且已定义的池标识，
 # 同一模板至多出现一次；未列出的模板沿用 default 池自动取址。
 _TEMPLATE_POOLS_KEY = "模板地址池"
 _MAX_TEMPLATE_POOL_CHOICES = 32
+# v12 新增顶层键“IPv6前缀池”与“模板IPv6池”：前者为按标识升序的前缀池对象
+# 列表（标识/聚合前缀/委派长度/保留前缀/静态绑定），后者为按模板标识升序的
+# 二元数组列表 [[模板标识, [前缀池标识...]], ...]，每项 1..32 个互异且已
+# 定义的前缀池标识。配置了 IPv6 池序列的模板以双栈上线；未配置者及 v1-v11
+# 升级配置保持纯 IPv4。
+_V6_POOLS_KEY = "IPv6前缀池"
+_TEMPLATE_V6_POOLS_KEY = "模板IPv6池"
+# IPv6 委派长度范围：不短于聚合前缀长度且不超过 128。
+_V6_MAX_PREFIXLEN = 128
+# 输出/检查点中 v6 三字段的固定键名（前缀池归属、规范委派前缀、前缀租期）。
+_V6_PREFIX_KEY = "IPv6前缀"
+_V6_POOL_OUTPUT_KEY = "前缀池"
+_V6_LEASE_KEY = "前缀租期"
 # 每 Sessions 保留的最近配置修订条数（初始窗口含构造态修订 0）；超限淘汰
 # 最旧项，当前修订永不淘汰。
 _CONFIG_HISTORY_LIMIT = 256
@@ -1614,6 +1981,203 @@ class _Pool:
         heapq.heapify(self.free)
         # 本池已租用地址 int -> sid（含静态与动态）。
         self.leases = {}
+
+
+class _V6Pool:
+    """单个 IPv6 前缀委派池：保留/静态集、稀疏空闲区间集与本池租用前缀表。
+
+    可委派前缀按委派长度 dlen 对齐，在聚合池内序号 k 为 0..N-1
+    （N=2**(dlen-聚合前缀长)，int = 聚合基址 + k<<(128-dlen)）。绝不按聚合
+    池完整展开（N 可达 2**80）：
+
+    - 保留前缀与静态前缀构成不可动态分配的“阻塞序号”升序表；
+    - 空闲动态序号以互不相交的半开区间 [start,end) 表示，start->end 与
+      end->start 双映射定位、start 最小堆取“数值最小的空闲前缀”，分配仅从
+      最小区间左端摘除，释放在相邻区间间合并（区间只左缩并合并、从不分裂）；
+      堆中陈旧项惰性弹出，陈旧项超界时以现存起点 heapify 摊还压实；
+    - 动态前缀释放后回空闲区间并与邻接区间合并；静态前缀不回动态集、仅退租。
+
+    任意时刻空闲区间数不超过“在租动态前缀数 + 阻塞数 + 1”（两个空闲区间
+    之间必有在租或阻塞序号相隔），故额外常驻空间 O(L+R+S)（L 活动租约、
+    R 保留项、S 静态绑定）；单次选择/取/还为 O(log L)。
+    """
+
+    __slots__ = (
+        "pool_id",
+        "network",
+        "dlen",
+        "reserved",
+        "static",
+        "static_ints",
+        "base_int",
+        "shift",
+        "count",
+        "blocked",
+        "start_end",
+        "end_start",
+        "heap",
+        "dyn_leases",
+        "leases",
+    )
+
+    def __init__(self, parsed):
+        (
+            pool_id,
+            network,
+            dlen,
+            reserved,
+            static,
+            static_ints,
+        ) = parsed
+        self.pool_id = pool_id
+        self.network = network
+        self.dlen = dlen
+        self.reserved = reserved
+        self.static = static
+        self.static_ints = static_ints
+        self.base_int = int(network.network_address)
+        self.shift = 128 - dlen
+        self.count = 1 << (dlen - network.prefixlen)
+        # 阻塞序号（保留与静态，互斥）升序表。
+        self.blocked = sorted(
+            (prefix_int - self.base_int) >> self.shift
+            for prefix_int in (reserved | static_ints)
+        )
+        self.start_end = {}
+        self.end_start = {}
+        self.heap = []
+        self.dyn_leases = 0
+        # 初始空闲区间 = [0,N) 扣除全部阻塞序号，O(R+S) 生成。
+        self._init_free_intervals(())
+        # 本池已租用委派前缀 int -> sid（含静态与动态）。
+        self.leases = {}
+
+    def _add_free_interval(self, start, end):
+        """登记空闲区间 [start,end)（start<end），并入堆。"""
+        self.start_end[start] = end
+        self.end_start[end] = start
+        heapq.heappush(self.heap, start)
+
+    def _init_free_intervals(self, leased_dynamic):
+        """由阻塞序号与在租动态序号（升序可迭代）重建全部空闲区间，
+        O(L+R+S)，不按聚合池逐序号展开。"""
+        self.start_end = {}
+        self.end_start = {}
+        occupied = []
+        i = j = 0
+        blocked, leased = self.blocked, leased_dynamic
+        while i < len(blocked) and j < len(leased):
+            if blocked[i] < leased[j]:
+                occupied.append(blocked[i])
+                i += 1
+            else:
+                occupied.append(leased[j])
+                j += 1
+        occupied.extend(blocked[i:])
+        occupied.extend(leased[j:])
+        prev = 0
+        for k in occupied:
+            if prev < k:
+                self._add_free_interval(prev, k)
+            prev = k + 1
+        if prev < self.count:
+            self._add_free_interval(prev, self.count)
+        self.heap = list(self.start_end)
+        heapq.heapify(self.heap)
+
+    def _peek_min_dynamic(self):
+        """数值最小的空闲动态委派前缀 int；无则 None，不改态。"""
+        heap = self.heap
+        start_end = self.start_end
+        while heap:
+            start = heap[0]
+            if start in start_end:
+                return self.base_int + (start << self.shift)
+            heapq.heappop(heap)
+        return None
+
+    def _compact_heap_if_needed(self):
+        """陈旧堆项超过现存区间数一定倍数时摊还压实，保证堆常驻 O(L+R+S)。"""
+        if len(self.heap) > (len(self.start_end) << 1) + 16:
+            self.heap = list(self.start_end)
+            heapq.heapify(self.heap)
+
+    def candidate(self, user):
+        """对 user 的可取委派前缀窥视，O(log L)，不改态：
+
+        有专属静态前缀时：未租用即返回该前缀，已被任一会话租用返回 None 且
+        不回落动态前缀；否则取数值最小的空闲动态前缀，无则 None。
+        """
+        static_int = self.static.get(user)
+        if static_int is None:
+            return self._peek_min_dynamic()
+        if static_int in self.leases:
+            return None
+        return static_int
+
+    def take(self, prefix_int, sid):
+        """登记一条委派租约（窥视已确认其空闲）：动态前缀自最小空闲区间左端
+        摘除，静态前缀仅登记；O(log L)。"""
+        self.leases[prefix_int] = sid
+        if prefix_int in self.static_ints:
+            return
+        self.dyn_leases += 1
+        index = (prefix_int - self.base_int) >> self.shift
+        heap = self.heap
+        # 窥视不变量保证动态前缀即全局最小空闲序号，其区间起点正是堆顶。
+        while heap[0] != index or index not in self.start_end:
+            heapq.heappop(heap)
+        start = heapq.heappop(heap)
+        end = self.start_end.pop(start)
+        del self.end_start[end]
+        if start + 1 < end:
+            self._add_free_interval(start + 1, end)
+        self._compact_heap_if_needed()
+
+    def release(self, prefix_int):
+        """释放一条委派租约：动态前缀回空闲区间并与邻接区间合并，静态前缀仅
+        退租；O(log L)。"""
+        del self.leases[prefix_int]
+        if prefix_int in self.static_ints:
+            return
+        self.dyn_leases -= 1
+        index = (prefix_int - self.base_int) >> self.shift
+        left_start = self.end_start.pop(index, None)
+        right_end = self.start_end.pop(index + 1, None)
+        if left_start is not None:
+            del self.start_end[left_start]
+        if right_end is not None:
+            del self.end_start[right_end]
+        new_start = left_start if left_start is not None else index
+        new_end = right_end if right_end is not None else index + 1
+        self._add_free_interval(new_start, new_end)
+        self._compact_heap_if_needed()
+
+    def rebuild(self, leases):
+        """按承载租约表重建本池租约态（检查点恢复/配置热加载用）：leases 为
+        {前缀 int: sid}，仅含本池在租前缀；O(L+R+S)。"""
+        self.leases = dict(leases)
+        self.dyn_leases = 0
+        leased_dynamic = []
+        for prefix_int in leases:
+            if prefix_int not in self.static_ints:
+                self.dyn_leases += 1
+                leased_dynamic.append(
+                    (prefix_int - self.base_int) >> self.shift
+                )
+        leased_dynamic.sort()
+        self._init_free_intervals(leased_dynamic)
+
+    def dynamic_total(self):
+        """可动态委派前缀总数 N - 保留数 - 静态数。"""
+        return self.count - len(self.reserved) - len(self.static_ints)
+
+    def dynamic_free(self):
+        """当前空闲动态委派前缀数（按区间长度求和，不逐序号展开）。"""
+        total = 0
+        for start, end in self.start_end.items():
+            total += end - start
+        return total
 
 
 class Sessions:
@@ -2106,14 +2670,21 @@ class Sessions:
         # v11 模板地址池优先序列：模板标识 -> (池标识, ...)（1..32 项互异、
         # 按文档优先序）；未列入的模板自动取址沿用 default 池。
         self._template_pool_order = {}
+        # v12 IPv6 前缀委派池：pool_id -> _V6Pool；为空表示未启用 IPv6，
+        # 全部输出与纯 IPv4 基线逐字节一致。模板 IPv6 池优先序列：
+        # 模板标识 -> (前缀池标识, ...)；未列入的模板保持纯 IPv4。
+        self._v6_pools = {}
+        self._template_v6_pool_order = {}
         # 容量背压：队列上限（0 表示不限）、最大等待毫秒（0 表示不限）、
         # 队满策略（拒绝/替换）。
         self._queue_limit = _MAX_QUEUE
         self._max_wait_ms = 0
         self._queue_policy = _QUEUE_POLICY_REJECT
 
-        # sid -> {"user": str, "state": str, "deadline": int, "ip": int|None,
-        #         "lease": int, "pool": str|None}
+        # sid -> {"user", "state", "deadline", "ip"(v4 int|None),
+        #         "lease"(v4 int), "pool"(v4 id|None),
+        #         "v6"(前缀 int|None), "v6pool"(前缀池 id|None),
+        #         "v6lease"(前缀租期 int)}；v6 三键在启用 IPv6 时存在。
         self._sessions = {}
         # key -> (op, sid, args, now_ms, outcome)
         # outcome 为 ("ok", json_str) 或 ("err", (exc_class, exc_args))
@@ -2655,22 +3226,28 @@ class Sessions:
     def _age(self, now_ms):
         """到期（含同刻）处理：租约到期或空闲到期均释址，空闲到期再挂起。
 
-        挂起即无址：空闲到期先释址再挂起、期限清零，挂起会话仍占全局与
-        单用户上限但不计在线。
+        挂起即无址：空闲到期先同步释放 v4 与 v6 两类租约再挂起、期限清零，
+        挂起会话仍占全局与单用户上限但不计在线。双栈两类租约在迁移后可能
+        时刻不同，故各自的租期到期独立释放（v4 到期退 v4、v6 到期退 v6），
+        会话保留另一类仍有效租约；空闲到期则两类一并释放。
         """
         for session in self._sessions.values():
             if session["state"] != _STATE_ONLINE:
                 continue
             expired = session["deadline"] <= now_ms
-            if session["ip"] is not None and (expired or session["lease"] <= now_ms):
-                self._release(session)
             if expired:
+                self._release(session)
                 session["state"] = _STATE_SUSPENDED
                 session["deadline"] = 0
+                continue
+            if session["ip"] is not None and session["lease"] <= now_ms:
+                self._release_v4(session)
+            if session.get("v6") is not None and session["v6lease"] <= now_ms:
+                self._release_v6(session)
 
-    def _release(self, session):
-        """释放会话持址：动态地址回本池堆，静态地址仅退租，仍专属其用户。"""
-        ip_int = session["ip"]
+    def _release_v4(self, session):
+        """仅释放会话的 v4 持址：动态地址回本池堆、静态地址仅退租。"""
+        ip_int = session.get("ip")
         if ip_int is None:
             return
         pool = self._pools[session["pool"]]
@@ -2681,6 +3258,23 @@ class Sessions:
         session["ip"] = None
         session["lease"] = 0
         session["pool"] = None
+
+    def _release_v6(self, session):
+        """仅释放会话的 v6 委派前缀：动态前缀回区间集、静态前缀仅退租。"""
+        v6_int = session.get("v6")
+        if v6_int is None:
+            return
+        v6_pool = self._v6_pools[session["v6pool"]]
+        v6_pool.release(v6_int)
+        session["v6"] = None
+        session["v6lease"] = 0
+        session["v6pool"] = None
+
+    def _release(self, session):
+        """同步释放会话持有的 v4 地址与 v6 前缀两类租约（挂起/下线/停用/
+        超时/接管清场）。"""
+        self._release_v4(session)
+        self._release_v6(session)
 
     def _backend_check(self, user, now_ms, count_fault=True):
         """老化前的后端健康检查，O(1) 时空。
@@ -2821,6 +3415,51 @@ class Sessions:
                 return pool_id, ip_int
         return last_pool_id, None
 
+    def _v6_enabled(self):
+        """是否启用 IPv6 前缀委派（配置含至少一个 IPv6 前缀池）。未启用时
+        全部 API 与命令输出与纯 IPv4 基线逐字节一致。"""
+        return bool(self._v6_pools)
+
+    def _candidate_v6_pools(self, user):
+        """user 双栈取前缀的候选 IPv6 前缀池序列（按模板配置优先序）；未绑定
+        模板或模板未配置 IPv6 池序列时为空 tuple（该用户保持纯 IPv4）。"""
+        template_id = self._user_templates.get(user)
+        if template_id is None:
+            return ()
+        return self._template_v6_pool_order.get(template_id, ())
+
+    @staticmethod
+    def _candidate_v6_pools_for(user, user_templates, template_v6_pool_order):
+        """同 _candidate_v6_pools，但绑定与序列由调用方给出（热均衡演算用）。"""
+        template_id = user_templates.get(user)
+        if template_id is None:
+            return ()
+        return template_v6_pool_order.get(template_id, ())
+
+    def _select_v6_prefix(self, user, now_ms):
+        """按模板 IPv6 池优先序确定性选池取委派前缀，只读窥视不改态。
+
+        无模板序列（纯 IPv4 用户）返回 (None, None)；有序列时依次跳过处于
+        有效耗尽故障或无可取前缀（动态耗尽或专属静态前缀被占用）的池，首个
+        可取池返回 (pool_id, prefix_int)，静态优先、否则数值最小空闲动态
+        前缀。候选均现存但全部不可取时返回 (last_pool_id, None)。
+        """
+        sequence = self._candidate_v6_pools(user)
+        if not sequence:
+            return None, None
+        last_pool_id = None
+        for pool_id in sequence:
+            pool = self._v6_pools.get(pool_id)
+            if pool is None:
+                continue
+            last_pool_id = pool_id
+            if self._pool_is_exhausted(pool_id, now_ms):
+                continue
+            prefix_int = pool.candidate(user)
+            if prefix_int is not None:
+                return pool_id, prefix_int
+        return last_pool_id, None
+
     def _sim_pool_state(self, now_ms, relevant_pools, do_age):
         """构建只读预测/热均衡演算用的多池地址态，不触碰实例。
 
@@ -2897,15 +3536,99 @@ class Sessions:
             return "wait", "池故障"
         return "wait", "地址"
 
-    def _commit_session(self, sid, user, pool_id, ip_int, now_ms):
-        """全部校验通过后原子落库：登记租约（动态弹出堆顶）并建在线会话。
+    def _sim_v6_pool_state(self, now_ms, relevant_pools, do_age):
+        """构建预测/热均衡演算用的多 v6 前缀池委派态，不触碰实例。
 
-        返回 (期限, 租期)；失败路径不到达此方法，故无半分配残留。
+        返回 (v6_dyn_free, v6_static_held)：v6_dyn_free 为每池老化后动态空闲
+        委派槽计数（do_age=False 取当前空闲区间计数），v6_static_held 为未老
+        化持租的 (前缀池标识, 专属用户) 集合。仅为现存相关前缀池建态，租约表
+        不复制。时间 O(S)、辅助 O(P+U_st)。
+        """
+        relevant = set(relevant_pools)
+        v6_dyn_free = {}
+        for pool_id in relevant:
+            pool = self._v6_pools.get(pool_id)
+            if pool is not None:
+                v6_dyn_free[pool_id] = pool.dynamic_free()
+        v6_static_held = set()
+        for session in self._sessions.values():
+            if session["state"] == _STATE_OFFLINE:
+                continue
+            if session["state"] != _STATE_ONLINE:
+                continue
+            v6_int = session.get("v6")
+            if v6_int is None:
+                continue
+            pool_id = session.get("v6pool")
+            if pool_id not in relevant:
+                continue
+            aging = do_age and (
+                session["deadline"] <= now_ms or session["v6lease"] <= now_ms
+            )
+            pool = self._v6_pools[pool_id]
+            if aging:
+                if v6_int not in pool.static_ints:
+                    v6_dyn_free[pool_id] = v6_dyn_free.get(pool_id, 0) + 1
+            elif v6_int in pool.static_ints:
+                v6_static_held.add((pool_id, session["user"]))
+        return v6_dyn_free, v6_static_held
+
+    def _sim_try_v6(self, user, now_ms, candidates, v6_dyn_free, v6_static_held):
+        """模拟态下按候选 v6 前缀池序尝试取委派前缀，成功即扣模拟占用并返回
+        ("ok", 前缀池标识)。规则同 _select_v6_prefix：静态优先、否则动态，
+        池故障/耗尽继续后备。无候选序列返回 ("none", "")。"""
+        if not candidates:
+            return "none", ""
+        for pool_id in candidates:
+            pool = self._v6_pools.get(pool_id)
+            if pool is None:
+                continue
+            if self._pool_is_exhausted(pool_id, now_ms):
+                continue
+            static_int = pool.static.get(user)
+            if static_int is None:
+                if v6_dyn_free.get(pool_id, 0) > 0:
+                    v6_dyn_free[pool_id] -= 1
+                    return "ok", pool_id
+            elif (pool_id, user) not in v6_static_held:
+                v6_static_held.add((pool_id, user))
+                return "ok", pool_id
+        return "wait", "前缀"
+
+    def _sim_v6_available(self, user, now_ms, candidates, v6_dyn_free,
+                         v6_static_held):
+        """模拟态判定 v6 可否取得（不扣占用，用于候选项等待原因归类前的
+        窥视）；无候选序列恒为 True（纯 IPv4 不受 v6 约束）。"""
+        if not candidates:
+            return True
+        for pool_id in candidates:
+            pool = self._v6_pools.get(pool_id)
+            if pool is None or self._pool_is_exhausted(pool_id, now_ms):
+                continue
+            if pool.static.get(user) is not None:
+                if (pool_id, user) not in v6_static_held:
+                    return True
+            elif v6_dyn_free.get(pool_id, 0) > 0:
+                return True
+        return False
+
+    def _commit_session(
+        self, sid, user, pool_id, ip_int, now_ms,
+        v6_pool_id=None, v6_prefix_int=None,
+    ):
+        """全部校验通过后原子落库：登记 v4 租约（动态弹出堆顶）与 v6 委派
+        租约（同事务），并建在线会话。
+
+        v6_pool_id/v6_prefix_int 为 None 时该会话为纯 IPv4；二者同给时为双栈，
+        v6 租期与 v4 租期同为 now_ms+lease_ms。返回 (期限, 租期)；调用方须已
+        窥视确认两类资源均空闲，失败路径不到达此方法，故无半分配残留。
         """
         pool = self._pools[pool_id]
         if pool.static.get(user) != ip_int:
             heapq.heappop(pool.free)
         pool.leases[ip_int] = sid
+        if v6_pool_id is not None:
+            self._v6_pools[v6_pool_id].take(v6_prefix_int, sid)
         deadline = now_ms + self._idle_ms
         lease = now_ms + self._lease_ms
         self._sessions[sid] = {
@@ -2915,6 +3638,9 @@ class Sessions:
             "ip": ip_int,
             "lease": lease,
             "pool": pool_id,
+            "v6pool": v6_pool_id,
+            "v6": v6_prefix_int,
+            "v6lease": lease if v6_pool_id is not None else 0,
         }
         return deadline, lease
 
@@ -2951,16 +3677,50 @@ class Sessions:
             raise ResourceError(
                 f"no address available in candidate pools for {user!r}"
             )
+        # 双栈：模板配置了 IPv6 池序列时，在同一事务内沿其后备序列取委派前缀
+        # （静态优先、否则首个可用后备池数值最小空闲前缀，池耗尽继续后备）。
+        # 窥视均为只读，两类资源在此前都未落库；v6 全后备耗尽则整体失败，
+        # v4 亦未提交，不留下半分配租约。
+        v6_pool_id, v6_prefix_int = self._select_v6_prefix(user, now_ms)
+        if self._candidate_v6_pools(user) and v6_prefix_int is None:
+            raise ResourceError(
+                f"no IPv6 prefix available in candidate pools for {user!r}"
+            )
 
         # 全部校验通过后再落库，杜绝失败残留。
-        deadline, lease = self._commit_session(sid, user, pool_id, ip_int, now_ms)
+        deadline, lease = self._commit_session(
+            sid, user, pool_id, ip_int, now_ms, v6_pool_id, v6_prefix_int
+        )
         # 计费开始：仅建立成功产生开始事件（累计 0）。
         self._account_start(sid, now_ms)
         address = str(ipaddress.IPv4Address(ip_int))
-        return self._render(sid, _STATE_ONLINE, now_ms, deadline, address, lease)
+        return self._render(
+            sid, _STATE_ONLINE, now_ms, deadline, address, lease,
+            self._session_v6_render(self._sessions[sid]),
+        )
+
+    def _session_v6_render(self, session):
+        """会话当前 v6 委派的渲染三元组 (规范前缀串, 所属池, 前缀租期)；
+        未启用 IPv6 时返回 None（输出不含 v6 键，与基线逐字节一致），未持
+        前缀时返回 ("", "", 0)。"""
+        if not self._v6_pools:
+            return None
+        v6_int = session.get("v6")
+        if v6_int is None:
+            return "", "", 0
+        pool = self._v6_pools[session["v6pool"]]
+        return (
+            str(ipaddress.IPv6Network((v6_int, pool.dlen))),
+            session["v6pool"],
+            session["v6lease"],
+        )
 
     def _renew(self, sid, now_ms):
-        """仅持址在线会话可续租；未知 sid 为 KeyError，其余状态为 StateError。"""
+        """仅持址在线会话可续租；未知 sid 为 KeyError，其余状态为 StateError。
+
+        续租同步顺延 v4 与有效的 v6 两类租期（同一 now_ms+lease_ms），空闲
+        期限（期限）不因续租改变；挂起或租约到期已释址的会话不可续租。
+        """
         session = self._sessions.get(sid)
         if session is None:
             raise KeyError(f"unknown sid: {sid!r}")
@@ -2968,8 +3728,11 @@ class Sessions:
             raise StateError(
                 f"cannot renew sid {sid!r} in state {session['state']!r} without address"
             )
-        # 续租只顺延租期，空闲期限（期限）不因续租改变。
+        # 续租顺延 v4 租期。
         session["lease"] = now_ms + self._lease_ms
+        # 双栈：有效 v6 前缀租期同步顺延。
+        if session.get("v6") is not None:
+            session["v6lease"] = now_ms + self._lease_ms
         address = str(ipaddress.IPv4Address(session["ip"]))
         return self._render(
             sid,
@@ -2978,6 +3741,7 @@ class Sessions:
             session["deadline"],
             address,
             session["lease"],
+            self._session_v6_render(session),
         )
 
     def _migrate(self, sid, target, password, now_ms):
@@ -3038,8 +3802,10 @@ class Sessions:
         new_address = str(ipaddress.IPv4Address(new_ip))
         session["ip"] = new_ip
         session["pool"] = target
-        # 迁移重置租期，空闲期限（期限）保持不变。
+        # 迁移重置 v4 租期，空闲期限（期限）保持不变。
         session["lease"] = now_ms + self._lease_ms
+        # 既有显式 IPv4 迁移只更换 v4 地址：有效的 v6 前缀、所属池与前缀
+        # 租期原样保留，不重新选择、不重置、不释放。
         return self._render_migration(
             sid,
             _STATE_ONLINE,
@@ -3050,6 +3816,7 @@ class Sessions:
             target,
             new_address,
             session["lease"],
+            self._session_v6_render(session),
         )
 
     def _takeover(self, sid, old, password, now_ms):
@@ -3078,6 +3845,12 @@ class Sessions:
         old_ip = old_session["ip"]
         old_deadline = old_session["deadline"]
         old_lease = old_session["lease"]
+        # v6 原前缀（含所属池与前缀租期）：接管原子转移、不重新选择；旧会话
+        # 无前缀时新会话亦不取得新前缀（与无址接管的 default 取 v4 对应，
+        # 但 v6 不新分）。
+        old_v6_int = old_session.get("v6")
+        old_v6_pool = old_session.get("v6pool")
+        old_v6_lease = old_session.get("v6lease", 0)
 
         if old_ip is not None:
             # 转移：池、地址与租约记录由旧会话让渡给新会话，池水位不变；
@@ -3112,13 +3885,29 @@ class Sessions:
         self._account_stop(old, now_ms, _ACCOUNT_REASON_TAKEOVER)
         pool = self._pools[pool_id]
         pool.leases[ip_int] = sid
+        # v6 前缀原子转移：v6 池租约表由旧 sid 改为新 sid，水位不变、不重新
+        # 选择、不重置前缀租期。
+        v6_int = None
+        v6_pool_id = None
+        v6_lease = 0
+        if old_v6_int is not None:
+            v6pool = self._v6_pools[old_v6_pool]
+            del v6pool.leases[old_v6_int]
+            v6pool.leases[old_v6_int] = sid
+            v6_int = old_v6_int
+            v6_pool_id = old_v6_pool
+            v6_lease = old_v6_lease
         old_session["state"] = _STATE_OFFLINE
         old_session["deadline"] = 0
         old_session["ip"] = None
         old_session["lease"] = 0
         old_session["pool"] = None
+        if "v6" in old_session:
+            old_session["v6"] = None
+            old_session["v6lease"] = 0
+            old_session["v6pool"] = None
         deadline = now_ms + self._idle_ms
-        self._sessions[sid] = {
+        new_session = {
             "user": user,
             "state": _STATE_ONLINE,
             "deadline": deadline,
@@ -3126,6 +3915,11 @@ class Sessions:
             "lease": lease,
             "pool": pool_id,
         }
+        if self._v6_pools:
+            new_session["v6pool"] = v6_pool_id
+            new_session["v6"] = v6_int
+            new_session["v6lease"] = v6_lease
+        self._sessions[sid] = new_session
         self._account_start(sid, now_ms)
         old_address = (
             str(ipaddress.IPv4Address(old_ip)) if old_ip is not None else ""
@@ -3141,10 +3935,11 @@ class Sessions:
             pool_id,
             str(ipaddress.IPv4Address(ip_int)),
             lease,
+            self._session_v6_render(new_session),
         )
 
     def _offline(self, sid, now_ms):
-        """在线/挂起/下线→下线、期限与租约清零、释址。"""
+        """在线/挂起/下线→下线、期限与租约清零、同步释放 v4 址与 v6 前缀。"""
         session = self._sessions.get(sid)
         if session is None:
             raise KeyError(f"unknown sid: {sid!r}")
@@ -3156,10 +3951,14 @@ class Sessions:
         session["deadline"] = 0
         self._release(session)
         address = "" if self._pools else None
-        return self._render(sid, _STATE_OFFLINE, now_ms, 0, address, 0)
+        v6_render = ("", "", 0) if self._v6_pools else None
+        return self._render(
+            sid, _STATE_OFFLINE, now_ms, 0, address, 0, v6_render
+        )
 
     def _suspend(self, sid, now_ms):
-        """在线→挂起：期限清零、释址退租；未知 sid KeyError，非在线 StateError。"""
+        """在线→挂起：期限清零、同步释放 v4 址与 v6 前缀；未知 sid KeyError，
+        非在线 StateError。"""
         session = self._sessions.get(sid)
         if session is None:
             raise KeyError(f"unknown sid: {sid!r}")
@@ -3170,14 +3969,19 @@ class Sessions:
         session["state"] = _STATE_SUSPENDED
         session["deadline"] = 0
         self._release(session)
-        return self._render_suspend_resume(sid, _STATE_SUSPENDED, now_ms, 0, "", "", 0)
+        v6_render = ("", "", 0) if self._v6_pools else None
+        return self._render_suspend_resume(
+            sid, _STATE_SUSPENDED, now_ms, 0, "", "", 0, v6_render
+        )
 
     def _resume(self, sid, pool_id, password, now_ms):
-        """挂起→在线：自指定池取用户静态址或最小动态址，失败不留半分配。
+        """挂起→在线：自指定 v4 池取用户静态址或最小动态址；模板配置了 IPv6
+        池时在同一事务内沿其后备序列取得委派前缀。失败不留半分配。
 
         依次：未知 sid/池 KeyError、非挂起 StateError、认证非 ok AuthError、
-        池故障演练/静态址占用/动态址耗尽 ResourceError；全部通过才落库，
-        期限 = now_ms+idle_ms、租期 = now_ms+lease_ms。定位、停用与后端
+        v4 池故障演练/静态址占用/动态址耗尽 ResourceError、v6 全后备耗尽
+        ResourceError（此时 v4 尚未提交）；全部通过才落库，
+        期限 = now_ms+idle_ms、两类租期 = now_ms+lease_ms。定位、停用与后端
         检查已在老化前由 do 完成。
         """
         session = self._sessions.get(sid)
@@ -3196,23 +4000,43 @@ class Sessions:
         if status != "ok":
             raise AuthError(f"authentication not ok for user {user!r}: {status}")
 
-        # 取址：耗尽演练期该池视为无址；静态址专属该用户但同时只能租给
-        # 一个会话；非静态用户取池内最小动态空闲址。
+        # v4 取址（只读窥视）：耗尽演练期该池视为无址；静态址专属该用户但
+        # 同时只能租给一个会话；非静态用户窥视池内最小动态空闲址。
         if self._pool_is_exhausted(pool_id, now_ms):
             raise ResourceError("address pool exhausted")
-        ip_int = pool.static.get(user)
-        if ip_int is None:
+        static_ip = pool.static.get(user)
+        if static_ip is None:
             if not pool.free:
                 raise ResourceError("address pool exhausted")
-            ip_int = heapq.heappop(pool.free)
-        elif ip_int in pool.leases:
+            ip_int = pool.free[0]
+            ip_static = False
+        elif static_ip in pool.leases:
             raise ResourceError(
-                f"static address {ipaddress.IPv4Address(ip_int)} for {user!r} "
+                f"static address {ipaddress.IPv4Address(static_ip)} for {user!r} "
                 "already in use"
             )
+        else:
+            ip_int = static_ip
+            ip_static = True
 
-        # 全部校验通过：原子落库，置在线。
+        # v6 取前缀（只读窥视）：模板配置了 IPv6 池序列时沿后备序列取静态或
+        # 最小空闲动态前缀；全后备耗尽则整体失败。两类资源此刻都未落库。
+        v6_sequence = self._candidate_v6_pools(user)
+        if v6_sequence:
+            v6_pool_id, v6_prefix_int = self._select_v6_prefix(user, now_ms)
+            if v6_prefix_int is None:
+                raise ResourceError(
+                    f"no IPv6 prefix available in candidate pools for {user!r}"
+                )
+        else:
+            v6_pool_id, v6_prefix_int = None, None
+
+        # 全部校验通过：原子落库 v4 与 v6，置在线。
+        if not ip_static:
+            heapq.heappop(pool.free)
         pool.leases[ip_int] = sid
+        if v6_pool_id is not None:
+            self._v6_pools[v6_pool_id].take(v6_prefix_int, sid)
         deadline = now_ms + self._idle_ms
         lease = now_ms + self._lease_ms
         session["state"] = _STATE_ONLINE
@@ -3220,13 +4044,23 @@ class Sessions:
         session["ip"] = ip_int
         session["lease"] = lease
         session["pool"] = pool_id
+        if self._v6_pools:
+            session["v6pool"] = v6_pool_id
+            session["v6"] = v6_prefix_int
+            session["v6lease"] = lease if v6_pool_id is not None else 0
         address = str(ipaddress.IPv4Address(ip_int))
         return self._render_suspend_resume(
-            sid, _STATE_ONLINE, now_ms, deadline, pool_id, address, lease
+            sid, _STATE_ONLINE, now_ms, deadline, pool_id, address, lease,
+            self._session_v6_render(session),
         )
 
     def pool_stats(self, now_ms):
-        """返回各池占用统计 JSON；无池抛 StateError，否则先老化再统计。"""
+        """返回各 v4 池占用统计 JSON；无池抛 StateError，否则先老化再统计。
+
+        启用 IPv6（配置含前缀池）时追加“前缀池”水位：项序为
+        [标识, 委派长度, 可委派总数, 保留, 静态, 租用, 空闲]，按标识升序；
+        未启用 IPv6 时不含该键，输出与纯 IPv4 基线逐字节一致。
+        """
         _check_int("now_ms", now_ms, 0)
         if not self._pools:
             raise StateError("no pool: no address pool configured")
@@ -3246,6 +4080,23 @@ class Sessions:
                 ]
             )
         payload = {"时刻": now_ms, "池": pools}
+        if self._v6_pools:
+            v6_rows = []
+            for pool_id in sorted(self._v6_pools):
+                v6pool = self._v6_pools[pool_id]
+                total = v6pool.dynamic_total()
+                v6_rows.append(
+                    [
+                        pool_id,
+                        v6pool.dlen,
+                        total,
+                        len(v6pool.reserved),
+                        len(v6pool.static_ints),
+                        len(v6pool.leases),
+                        v6pool.dynamic_free(),
+                    ]
+                )
+            payload[_V6_POOLS_KEY] = v6_rows
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def qos(self, sid):
@@ -4466,8 +5317,9 @@ class Sessions:
             )
             raise
 
-        # 类型、值校验全过后方查池存在：未知池 KeyError（业务失败，缓存、不审计）。
-        if pool not in self._pools:
+        # 类型、值校验全过后方查池存在：v4 地址池与 v6 前缀池共用同一命名空间
+        # 的耗尽演练（同名即可），未知池 KeyError（业务失败，缓存、不审计）。
+        if pool not in self._pools and pool not in self._v6_pools:
             exc = KeyError(f"unknown pool: {pool!r}")
             self._pool_fault_cache[key] = (
                 op,
@@ -4827,7 +5679,7 @@ class Sessions:
                     f"fault checkpoint references unregistered user: {user!r}"
                 )
         for pool_id, _pool_until in pool_rows:
-            if pool_id not in self._pools:
+            if pool_id not in self._pools and pool_id not in self._v6_pools:
                 raise ResourceError(
                     f"fault checkpoint references unknown pool: {pool_id!r}"
                 )
@@ -5069,7 +5921,7 @@ class Sessions:
                     else:
                         new_until = 0
                 elif domain == _FAULT_PLAN_DOMAIN_POOL:
-                    if target not in self._pools:
+                    if target not in self._pools and target not in self._v6_pools:
                         raise KeyError(f"unknown pool: {target!r}")
                     if op == _OP_INJECT:
                         new_pool_fault[target] = now_ms + value
@@ -5282,7 +6134,7 @@ class Sessions:
                 else:
                     new_until = 0
             elif domain == _FAULT_PLAN_DOMAIN_POOL:
-                if target not in self._pools:
+                if target not in self._pools and target not in self._v6_pools:
                     raise KeyError(f"unknown pool: {target!r}")
                 if op == _OP_INJECT:
                     new_pool_fault[target] = now_ms + value
@@ -6442,7 +7294,8 @@ class Sessions:
             raise StateError(f"duplicate sid: {sid!r}")
 
         # 自动取址：绑定模板按其模板地址池优先序列、其余仅 default 池依次
-        # 检查；序列无现存池为 StateError（零池模式）。
+        # 检查；序列无现存池为 StateError（零池模式）。模板配置了 IPv6 池
+        # 序列时在同一事务内取得委派前缀，v6 全后备耗尽即 ResourceError。
         pool_id, ip_int = self._select_address(user, now_ms)
         if pool_id is None:
             raise StateError("no address pool available: cannot establish session")
@@ -6450,9 +7303,20 @@ class Sessions:
             raise ResourceError(
                 f"no address available in candidate pools for {user!r}"
             )
+        v6_sequence = self._candidate_v6_pools(user)
+        if v6_sequence:
+            v6_pool_id, v6_prefix_int = self._select_v6_prefix(user, now_ms)
+            if v6_prefix_int is None:
+                raise ResourceError(
+                    f"no IPv6 prefix available in candidate pools for {user!r}"
+                )
+        else:
+            v6_pool_id, v6_prefix_int = None, None
 
         # 全部校验通过后再落库，杜绝失败残留。
-        self._commit_session(sid, user, pool_id, ip_int, now_ms)
+        self._commit_session(
+            sid, user, pool_id, ip_int, now_ms, v6_pool_id, v6_prefix_int
+        )
 
     @staticmethod
     def _render_batch_online(now_ms, atomic, result, items):
@@ -7931,6 +8795,7 @@ class Sessions:
         suspended = 0
         offline = 0
         pool_leased = {}
+        v6_pool_leased = {}
         for session in self._sessions.values():
             state = session["state"]
             if state == _STATE_ONLINE and session["deadline"] > now_ms:
@@ -7948,6 +8813,15 @@ class Sessions:
             ):
                 pool_id = session["pool"]
                 pool_leased[pool_id] = pool_leased.get(pool_id, 0) + 1
+            # v6 有效租约：在线、期限未到且前缀租期未到（含同刻不计）。
+            if (
+                state == _STATE_ONLINE
+                and session.get("v6") is not None
+                and session["deadline"] > now_ms
+                and session["v6lease"] > now_ms
+            ):
+                v6_id = session["v6pool"]
+                v6_pool_leased[v6_id] = v6_pool_leased.get(v6_id, 0) + 1
 
         # 队列表单扫：截止 > now_ms 的队项计排队（截止到的不摘队、仅不计）。
         queued = 0
@@ -8004,6 +8878,29 @@ class Sessions:
             ],
             "池": pool_rows,
         }
+        if self._v6_pools:
+            v6_rows = []
+            v6_ids = sorted(self._v6_pools) if pool is None else [pool]
+            for pool_id in v6_ids:
+                target6 = self._v6_pools.get(pool_id)
+                if target6 is None:
+                    # 指定仅列 v4 池标识且无同名前缀池时跳过。
+                    continue
+                reserved = len(target6.reserved)
+                static = len(target6.static_ints)
+                occupied = v6_pool_leased.get(pool_id, 0)
+                total = target6.dynamic_total()
+                v6_rows.append(
+                    {
+                        "标识": pool_id,
+                        "总量": total,
+                        "占用": occupied,
+                        "可用": total - occupied,
+                        "保留": reserved,
+                        "静态": static,
+                    }
+                )
+            payload[_V6_POOLS_KEY] = v6_rows
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _stats_payload(self):
@@ -8552,12 +9449,16 @@ class Sessions:
             raise ValueError(f"limit must be <= 1000, got {limit}")
 
         rows = []
+        v6_on = bool(self._v6_pools)
         for sid, session in self._sessions.items():
             state = session["state"]
             deadline = session["deadline"]
             pool_id = ""
             address = ""
             lease = 0
+            v6_pool = ""
+            v6_prefix = ""
+            v6_lease = 0
             if state == _STATE_ONLINE and deadline > now_ms:
                 # 在线且期限未到：租期亦未到才保留池/地址/租期视图。
                 status = _STATE_ONLINE
@@ -8566,6 +9467,17 @@ class Sessions:
                     pool_id = session["pool"]
                     address = str(ipaddress.IPv4Address(session["ip"]))
                     lease = session["lease"]
+                if (
+                    v6_on
+                    and session.get("v6") is not None
+                    and session["v6lease"] > now_ms
+                ):
+                    vp = self._v6_pools[session["v6pool"]]
+                    v6_pool = session["v6pool"]
+                    v6_prefix = str(
+                        ipaddress.IPv6Network((session["v6"], vp.dlen))
+                    )
+                    v6_lease = session["v6lease"]
             elif state == _STATE_ONLINE:
                 # 在线但期限已到（含同刻）：视图为挂起，期限/池址/租期清零。
                 status = _STATE_SUSPENDED
@@ -8577,42 +9489,42 @@ class Sessions:
                 # 下线墓碑：全部清零。
                 status = _STATE_OFFLINE
                 view_deadline = 0
-            rows.append(
-                (
-                    sid,
-                    {
-                        "会话": sid,
-                        "用户": session["user"],
-                        "状态": status,
-                        "期限": view_deadline,
-                        "池": pool_id,
-                        "地址": address,
-                        "租期": lease,
-                        "入队序": 0,
-                    },
-                )
-            )
+            item = {
+                "会话": sid,
+                "用户": session["user"],
+                "状态": status,
+                "期限": view_deadline,
+                "池": pool_id,
+                "地址": address,
+                "租期": lease,
+            }
+            if v6_on:
+                item[_V6_POOL_OUTPUT_KEY] = v6_pool
+                item[_V6_PREFIX_KEY] = v6_prefix
+                item[_V6_LEASE_KEY] = v6_lease
+            item["入队序"] = 0
+            rows.append((sid, item))
 
         # 队项：截止 > now_ms 者列出（截止到的不摘队、仅不列），入队序取原值。
         for queued_sid, entry in self._capacity_queue.items():
             cutoff = entry[3]
             if cutoff <= now_ms:
                 continue
-            rows.append(
-                (
-                    queued_sid,
-                    {
-                        "会话": queued_sid,
-                        "用户": entry[0],
-                        "状态": _CAP_QUEUED,
-                        "期限": cutoff,
-                        "池": "",
-                        "地址": "",
-                        "租期": 0,
-                        "入队序": entry[4],
-                    },
-                )
-            )
+            item = {
+                "会话": queued_sid,
+                "用户": entry[0],
+                "状态": _CAP_QUEUED,
+                "期限": cutoff,
+                "池": "",
+                "地址": "",
+                "租期": 0,
+            }
+            if v6_on:
+                item[_V6_POOL_OUTPUT_KEY] = ""
+                item[_V6_PREFIX_KEY] = ""
+                item[_V6_LEASE_KEY] = 0
+            item["入队序"] = entry[4]
+            rows.append((queued_sid, item))
 
         # 标识与队项 sid 互不重叠（同一 sid 不会既会话又排队），按码点升序。
         rows.sort(key=lambda row: row[0])
@@ -8830,6 +9742,12 @@ class Sessions:
         deadline = now_ms + wait
         total_count, user_count = self._capacity_counts(user)
         pool_id, ip_int = self._select_address(user, now_ms)
+        # 双栈：模板配置了 IPv6 池序列时同事务取委派前缀。
+        v6_sequence = self._candidate_v6_pools(user)
+        if v6_sequence:
+            v6_pool_id, v6_prefix_int = self._select_v6_prefix(user, now_ms)
+        else:
+            v6_pool_id, v6_prefix_int = None, None
         # 模板并发会话上限：占用为绑定该模板用户的在线加挂起会话数；超限
         # 不拒绝而排队（背压），由推进在占用回落后晋升。
         template_id = self._user_templates.get(user)
@@ -8846,9 +9764,12 @@ class Sessions:
             and template_open
             and pool_id is not None
             and ip_int is not None
+            and (not v6_sequence or v6_prefix_int is not None)
         )
         if servable:
-            self._commit_session(sid, user, pool_id, ip_int, now_ms)
+            self._commit_session(
+                sid, user, pool_id, ip_int, now_ms, v6_pool_id, v6_prefix_int
+            )
             self._cap_event(now_ms, sid, _CAP_ONLINE, 0)
             # 计费开始：申请立即服务成功即开账。
             self._account_start(sid, now_ms)
@@ -8977,14 +9898,23 @@ class Sessions:
                     or per_template.get(template_id, 0) < session_limit
                 )
             pool_id, ip_int = self._select_address(user, now_ms)
+            v6_sequence = self._candidate_v6_pools(user)
+            if v6_sequence:
+                v6_pool_id, v6_prefix_int = self._select_v6_prefix(user, now_ms)
+            else:
+                v6_pool_id, v6_prefix_int = None, None
             if (
                 total_count < self._total
                 and per_user.get(user, 0) < self._per
                 and template_open
                 and pool_id is not None
                 and ip_int is not None
+                and (not v6_sequence or v6_prefix_int is not None)
             ):
-                self._commit_session(queued_sid, user, pool_id, ip_int, now_ms)
+                self._commit_session(
+                    queued_sid, user, pool_id, ip_int, now_ms,
+                    v6_pool_id, v6_prefix_int
+                )
                 promoted.append((queued_sid, order))
                 promoted_sids.add(queued_sid)
                 # 计费开始：晋升提交即开账，按尝试序追加，与后附的晋升
@@ -9294,11 +10224,21 @@ class Sessions:
             queued_sid: self._candidate_pools(user)
             for queued_sid, user in queued_users.items()
         }
+        v6_candidate_of = {
+            queued_sid: self._candidate_v6_pools(user)
+            for queued_sid, user in queued_users.items()
+        }
         relevant_pools = set()
         for sequence in candidate_of.values():
             relevant_pools.update(sequence)
         dyn_free, static_held, _owners = self._sim_pool_state(
             now_ms, relevant_pools, True
+        )
+        relevant_v6 = set()
+        for sequence in v6_candidate_of.values():
+            relevant_v6.update(sequence)
+        v6_dyn_free, v6_static_held = self._sim_v6_pool_state(
+            now_ms, relevant_v6, True
         )
 
         # 全部队项先判超时（不占资源），存活项（含窗口外）按推进同口径有效
@@ -9347,14 +10287,33 @@ class Sessions:
             ):
                 result, reason = "等待", "模板"
             else:
-                # 容量闸通过后按候选池优先序模拟取址（多池后备切换）。
-                outcome, detail = self._sim_try_address(
-                    user,
-                    now_ms,
-                    candidate_of[queued_sid],
-                    dyn_free,
-                    static_held,
+                # 双栈：先窥视 v6 可否取得（不扣占用），避免 v4 已扣而 v6
+                # 失败导致模拟态泄漏；v6 可取得后再同序提交 v4 与 v6。
+                v6_seq = v6_candidate_of[queued_sid]
+                v6_ready = (
+                    not v6_seq
+                    or self._sim_v6_available(
+                        user, now_ms, v6_seq, v6_dyn_free, v6_static_held
+                    )
                 )
+                if not v6_ready:
+                    outcome, detail = "wait", "前缀"
+                else:
+                    outcome, detail = self._sim_try_address(
+                        user,
+                        now_ms,
+                        candidate_of[queued_sid],
+                        dyn_free,
+                        static_held,
+                    )
+                if outcome == "ok" and v6_seq:
+                    self._sim_try_v6(
+                        user,
+                        now_ms,
+                        v6_seq,
+                        v6_dyn_free,
+                        v6_static_held,
+                    )
                 if outcome == "ok":
                     total_count += 1
                     per_user[user] = per_user.get(user, 0) + 1
@@ -9464,7 +10423,7 @@ class Sessions:
         spec, bindings, tmpl_priority, tmpl_limit, queue_limit, max_wait_ms = (
             self._rebalance_candidate(changes)
         )
-        new_pools = self._build_pools(spec, check_queue=False)
+        new_pools, new_v6_pools = self._build_pools(spec, check_queue=False)
 
         # 时钟回拨门（未知引用与承载失败之后）：now_ms 不得早于调用前任一排
         # 队项的申请时刻；空队不触发。
@@ -9477,7 +10436,7 @@ class Sessions:
         # 在局部副本上统一演算超时/淘汰/晋升（不老化既有会话）。
         plan = self._rebalance_plan(
             now_ms, queue_limit, max_wait_ms, bindings, tmpl_priority,
-            tmpl_limit, dict(spec[9])
+            tmpl_limit, dict(spec[9]), dict(spec[11])
         )
 
         result = self._render_rebalance(
@@ -9489,7 +10448,8 @@ class Sessions:
             # config_history 追加“加载”、目标 -1），再落实队列收敛与晋升；
             # 所有可能失败的承载校验均已在提交前通过，提交后不留失败路径。
             self._commit_config(
-                spec, new_pools, self._current_spec(), _CONFIG_HISTORY_OP_LOAD
+                spec, new_pools, new_v6_pools, self._current_spec(),
+                _CONFIG_HISTORY_OP_LOAD
             )
             self._rebalance_apply(now_ms, max_wait_ms, plan)
             self._capacity_rebalance_cache[key] = (mode, changes, now_ms, result)
@@ -9693,12 +10653,15 @@ class Sessions:
             (queue_limit, max_wait_ms, policy),
             spec[8],
             spec[9],
+            spec[10],
+            spec[11],
         )
         return (candidate, bindings, tmpl_priority, tmpl_limit, queue_limit,
                 max_wait_ms)
 
     def _rebalance_plan(self, now_ms, queue_limit, max_wait_ms, bindings,
-                        tmpl_priority, tmpl_limit, template_pool_order):
+                        tmpl_priority, tmpl_limit, template_pool_order,
+                        template_v6_pool_order):
         """在局部副本上演算队列收敛（不老化、不改实例），返回决策 dict。
 
         队列条目复制为 [用户,申请时刻,等待,截止,入队序]；先按新最大等待缩短
@@ -9775,11 +10738,23 @@ class Sessions:
             )
             for sid in survivors
         }
+        v6_candidate_of = {
+            sid: self._candidate_v6_pools_for(
+                queue[sid][0], bindings, template_v6_pool_order
+            )
+            for sid in survivors
+        }
         relevant_pools = set()
         for sequence in candidate_of.values():
             relevant_pools.update(sequence)
         dyn_free, static_held, _owners = self._sim_pool_state(
             now_ms, relevant_pools, False
+        )
+        relevant_v6 = set()
+        for sequence in v6_candidate_of.values():
+            relevant_v6.update(sequence)
+        v6_dyn_free, v6_static_held = self._sim_v6_pool_state(
+            now_ms, relevant_v6, False
         )
 
         promoted = []
@@ -9799,14 +10774,26 @@ class Sessions:
                 and (not session_limit or per_template.get(template_id, 0)
                      < session_limit)
             ):
-                outcome, _pool_id = self._sim_try_address(
-                    user,
-                    now_ms,
-                    candidate_of[sid],
-                    dyn_free,
-                    static_held,
+                v6_seq = v6_candidate_of[sid]
+                v6_ready = (
+                    not v6_seq
+                    or self._sim_v6_available(
+                        user, now_ms, v6_seq, v6_dyn_free, v6_static_held
+                    )
                 )
-                servable = outcome == "ok"
+                if v6_ready:
+                    outcome, _pool_id = self._sim_try_address(
+                        user,
+                        now_ms,
+                        candidate_of[sid],
+                        dyn_free,
+                        static_held,
+                    )
+                    if outcome == "ok" and v6_seq:
+                        self._sim_try_v6(
+                            user, now_ms, v6_seq, v6_dyn_free, v6_static_held
+                        )
+                    servable = outcome == "ok"
             if servable:
                 promoted.append(sid)
                 promoted_set.add(sid)
@@ -9850,7 +10837,10 @@ class Sessions:
             entry = self._capacity_queue[sid]
             user = entry[0]
             pool_id, ip_int = self._select_address(user, now_ms)
-            self._commit_session(sid, user, pool_id, ip_int, now_ms)
+            v6_pool_id, v6_prefix_int = self._select_v6_prefix(user, now_ms)
+            self._commit_session(
+                sid, user, pool_id, ip_int, now_ms, v6_pool_id, v6_prefix_int
+            )
             del self._capacity_queue[sid]
         promoted_set = set(plan["晋升"])
         self._queue_order = [
@@ -9875,26 +10865,35 @@ class Sessions:
     def _checkpoint_sessions(self):
         """检查点会话快照：在线、挂起与下线墓碑全列，按会话升序。
 
-        项键序为“会话/用户/状态/期限/池/地址/租期”；期限/租期为 int，
+        项键序为“会话/用户/状态/期限/池/地址/租期”；启用 IPv6 时追加
+        “前缀池/IPv6前缀/前缀租期”（固定键序）；期限/租期/前缀租期为 int，
         余为 str。无址（挂起及租约到期未挂起）项池址为 ""、租期为 0。
-        下线墓碑固定状态“下线”、期限 0、池 ""、地址 ""、租期 0，不计
-        容量、不持址，仅随检查点往返保留用户归属与 sid。
+        下线墓碑固定状态“下线”、期限 0、池 ""、地址 ""、租期 0（启用 IPv6
+        时前缀三字段亦清零），不计容量、不持址，仅随检查点往返保留用户
+        归属与 sid。
         """
+        v6_on = bool(self._v6_pools)
         rows = []
         for sid in sorted(self._sessions):
             session = self._sessions[sid]
+            v6_pool = ""
+            v6_prefix = ""
+            v6_lease = 0
             if session["state"] == _STATE_OFFLINE:
-                rows.append(
-                    {
-                        "会话": sid,
-                        "用户": session["user"],
-                        "状态": _STATE_OFFLINE,
-                        "期限": 0,
-                        "池": "",
-                        "地址": "",
-                        "租期": 0,
-                    }
-                )
+                item = {
+                    "会话": sid,
+                    "用户": session["user"],
+                    "状态": _STATE_OFFLINE,
+                    "期限": 0,
+                    "池": "",
+                    "地址": "",
+                    "租期": 0,
+                }
+                if v6_on:
+                    item[_V6_POOL_OUTPUT_KEY] = ""
+                    item[_V6_PREFIX_KEY] = ""
+                    item[_V6_LEASE_KEY] = 0
+                rows.append(item)
                 continue
             if session["ip"] is None:
                 pool_id = ""
@@ -9904,18 +10903,108 @@ class Sessions:
                 pool_id = session["pool"]
                 address = str(ipaddress.IPv4Address(session["ip"]))
                 lease = session["lease"]
-            rows.append(
-                {
-                    "会话": sid,
-                    "用户": session["user"],
-                    "状态": session["state"],
-                    "期限": session["deadline"],
-                    "池": pool_id,
-                    "地址": address,
-                    "租期": lease,
-                }
-            )
+            if v6_on and session.get("v6") is not None:
+                vp = self._v6_pools[session["v6pool"]]
+                v6_pool = session["v6pool"]
+                v6_prefix = str(ipaddress.IPv6Network((session["v6"], vp.dlen)))
+                v6_lease = session["v6lease"]
+            item = {
+                "会话": sid,
+                "用户": session["user"],
+                "状态": session["state"],
+                "期限": session["deadline"],
+                "池": pool_id,
+                "地址": address,
+                "租期": lease,
+            }
+            if v6_on:
+                item[_V6_POOL_OUTPUT_KEY] = v6_pool
+                item[_V6_PREFIX_KEY] = v6_prefix
+                item[_V6_LEASE_KEY] = v6_lease
+            rows.append(item)
         return rows
+
+    def _session_v6_tuple(self, session):
+        """会话当前持有的 v6 委派 (pool_id, prefix_int, lease)；未持有为
+        (None, None, 0)。"""
+        if not self._v6_pools or session.get("v6") is None:
+            return None, None, 0
+        return session["v6pool"], session["v6"], session["v6lease"]
+
+    def _live_lease_maps(self):
+        """当前会话的 v4 与 v6 在租映射：({pool:{ip:sid}}, {v6pool:{pfx:sid}})。"""
+        live_leases = {}
+        live_v6_leases = {}
+        for sid, session in self._sessions.items():
+            if session["ip"] is not None:
+                live_leases.setdefault(session["pool"], {})[session["ip"]] = sid
+            if self._v6_pools and session.get("v6") is not None:
+                live_v6_leases.setdefault(session["v6pool"], {})[
+                    session["v6"]
+                ] = sid
+        return live_leases, live_v6_leases
+
+    def _session_row_matches(self, session, row):
+        """当前会话实例是否与检查点规范化会话行逐字段一致（含启用 IPv6 时
+        的前缀池/IPv6前缀/前缀租期）。"""
+        if (
+            session["user"] != row["用户"]
+            or session["state"] != row["状态"]
+            or session["deadline"] != row["期限"]
+        ):
+            return False
+        current_ip = (
+            "" if session["ip"] is None
+            else str(ipaddress.IPv4Address(session["ip"]))
+        )
+        current_pool = "" if session["pool"] is None else session["pool"]
+        if current_pool != row["池"] or current_ip != row["地址"]:
+            return False
+        if session["lease"] != row["租期"]:
+            return False
+        if self._v6_pools:
+            v6_pool, v6_int, v6_lease = self._session_v6_tuple(session)
+            cur_pool = "" if v6_pool is None else v6_pool
+            cur_prefix = ""
+            if v6_int is not None:
+                vp = self._v6_pools[v6_pool]
+                cur_prefix = str(ipaddress.IPv6Network((v6_int, vp.dlen)))
+            if (
+                cur_pool != row[_V6_POOL_OUTPUT_KEY]
+                or cur_prefix != row[_V6_PREFIX_KEY]
+                or v6_lease != row[_V6_LEASE_KEY]
+            ):
+                return False
+        return True
+
+    def _session_dict_from_row(self, row):
+        """由检查点规范化会话行构建内部会话 dict（含启用 IPv6 时的 v6 字段）。"""
+        if row["池"] == "":
+            pool_id = None
+            ip_int = None
+        else:
+            pool_id = row["池"]
+            ip_int = _check_ip("会话.地址", row["地址"])
+        new_session = {
+            "user": row["用户"],
+            "state": row["状态"],
+            "deadline": row["期限"],
+            "ip": ip_int,
+            "lease": row["租期"],
+            "pool": pool_id,
+        }
+        if self._v6_pools:
+            v6_text = row[_V6_PREFIX_KEY]
+            if v6_text == "":
+                new_session["v6pool"] = None
+                new_session["v6"] = None
+                new_session["v6lease"] = 0
+            else:
+                net = ipaddress.IPv6Network(v6_text, strict=True)
+                new_session["v6pool"] = row[_V6_POOL_OUTPUT_KEY]
+                new_session["v6"] = int(net.network_address)
+                new_session["v6lease"] = row[_V6_LEASE_KEY]
+        return new_session
 
     def _checkpoint_queued(self):
         """检查点排队快照：按入队序（即 _queue_order）。
@@ -10151,15 +11240,25 @@ class Sessions:
             )
             prev_hash = digest
 
-        session_keys = {"会话", "用户", "状态", "期限", "池", "地址", "租期"}
+        session_keys_v4 = {"会话", "用户", "状态", "期限", "池", "地址", "租期"}
+        session_keys_v6 = session_keys_v4 | {
+            _V6_POOL_OUTPUT_KEY, _V6_PREFIX_KEY, _V6_LEASE_KEY
+        }
+        required_session_keys = session_keys_v6 if self._v6_pools else session_keys_v4
         sessions = []
         session_sids = set()
         last_sid = None
         for item in sessions_raw:
-            if not isinstance(item, dict) or set(item) != session_keys:
+            if not isinstance(item, dict) or set(item) != required_session_keys:
+                if self._v6_pools:
+                    raise ValueError(
+                        "session keys must be 会话/用户/状态/期限/池/地址/租期/"
+                        "前缀池/IPv6前缀/前缀租期"
+                    )
                 raise ValueError(
                     "session keys must be 会话/用户/状态/期限/池/地址/租期"
                 )
+            v6_present = bool(self._v6_pools)
             sid = self._cp_str(item["会话"], "会话.会话")
             user = self._cp_str(item["用户"], "会话.用户")
             state = item["状态"]
@@ -10171,18 +11270,52 @@ class Sessions:
             pool_id = item["池"]
             address = item["地址"]
             lease = self._cp_int(item["租期"], "会话.租期", 0)
+            if v6_present:
+                v6_pool = item[_V6_POOL_OUTPUT_KEY]
+                v6_prefix = item[_V6_PREFIX_KEY]
+                v6_lease = self._cp_int(
+                    item[_V6_LEASE_KEY], "会话.前缀租期", 0
+                )
+                if not isinstance(v6_pool, str) or not isinstance(v6_prefix, str):
+                    raise ValueError("会话.前缀池 and 会话.IPv6前缀 must be str")
+                if (v6_pool == "") != (v6_prefix == ""):
+                    raise ValueError(
+                        "会话.前缀池 and 会话.IPv6前缀 must be both empty or both set"
+                    )
+                if v6_prefix != "":
+                    self._cp_str(v6_pool, "会话.前缀池")
+                    try:
+                        net = ipaddress.IPv6Network(v6_prefix, strict=True)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"会话.IPv6Prefix must be a canonical IPv6 prefix: "
+                            f"{v6_prefix!r}"
+                        ) from exc
+                    if str(net) != v6_prefix:
+                        raise ValueError(
+                            f"会话.IPv6Prefix must be canonical: {v6_prefix!r}"
+                        )
+            else:
+                v6_pool = ""
+                v6_prefix = ""
+                v6_lease = 0
             if not isinstance(pool_id, str) or not isinstance(address, str):
                 raise ValueError("会话.池 and 会话.地址 must be str")
             if state == _STATE_OFFLINE:
-                # 下线墓碑：期限 0、池 ""、地址 ""、租期 0，固定清零。
+                # 下线墓碑：期限 0、池 ""、地址 ""、租期 0，固定清零；启用
+                # IPv6 时前缀三字段亦固定清零。
                 if (
                     deadline != 0
                     or pool_id != ""
                     or address != ""
                     or lease != 0
+                    or v6_pool != ""
+                    or v6_prefix != ""
+                    or v6_lease != 0
                 ):
                     raise ValueError(
-                        "offline tombstone must have 期限/池/地址/租期 zeroed"
+                        "offline tombstone must have 期限/池/地址/租期/"
+                        "前缀池/IPv6前缀/前缀租期 zeroed"
                     )
             else:
                 if (pool_id == "") != (address == ""):
@@ -10198,11 +11331,27 @@ class Sessions:
                         _check_ip("会话.地址", address)
                     except ValueError as exc:
                         raise ValueError(str(exc)) from exc
+                if v6_pool == "" and v6_lease != 0:
+                    raise ValueError(
+                        "会话.前缀租期 must be 0 when 会话.前缀池 is empty"
+                    )
+                if v6_pool != "" and v6_lease < 1:
+                    raise ValueError(
+                        "online/suspended session with IPv6 prefix must have "
+                        "前缀租期 >= 1"
+                    )
                 if state == _STATE_SUSPENDED and (
-                    deadline != 0 or pool_id != "" or address != "" or lease != 0
+                    deadline != 0
+                    or pool_id != ""
+                    or address != ""
+                    or lease != 0
+                    or v6_pool != ""
+                    or v6_prefix != ""
+                    or v6_lease != 0
                 ):
                     raise ValueError(
-                        "suspended session must have 期限/池/地址/租期 zeroed"
+                        "suspended session must have 期限/池/地址/租期/"
+                        "前缀池/IPv6前缀/前缀租期 zeroed"
                     )
                 if state == _STATE_ONLINE:
                     if deadline < 1:
@@ -10217,17 +11366,20 @@ class Sessions:
                 raise ValueError("会话 rows must be sorted by 会话 ascending")
             last_sid = sid
             session_sids.add(sid)
-            sessions.append(
-                {
-                    "会话": sid,
-                    "用户": user,
-                    "状态": state,
-                    "期限": deadline,
-                    "池": pool_id,
-                    "地址": address,
-                    "租期": lease,
-                }
-            )
+            row = {
+                "会话": sid,
+                "用户": user,
+                "状态": state,
+                "期限": deadline,
+                "池": pool_id,
+                "地址": address,
+                "租期": lease,
+            }
+            if v6_present:
+                row[_V6_POOL_OUTPUT_KEY] = v6_pool
+                row[_V6_PREFIX_KEY] = v6_prefix
+                row[_V6_LEASE_KEY] = v6_lease
+            sessions.append(row)
 
         queued_keys = {"会话", "用户", "申请时刻", "等待", "截止", "入队序"}
         queued = []
@@ -10286,10 +11438,12 @@ class Sessions:
             raise ValueError("状态哈希 mismatch: checkpoint is not canonical")
         return now_ms, events, sessions, queued, state_hash
 
-    def _rebuild_pool_leases(self, required_leases):
-        """按承载租约重建全部池的租约表与动态空闲堆（租约表完全由在租会话
-        决定，属可由检查点派生的状态）：租约表只保留所列在租址，空闲堆为
-        可用集扣除保留、静态与在租动态址。静态址未租时不回堆，语义同 _Pool。
+    def _rebuild_pool_leases(self, required_leases, required_v6_leases=None):
+        """按承载租约重建全部 v4 池的租约表与动态空闲堆（租约表完全由在租
+        会话决定，属可由检查点派生的状态）：租约表只保留所列在租址，空闲堆
+        为可用集扣除保留、静态与在租动态址。静态址未租时不回堆，语义同
+        _Pool。required_v6_leases 给定时同步重建各 v6 前缀池的稀疏空闲
+        区间（O(L+R+S)）。
         """
         for pool_id, pool in self._pools.items():
             pool_leases = required_leases.get(pool_id, {})
@@ -10306,6 +11460,9 @@ class Sessions:
                 and ip_int not in pool_leases
             ]
             heapq.heapify(pool.free)
+        if required_v6_leases is not None:
+            for pool_id, v6pool in self._v6_pools.items():
+                v6pool.rebuild(required_v6_leases.get(pool_id, {}))
 
     def _checkpoint_carry_leases(self, sessions, queued):
         """检查点承载力校验（ResourceError）：用户注册（墓碑仍归属已注册
@@ -10355,34 +11512,83 @@ class Sessions:
             return usable
 
         required_leases = {}
+        required_v6_leases = {}
         for row in sessions:
-            if row["池"] == "":
-                continue
-            pool = self._pools.get(row["池"])
-            if pool is None:
-                raise ResourceError(
-                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
-                    f"no pool {row['池']!r}"
-                )
-            ip_int = _check_ip("会话.地址", row["地址"])
-            if ip_int not in usable_of(row["池"]) or ip_int in pool.reserved:
-                raise ResourceError(
-                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
-                    f"address {row['地址']} not usable in pool {row['池']!r}"
-                )
-            if ip_int in pool.static_ips and pool.static.get(row["用户"]) != ip_int:
-                raise ResourceError(
-                    f"checkpoint cannot carry lease of sid {row['会话']!r}: "
-                    f"address {row['地址']} is static for another user"
-                )
-            pool_leases = required_leases.setdefault(row["池"], {})
-            if ip_int in pool_leases:
-                raise ResourceError(
-                    f"address {row['地址']} in pool {row['池']!r} rented by "
-                    f"{pool_leases[ip_int]!r} and {row['会话']!r}"
-                )
-            pool_leases[ip_int] = row["会话"]
-        return required_leases
+            if row["池"] != "":
+                pool = self._pools.get(row["池"])
+                if pool is None:
+                    raise ResourceError(
+                        f"checkpoint cannot carry lease of sid {row['会话']!r}: "
+                        f"no pool {row['池']!r}"
+                    )
+                ip_int = _check_ip("会话.地址", row["地址"])
+                if ip_int not in usable_of(row["池"]) or ip_int in pool.reserved:
+                    raise ResourceError(
+                        f"checkpoint cannot carry lease of sid {row['会话']!r}: "
+                        f"address {row['地址']} not usable in pool {row['池']!r}"
+                    )
+                if ip_int in pool.static_ips and pool.static.get(row["用户"]) != ip_int:
+                    raise ResourceError(
+                        f"checkpoint cannot carry lease of sid {row['会话']!r}: "
+                        f"address {row['地址']} is static for another user"
+                    )
+                pool_leases = required_leases.setdefault(row["池"], {})
+                if ip_int in pool_leases:
+                    raise ResourceError(
+                        f"address {row['地址']} in pool {row['池']!r} rented by "
+                        f"{pool_leases[ip_int]!r} and {row['会话']!r}"
+                    )
+                pool_leases[ip_int] = row["会话"]
+            # v6 承载：前缀归属（前缀池存在）、按委派长度对齐、位于池内、非
+            # 保留、静态归属一致与唯一占用；任一不可承载即 ResourceError。
+            if self._v6_pools and row.get(_V6_POOL_OUTPUT_KEY):
+                v6_pool_id = row[_V6_POOL_OUTPUT_KEY]
+                v6pool = self._v6_pools.get(v6_pool_id)
+                if v6pool is None:
+                    raise ResourceError(
+                        f"checkpoint cannot carry IPv6 lease of sid "
+                        f"{row['会话']!r}: no IPv6 pool {v6_pool_id!r}"
+                    )
+                net = ipaddress.IPv6Network(row[_V6_PREFIX_KEY], strict=True)
+                prefix_int = int(net.network_address)
+                base = int(v6pool.network.network_address)
+                shift = 128 - v6pool.dlen
+                if base + (((prefix_int - base) >> shift) << shift) != prefix_int:
+                    raise ResourceError(
+                        f"checkpoint cannot carry IPv6 lease of sid "
+                        f"{row['会话']!r}: prefix {row[_V6_PREFIX_KEY]!r} not "
+                        f"aligned to /{v6pool.dlen} in pool {v6_pool_id!r}"
+                    )
+                if (
+                    prefix_int < base
+                    or prefix_int > int(v6pool.network.broadcast_address)
+                ):
+                    raise ResourceError(
+                        f"checkpoint cannot carry IPv6 lease of sid "
+                        f"{row['会话']!r}: prefix outside pool {v6_pool_id!r}"
+                    )
+                if prefix_int in v6pool.reserved:
+                    raise ResourceError(
+                        f"checkpoint cannot carry IPv6 lease of sid "
+                        f"{row['会话']!r}: prefix is reserved"
+                    )
+                if (
+                    prefix_int in v6pool.static_ints
+                    and v6pool.static.get(row["用户"]) != prefix_int
+                ):
+                    raise ResourceError(
+                        f"checkpoint cannot carry IPv6 lease of sid "
+                        f"{row['会话']!r}: static prefix belongs to another user"
+                    )
+                v6_leases = required_v6_leases.setdefault(v6_pool_id, {})
+                if prefix_int in v6_leases:
+                    raise ResourceError(
+                        f"IPv6 prefix {row[_V6_PREFIX_KEY]!r} in pool "
+                        f"{v6_pool_id!r} rented by {v6_leases[prefix_int]!r} "
+                        f"and {row['会话']!r}"
+                    )
+                v6_leases[prefix_int] = row["会话"]
+        return required_leases, required_v6_leases
 
     def creplay(self, text):
         """按检查点恢复所列会话（含下线墓碑）、租约、队列与 capacity 事件
@@ -10411,11 +11617,8 @@ class Sessions:
             now_ms, current["事件"], current["会话"], current["排队"]
         )
         if current_hash == state_hash:
-            live_leases = {}
-            for sid, session in self._sessions.items():
-                if session["ip"] is not None:
-                    live_leases.setdefault(session["pool"], {})[session["ip"]] = sid
-            self._rebuild_pool_leases(live_leases)
+            live_leases, live_v6_leases = self._live_lease_maps()
+            self._rebuild_pool_leases(live_leases, live_v6_leases)
             return self.capacity_stats(now_ms)
 
         target_sessions = {row["会话"]: row for row in sessions}
@@ -10436,19 +11639,7 @@ class Sessions:
             if row is None:
                 # 目标存在而检查点未列：在线/挂起为包外会话，下线为包外墓碑。
                 raise StateError(f"current session {sid!r} is not in checkpoint")
-            current_ip = (
-                "" if session["ip"] is None
-                else str(ipaddress.IPv4Address(session["ip"]))
-            )
-            current_pool = "" if session["pool"] is None else session["pool"]
-            if (
-                session["user"] != row["用户"]
-                or session["state"] != row["状态"]
-                or session["deadline"] != row["期限"]
-                or current_pool != row["池"]
-                or current_ip != row["地址"]
-                or session["lease"] != row["租期"]
-            ):
+            if not self._session_row_matches(session, row):
                 # 同标识但状态或字段不同（在线/挂起/下线三态互异）。
                 raise StateError(f"current session {sid!r} diverges from checkpoint")
         for queued_sid in self._queue_order:
@@ -10467,29 +11658,18 @@ class Sessions:
                 raise StateError(f"current queued sid {queued_sid!r} diverges")
 
         # 承载力（ResourceError）：用户注册（墓碑仍归属已注册用户）、全局/单用户
-        # 上限（仅计在线/挂起，墓碑不计容量）、池与地址（墓碑不建租约）。
-        required_leases = self._checkpoint_carry_leases(sessions, queued)
+        # 上限（仅计在线/挂起，墓碑不计容量）、v4 池址与 v6 前缀（墓碑不建租约）。
+        required_leases, required_v6_leases = self._checkpoint_carry_leases(
+            sessions, queued
+        )
 
         # 全部校验通过：原子替换会话（含墓碑）、租约、队列、入队序游标与账本。
         new_sessions = {}
         for row in sessions:
-            if row["池"] == "":
-                pool_id = None
-                ip_int = None
-            else:
-                pool_id = row["池"]
-                ip_int = _check_ip("会话.地址", row["地址"])
-            new_sessions[row["会话"]] = {
-                "user": row["用户"],
-                "state": row["状态"],
-                "deadline": row["期限"],
-                "ip": ip_int,
-                "lease": row["租期"],
-                "pool": pool_id,
-            }
+            new_sessions[row["会话"]] = self._session_dict_from_row(row)
         self._sessions = new_sessions
-        # 以承载租约重建全部池（租约表与空闲堆为在租会话的派生态）。
-        self._rebuild_pool_leases(required_leases)
+        # 以承载租约重建全部 v4 池与 v6 前缀池（空闲结构为在租会话的派生态）。
+        self._rebuild_pool_leases(required_leases, required_v6_leases)
         self._capacity_queue = {
             row["会话"]: [
                 row["用户"],
@@ -10586,19 +11766,18 @@ class Sessions:
         # 账本与现存模板账本已与检查点逐字段一致，空操作不替换；租约表为在租
         # 会话的派生态，顺带对齐。
         if self._runtime_payload(now_ms)["摘要"] == summary:
-            live_leases = {}
-            for sid, session in self._sessions.items():
-                if session["ip"] is not None:
-                    live_leases.setdefault(session["pool"], {})[session["ip"]] = sid
-            self._rebuild_pool_leases(live_leases)
+            live_leases, live_v6_leases = self._live_lease_maps()
+            self._rebuild_pool_leases(live_leases, live_v6_leases)
             result = self._runtime_checkpoint_text(now_ms)
             self._runtime_restore_cache[key] = (text, result)
             return result
 
         # 承载力（ResourceError）：容量部分沿 creplay 口径（用户、全局/单用户
-        # 上限、池址）；配额部分沿 quota_restore 口径（用户、模板、令牌桶容，
-        # 本题归为不承载 ResourceError）。
-        required_leases = self._checkpoint_carry_leases(sessions, queued)
+        # 上限、池址、v6 前缀）；配额部分沿 quota_restore 口径（用户、模板、
+        # 令牌桶容，本题归为不承载 ResourceError）。
+        required_leases, required_v6_leases = self._checkpoint_carry_leases(
+            sessions, queued
+        )
         for user, template_id, _used, _last, tokens in quota_rows:
             if user not in self._auth:
                 raise ResourceError(
@@ -10635,23 +11814,10 @@ class Sessions:
         # 事件账本与现存模板账本；已删模板的历史账本原样保留。
         new_sessions = {}
         for row in sessions:
-            if row["池"] == "":
-                pool_id = None
-                ip_int = None
-            else:
-                pool_id = row["池"]
-                ip_int = _check_ip("会话.地址", row["地址"])
-            new_sessions[row["会话"]] = {
-                "user": row["用户"],
-                "state": row["状态"],
-                "deadline": row["期限"],
-                "ip": ip_int,
-                "lease": row["租期"],
-                "pool": pool_id,
-            }
+            new_sessions[row["会话"]] = self._session_dict_from_row(row)
         self._sessions = new_sessions
-        # 以承载租约重建全部池（租约表与空闲堆为在租会话的派生态）。
-        self._rebuild_pool_leases(required_leases)
+        # 以承载租约重建全部 v4 池与 v6 前缀池（空闲结构为在租会话的派生态）。
+        self._rebuild_pool_leases(required_leases, required_v6_leases)
         self._capacity_queue = {
             row["会话"]: [
                 row["用户"],
@@ -10731,9 +11897,14 @@ class Sessions:
             )
         if list(doc["配额"]) != ["版本", "账本"]:
             raise ValueError("配额 keys must be 版本/账本 in order")
+        session_order = ["会话", "用户", "状态", "期限", "池", "地址", "租期"]
+        if self._v6_pools:
+            session_order += [
+                _V6_POOL_OUTPUT_KEY, _V6_PREFIX_KEY, _V6_LEASE_KEY
+            ]
         for label, key_order in (
             ("事件", ["序号", "时刻", "会话", "结果", "入队序", "前哈希", "哈希"]),
-            ("会话", ["会话", "用户", "状态", "期限", "池", "地址", "租期"]),
+            ("会话", session_order),
             ("排队", ["会话", "用户", "申请时刻", "等待", "截止", "入队序"]),
         ):
             rows = capacity[label]
@@ -10945,7 +12116,9 @@ class Sessions:
         # 承载力/引用（ResourceError），沿 runtime_restore/creplay 口径：
         # 会话与队项用户注册、全局/单用户上限、池址承载；账本用户注册、模板
         # 存在、令牌桶容。
-        required_leases = self._checkpoint_carry_leases(sessions, queued)
+        required_leases, required_v6_leases = self._checkpoint_carry_leases(
+            sessions, queued
+        )
         for user, template_id, _used, _last, tokens in quota_rows:
             if user not in self._auth:
                 raise ResourceError(
@@ -11044,24 +12217,11 @@ class Sessions:
 
         new_sessions = {}
         for row in sessions:
-            if row["池"] == "":
-                pool_id = None
-                ip_int = None
-            else:
-                pool_id = row["池"]
-                ip_int = _check_ip("会话.地址", row["地址"])
-            new_sessions[row["会话"]] = {
-                "user": row["用户"],
-                "state": row["状态"],
-                "deadline": row["期限"],
-                "ip": ip_int,
-                "lease": row["租期"],
-                "pool": pool_id,
-            }
+            new_sessions[row["会话"]] = self._session_dict_from_row(row)
         self._sessions = new_sessions
-        # 以承载租约重建全部池（租约表与空闲堆为在租会话的派生态），保证恢复
-        # 后租约必与会话一致。
-        self._rebuild_pool_leases(required_leases)
+        # 以承载租约重建全部 v4 池与 v6 前缀池（空闲结构为在租会话的派生态），
+        # 保证恢复后租约必与会话一致。
+        self._rebuild_pool_leases(required_leases, required_v6_leases)
         self._capacity_queue = {
             row["会话"]: [
                 row["用户"],
@@ -11647,8 +12807,9 @@ class Sessions:
     def _current_spec(self):
         """当前配置的规范化 spec：池按标识、保留按 IPv4 整数、静态按用户升序，
         模板按标识、用户模板按用户升序，容量为 (队列上限, 最大等待毫秒,
-        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒)，末项为模板地址池
-        （按模板标识升序的 (模板标识, (池标识...)) 元组）。"""
+        队满策略)，认证为认证器当前 (最大失败, 锁定毫秒)，模板地址池与
+        模板 IPv6 池均为按模板标识升序的 (模板标识, (池标识...)) 元组；
+        IPv6 前缀池按标识、保留前缀按数值、静态绑定按用户升序。"""
         pool_specs = []
         for pool_id in sorted(self._pools):
             pool = self._pools[pool_id]
@@ -11672,6 +12833,32 @@ class Sessions:
             (template_id, self._template_pool_order[template_id])
             for template_id in sorted(self._template_pool_order)
         )
+        v6_pool_specs = tuple(
+            (
+                pool_id,
+                str(self._v6_pools[pool_id].network),
+                self._v6_pools[pool_id].dlen,
+                tuple(
+                    str(ipaddress.IPv6Network((prefix_int, self._v6_pools[pool_id].dlen)))
+                    for prefix_int in sorted(self._v6_pools[pool_id].reserved)
+                ),
+                tuple(
+                    (
+                        user,
+                        str(ipaddress.IPv6Network(
+                            (self._v6_pools[pool_id].static[user],
+                             self._v6_pools[pool_id].dlen)
+                        )),
+                    )
+                    for user in sorted(self._v6_pools[pool_id].static)
+                ),
+            )
+            for pool_id in sorted(self._v6_pools)
+        )
+        template_v6_pool_order = tuple(
+            (template_id, self._template_v6_pool_order[template_id])
+            for template_id in sorted(self._template_v6_pool_order)
+        )
         return (
             self._total,
             self._per,
@@ -11683,6 +12870,8 @@ class Sessions:
             (self._queue_limit, self._max_wait_ms, self._queue_policy),
             self._auth.policy(),
             template_pool_order,
+            v6_pool_specs,
+            template_v6_pool_order,
         )
 
     def export_config(self):
@@ -11704,20 +12893,21 @@ class Sessions:
         """
         return _compact_config(self._current_spec()) + "\n"
 
-    def upgrade_config(self, text, target=11):
-        """只读地将 v1..v11 配置文本升级到 target（仅支持 11），返回升级包 JSON。
+    def upgrade_config(self, text, target=12):
+        """只读地将 v1..v12 配置文本升级到 target（仅支持 12），返回升级包 JSON。
 
         text 须为 str、target 须为非 bool int，否则抛 TypeError；源版本限
-        1..11 且 target 只许 11；JSON 解析、重复键、键缺失或未知、结构、类型、
+        1..12 且 target 只许 12；JSON 解析、重复键、键缺失或未知、结构、类型、
         数量、排序、值、引用或版本非法均抛 ValueError。迁移沿既有规则：v1 单池
         改 default，v1/v2 补空模板与用户模板，v1-v3 补容量 (1024, 0, 拒绝)，
         v1-v4 以认证器当前四值补认证，v1-v5 模板会话上限补 0，v1-v6 模板周期
         毫秒补 0，v1-v7 模板排队优先级补 0，v1-v8 容量队满策略补“拒绝”，
-        v1-v9 重试两项补 0，v1-v10 模板地址池补空，v11 只规范化。返回基线
+        v1-v9 重试两项补 0，v1-v10 模板地址池补空，v1-v11 IPv6 前缀池与
+        模板 IPv6 池两节补空（保持纯 IPv4），v12 只规范化。返回基线
         格式的 LF 尾紧凑 JSON：
         顶层序/型为“源版本:int、目标版本:int、改变:bool、摘要:str、配置:
-        object”，改变 = 源版本 != 11；配置逐层键序、类型与排序同
-        export_config() 的 v11；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
+        object”，改变 = 源版本 != 12；配置逐层键序、类型与排序同
+        export_config() 的 v12；摘要为配置对象同法编码、去 LF 后的 UTF-8 字节
         sha256 小写值。升级只读，不触碰任何实例状态；时/空上界 O(n log n)/
         O(n)。
         """
@@ -11765,6 +12955,8 @@ class Sessions:
             (queue_limit, _max_wait_ms, _queue_policy),
             _auth_policy,
             _template_pool_order,
+            v6_pool_specs,
+            _template_v6_pool_order,
         ) = spec
         total_count = 0
         per_user = {}
@@ -11854,7 +13046,56 @@ class Sessions:
                     f"in pool {pool_id!r}"
                 )
 
-        # 全部校验通过：构建新池表并回挂在租租约，空闲堆剔除租用动态址。
+        # v6 前缀池：校验规范形态并承载在线会话当前持有的委派前缀（归属、
+        # 对齐、位于池内、非保留、静态归属一致）。热加载不迁移会话——持有
+        # 前缀所在的前缀池被删除或前缀不再可承载即 ResourceError。
+        v6_parsed = {}
+        for pool_id, aggregate, dlen, reserved, static in v6_pool_specs:
+            v6_parsed[pool_id] = _check_v6_pool(
+                (pool_id, aggregate, dlen, reserved, static)
+            )
+        for sid, session in self._sessions.items():
+            v6_int = session.get("v6")
+            if v6_int is None:
+                continue
+            v6_pool_id = session["v6pool"]
+            data = v6_parsed.get(v6_pool_id)
+            if data is None:
+                raise ResourceError(
+                    f"new config cannot carry IPv6 lease of sid {sid!r}: "
+                    f"no IPv6 pool {v6_pool_id!r}"
+                )
+            _pid, network, dlen, reserved_ints, static_map, static_ints = data
+            base = int(network.network_address)
+            shift = 128 - dlen
+            aligned = base + (((v6_int - base) >> shift) << shift)
+            prefix_str = str(ipaddress.IPv6Network((v6_int, dlen)))
+            if aligned != v6_int:
+                raise ResourceError(
+                    f"new config cannot carry IPv6 lease of sid {sid!r}: "
+                    f"prefix {prefix_str} not aligned to /{dlen}"
+                )
+            if v6_int < base or v6_int > int(network.broadcast_address):
+                raise ResourceError(
+                    f"new config cannot carry IPv6 lease of sid {sid!r}: "
+                    f"prefix {prefix_str} not in pool {v6_pool_id!r}"
+                )
+            if v6_int in reserved_ints:
+                raise ResourceError(
+                    f"new config cannot carry IPv6 lease of sid {sid!r}: "
+                    f"prefix {prefix_str} is reserved in pool {v6_pool_id!r}"
+                )
+            if (
+                v6_int in static_ints
+                and static_map.get(session["user"]) != v6_int
+            ):
+                raise ResourceError(
+                    f"new config cannot carry IPv6 lease of sid {sid!r}: "
+                    f"prefix {prefix_str} is static for another user in pool "
+                    f"{v6_pool_id!r}"
+                )
+
+        # 全部校验通过：构建新 v4 池表并回挂在租租约，空闲堆剔除租用动态址。
         leased = {}
         for sid, session in self._sessions.items():
             if session["ip"] is not None:
@@ -11868,9 +13109,22 @@ class Sessions:
                 pool.free = [x for x in pool.free if x not in pool_leases]
                 heapq.heapify(pool.free)
             new_pools[pool_id] = pool
-        return new_pools
 
-    def _install_spec(self, spec, new_pools):
+        # 构建新 v6 前缀池表并按在租委派前缀 {前缀 int: sid} 重建稀疏空闲区间。
+        v6_leased = {}
+        for sid, session in self._sessions.items():
+            if session.get("v6") is not None:
+                v6_leased.setdefault(session["v6pool"], {})[
+                    session["v6"]
+                ] = sid
+        new_v6_pools = {}
+        for pool_id, data in v6_parsed.items():
+            v6pool = _V6Pool(data)
+            v6pool.rebuild(v6_leased.get(pool_id, {}))
+            new_v6_pools[pool_id] = v6pool
+        return new_pools, new_v6_pools
+
+    def _install_spec(self, spec, new_pools, new_v6_pools):
         """原子替换配置数值、池表、QoS 模板、容量背压与认证策略；会话状态、
         期限、地址、租期及旧队项的等待、截止、入队序均不变，认证器的用户
         凭据、失败计数与锁定记录全部保留。计量账本同标识原样保留 u/t/c，
@@ -11886,12 +13140,15 @@ class Sessions:
             (queue_limit, max_wait_ms, queue_policy),
             (max_fail, lock_ms, retry_base_ms, retry_cap_ms),
             template_pool_order,
+            _v6_pool_specs,
+            template_v6_pool_order,
         ) = spec
         self._total = total
         self._per = per
         self._idle_ms = idle_ms
         self._lease_ms = lease_ms
         self._pools = new_pools
+        self._v6_pools = new_v6_pools
         self._templates = {
             template_id: (
                 rate, burst, quota, period_ms, session_limit, priority, exceed
@@ -11904,6 +13161,9 @@ class Sessions:
         # 模板地址池序列仅作用于后续自动选池与尚未晋升的队项；既有在线或
         # 挂起会话保留原池、地址与租期，不随配置重绑或迁移。
         self._template_pool_order = dict(template_pool_order)
+        # v12 模板 IPv6 池序列同理仅作用于后续建立/恢复/晋升；既有会话的 v6
+        # 前缀不迁移、不释放，热加载不暗中迁移在线会话。
+        self._template_v6_pool_order = dict(template_v6_pool_order)
         self._queue_limit = queue_limit
         self._max_wait_ms = max_wait_ms
         self._queue_policy = queue_policy
@@ -11915,14 +13175,16 @@ class Sessions:
         # 已删模板的历史账本原样保留（改绑后按新 (用户, 模板) 独立建账），
         # 加载/回滚失败不经过本方法。
         # 配置加载/回滚成功后保留同名池的耗尽演练、清除已删池（截至不改）；
-        # 加载失败不经过本方法，故障态不变。
+        # v4 与 v6 池标识独立判定。加载失败不经过本方法，故障态不变。
+        surviving = set(new_pools) | set(new_v6_pools)
         self._pool_fault = {
             pool_id: until
             for pool_id, until in self._pool_fault.items()
-            if pool_id in new_pools
+            if pool_id in surviving
         }
 
-    def _commit_config(self, spec, new_pools, rollback_spec, op, target=-1):
+    def _commit_config(self, spec, new_pools, new_v6_pools, rollback_spec, op,
+                       target=-1):
         """校验通过后原子提交配置：覆盖回滚点、安装 spec、修订号加 1，并把
         新修订的 spec 写入历史后按 _CONFIG_HISTORY_LIMIT 淘汰最旧项。
 
@@ -11937,7 +13199,7 @@ class Sessions:
         不改；当前项随快照永不淘汰。
         """
         self._rollback = rollback_spec
-        self._install_spec(spec, new_pools)
+        self._install_spec(spec, new_pools, new_v6_pools)
         self._revision += 1
         revision = self._revision
         history = self._config_history
@@ -12007,7 +13269,7 @@ class Sessions:
                 raise ValueError(
                     f"user template user not in authenticator: {user!r}"
                 )
-        return spec, self._build_pools(spec)
+        return spec, *self._build_pools(spec)
 
     def load_config(self, text):
         """校验并原子加载配置文本，保存旧配置为唯一回滚点，返回新配置 v11 JSON。
@@ -12031,9 +13293,10 @@ class Sessions:
         UTF-8 字节 sha256 小写值）；失败与同参重放（经 config_change/
         config_cas 缓存）不追加。
         """
-        spec, new_pools = self._parse_config_text(text)
+        spec, new_pools, new_v6_pools = self._parse_config_text(text)
         self._commit_config(
-            spec, new_pools, self._current_spec(), _CONFIG_HISTORY_OP_LOAD
+            spec, new_pools, new_v6_pools, self._current_spec(),
+            _CONFIG_HISTORY_OP_LOAD
         )
         return self.export_config()
 
@@ -12051,9 +13314,9 @@ class Sessions:
         spec = self._rollback
         if spec is None:
             raise StateError("no config rollback point")
-        new_pools = self._build_pools(spec)
+        new_pools, new_v6_pools = self._build_pools(spec)
         self._commit_config(
-            spec, new_pools, None, _CONFIG_HISTORY_OP_ROLLBACK
+            spec, new_pools, new_v6_pools, None, _CONFIG_HISTORY_OP_ROLLBACK
         )
         return self.export_config()
 
@@ -13441,9 +14704,10 @@ class Sessions:
         # 按 load_config 规则解析并承载校验，成功后以“CAS”操作原子提交、
         # 覆盖回滚点并将修订号加 1（不经 load_config，以免配置历史误记
         # “加载”）；文档错 ValueError、承载冲突 ResourceError，失败实例不变。
-        spec, new_pools = self._parse_config_text(text)
+        spec, new_pools, new_v6_pools = self._parse_config_text(text)
         self._commit_config(
-            spec, new_pools, self._current_spec(), _CONFIG_HISTORY_OP_CAS
+            spec, new_pools, new_v6_pools, self._current_spec(),
+            _CONFIG_HISTORY_OP_CAS
         )
         after = self._config_summary()
         payload = {"修订": self._revision, "前摘要": before, "后摘要": after}
@@ -13525,9 +14789,9 @@ class Sessions:
         # _build_pools 不改状态，故失败配置、历史、回滚点与运行态均不变。
         # 成功以“回退”操作提交并携带 target（记录目标取 target）。
         before = self._config_summary()
-        new_pools = self._build_pools(spec)
+        new_pools, new_v6_pools = self._build_pools(spec)
         self._commit_config(
-            spec, new_pools, self._current_spec(),
+            spec, new_pools, new_v6_pools, self._current_spec(),
             _CONFIG_HISTORY_OP_REVERT, target,
         )
         after = self._config_summary()
@@ -15317,21 +16581,29 @@ class Sessions:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
-    def _render(sid, state, now_ms, deadline, address=None, lease=0):
+    def _render(sid, state, now_ms, deadline, address=None, lease=0, v6=None):
         # address=None 表示未启用地址池，JSON 与基线逐字节一致；
-        # 启用时在线给地址串与租期，下线给 "" 与 0。
+        # 启用时在线给地址串与租期，下线给 "" 与 0。v6 非 None（启用 IPv6
+        # 功能）时在租期后以固定键序追加 前缀池/IPv6前缀/前缀租期。
         payload = {"会话": sid, "状态": state, "时刻": now_ms, "期限": deadline}
         if address is not None:
             payload["地址"] = address
             payload["租期"] = lease
+        if v6 is not None:
+            payload[_V6_POOL_OUTPUT_KEY] = v6[1]
+            payload[_V6_PREFIX_KEY] = v6[0]
+            payload[_V6_LEASE_KEY] = v6[2]
         return (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
 
     @staticmethod
-    def _render_suspend_resume(sid, state, now_ms, deadline, pool_id, address, lease):
+    def _render_suspend_resume(
+        sid, state, now_ms, deadline, pool_id, address, lease, v6=None
+    ):
         # 键序：会话、状态、时刻、期限、池、地址、租期；会话/状态/池/地址为
-        # str，余为 int；挂起时池/地址为 ""、期限与租期为 0。
+        # str，余为 int；挂起时池/地址为 ""、期限与租期为 0。启用 IPv6 时
+        # 在租期后以固定键序追加 前缀池/IPv6前缀/前缀租期（挂起为空/0）。
         payload = {
             "会话": sid,
             "状态": state,
@@ -15341,12 +16613,19 @@ class Sessions:
             "地址": address,
             "租期": lease,
         }
+        if v6 is not None:
+            payload[_V6_POOL_OUTPUT_KEY] = v6[1]
+            payload[_V6_PREFIX_KEY] = v6[0]
+            payload[_V6_LEASE_KEY] = v6[2]
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
     def _render_migration(
-        sid, state, now_ms, deadline, source, old_address, target, new_address, lease
+        sid, state, now_ms, deadline, source, old_address, target, new_address,
+        lease, v6=None,
     ):
+        # 显式 IPv4 迁移只更换 v4 地址；启用 IPv6 时追加保留的有效 v6 前缀
+        # 三字段（前缀池/IPv6前缀/前缀租期）。
         payload = {
             "会话": sid,
             "状态": state,
@@ -15358,6 +16637,10 @@ class Sessions:
             "目标地址": new_address,
             "租期": lease,
         }
+        if v6 is not None:
+            payload[_V6_POOL_OUTPUT_KEY] = v6[1]
+            payload[_V6_PREFIX_KEY] = v6[0]
+            payload[_V6_LEASE_KEY] = v6[2]
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
@@ -15372,8 +16655,10 @@ class Sessions:
         pool_id,
         address,
         lease,
+        v6=None,
     ):
         # 旧值取接管前，旧会话无地址时旧地址为 ""；新会话状态恒为在线。
+        # 接管原子转移原 v6 前缀（不重新选择），启用 IPv6 时在租期后追加。
         payload = {
             "旧会话": old,
             "旧地址": old_address,
@@ -15387,6 +16672,10 @@ class Sessions:
             "地址": address,
             "租期": lease,
         }
+        if v6 is not None:
+            payload[_V6_POOL_OUTPUT_KEY] = v6[1]
+            payload[_V6_PREFIX_KEY] = v6[0]
+            payload[_V6_LEASE_KEY] = v6[2]
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 # ---------------------------------------------------------------------------
@@ -15645,12 +16934,12 @@ def _check_run_users(users):
 
 
 def _check_run_config(config, registered_users=None):
-    """校验 session-run 的 config：须为版本 11 配置对象（load_config 的键、
-    结构与取值规则）且含 default 地址池。config 非 object 抛 TypeError；
-    版本、键集/键序、结构、类型、值、引用、排序/重复或缺 default 池抛
-    ValueError。registered_users 给定时，用户模板引用的用户须在其中，
-    否则按引用非法抛 ValueError。仅做静态形态校验，不触碰任何实例。返回
-    规范化 spec（仅供调用方做进一步引用校验）。
+    """校验 session-run 的 config：须为版本 1..12 配置对象（load_config 的
+    键、结构与取值规则，v12 含 IPv6前缀池/模板IPv6池 两节）且含 default
+    地址池。config 非 object 抛 TypeError；版本、键集/键序、结构、类型、值、
+    引用、排序/重复或缺 default 池抛 ValueError。registered_users 给定时，
+    用户模板引用的用户须在其中，否则按引用非法抛 ValueError。仅做静态形态
+    校验，不触碰任何实例。返回规范化 spec（仅供调用方做进一步引用校验）。
     """
     if not isinstance(config, dict):
         raise TypeError(
@@ -15795,7 +17084,8 @@ def _parse_cli_run_request(raw):
     raw 须为 UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许
     空白；编码、JSON、重键、顶层形态、键集或键序错抛 ValueError。users
     为按用户名 Unicode 码点升序且互异的 [user, password] 二元数组；
-    config 为版本 11 配置对象且含 default 池；requests 为 1..1000 个会话
+    config 为版本 1..12 配置对象（v12 含可选 IPv6前缀池/模板IPv6池）且含
+    default 池；requests 为 1..1000 个会话
     请求对象；query_ms 为非 bool 非负 int。类型错抛 TypeError，其余形态/
     取值/排序/重复/配置非法抛 ValueError。
     """
