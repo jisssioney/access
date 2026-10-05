@@ -1966,6 +1966,16 @@ _DRAIN_MAX_LIMIT = 1000
 _DRAIN_ITEM_MOVED = _BATCH_ITEM_MIGRATE
 _DRAIN_ITEM_FAILED = "ResourceError"
 _BATCH_AUDIT_DRAIN = "地址池排空"
+
+# prefix_pool_drain 可恢复 IPv6 前缀池排空：op 与状态口径与 pool_drain 一致；
+# 推进成功项的项结果沿用 do 前缀迁移结果，失败项固定 ResourceError；成功首果
+# 与同参重放逐项写批量防篡改审计链的操作名“前缀池排空”。
+_V6_DRAIN_ITEM_MOVED = _OP_V6_MIGRATE
+_V6_DRAIN_ITEM_FAILED = "ResourceError"
+_BATCH_AUDIT_V6_DRAIN = "前缀池排空"
+# 运行态/服务检查点中 IPv6 排空节的键名（无活动排空时该键缺省，输出与基线
+# 逐字节一致；旧检查点无此键，恢复时视为无 IPv6 排空）。
+_V6_DRAIN_CP_KEY = "IPv6排空"
 # user_admin 入防篡改审计链的操作名。
 _ADMIN_CHAIN_DISABLE = "用户停用"
 _ADMIN_CHAIN_ENABLE = "用户启用"
@@ -2918,6 +2928,22 @@ class Sessions:
         # 重放逐项指认首次事件；与其余批量操作索引分域，同名 key 不互指。
         self._pool_drain_chain_index = {}
 
+        # 可恢复 IPv6 前缀池排空：源前缀池 -> [状态, (目标前缀池, ...)]，
+        # 结构与 _drains 同构（状态仅排空中/已排空，目标序互异且不含源池）。
+        # 开始后源前缀池不再承接建立、恢复、容量晋升或前缀迁移的新委派；已排
+        # 空仍拒绝新委派直至取消；取消只移除记录、恢复后续选池，不迁回已迁出
+        # 前缀。IPv4 池排空记录与本记录互不影响（IPv4 排空可把 IPv6 排空池列
+        # 为目标，反之亦可，按各址族各自的排空集合独立跳过）。
+        self._v6_drains = {}
+        # prefix_pool_drain 的重放缓存，与其余各域独立：
+        # key -> (op, source, targets, now_ms, limit, outcome)；仅成功结果缓存，
+        # 参数错（TypeError/ValueError）、未知前缀池 KeyError 与状态冲突
+        # StateError 均不占 key。
+        self._prefix_pool_drain_cache = {}
+        # prefix_pool_drain 在批量审计链的各操作 key -> 首批事件首序号索引，
+        # 供同参重放逐项指认；与其余批量操作索引分域，同名 key 不互指。
+        self._prefix_pool_drain_chain_index = {}
+
     def add_pool(self, pool_id, pool):
         """追加命名池；零池起步时借此激活地址池（含 default），返回 None。
 
@@ -3434,6 +3460,10 @@ class Sessions:
             v6_pool = self._v6_pools.get(pool_id)
             if v6_pool is None:
                 continue
+            # 排空中（含已排空）的前缀池不承接自动选址产生的新委派：与显式
+            # 前缀迁移阻断同为跳过下一后备池；既有会话前缀与从该池迁出不受影响。
+            if pool_id in self._v6_drains:
+                continue
             prefix = v6_pool.peek(user)
             if prefix is not None:
                 return pool_id, prefix
@@ -3504,6 +3534,10 @@ class Sessions:
         if not candidate_ids:
             return True
         for pool_id in candidate_ids:
+            # 排空中（含已排空）的前缀池不承接新委派，与真实选择同口径跳过
+            # （容量预测/热均衡演算须反映此不可用）。
+            if pool_id in self._v6_drains:
+                continue
             state = sims.get(pool_id)
             if state is None:
                 continue
@@ -3871,6 +3905,14 @@ class Sessions:
         _, status, _ = self._auth.authenticate(user, password, now_ms)
         if status != "ok":
             raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        # 目标前缀池正在排空（含已排空）：不承接显式前缀迁移的新委派，与
+        # 无可用前缀同为 ResourceError；从排空源池迁出不受影响。
+        if target in self._v6_drains:
+            raise ResourceError(
+                f"target IPv6 prefix pool {target!r} is draining and accepts "
+                "no new delegation"
+            )
 
         # 窥视不改租约表与归还堆：静态优先（被占用返回 None 且不回落动态），
         # 否则取数值最小的可用动态前缀；无可用 ResourceError，此刻两池水位
@@ -11339,6 +11381,324 @@ class Sessions:
         payload = {"源池": source, "状态": record[0], "剩余": remaining}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    # -- 可恢复 IPv6 前缀池排空 -----------------------------------------
+
+    def prefix_pool_drain(self, key, op, source, targets, now_ms, limit):
+        """可恢复的 IPv6 前缀池排空，返回 LF 结尾紧凑 JSON。
+
+        key 沿用凭据约束；op 仅 开始/推进/取消；source 为源前缀池标识（沿凭据
+        约束），targets 为 1..个互异且不含源池的目标前缀池标识 tuple（按调用序
+        为选池优先序）；now_ms 为非 bool 非负 int；limit 为非 bool int 且
+        1..1000（每次推进最多处理的会话数）。类型错抛 TypeError，非法操作、空
+        目标、重复目标、源池混入目标、负时刻或 limit 越界抛 ValueError，源池或
+        任一目标前缀池未知抛 KeyError（校验次序：类型→取值→未知池→状态）。
+
+        开始：源前缀池进入“排空中”，此后停止承接建立、恢复、容量晋升与显式
+        前缀迁移产生的新委派（任何在排空的前缀池都不接收新委派，含另一排水源
+        池作为目标的情形）；已有会话、IPv4 地址与租约、队列和计量状态保持原状。
+        对同一源池以不同目标顺序（或目标集）再次开始抛 StateError；同序同集
+        重开始为空操作成功。推进：先按 now_ms 完成一次既有老化，再按会话标识
+        Unicode 码点顺序处理仍在源池持有有效 IPv6 租约（在线、持前缀且
+        v6_lease > now_ms）的前 limit 项；每项按目标池顺序，沿用静态绑定优先、
+        保留前缀不可动态分配、取数值最小动态前缀（归还堆顶与未派发游标之较小
+        者）的规则选首个可承载池，目标自身在排空（含已排空）即跳过；取得目标
+        前缀后才释放原前缀，只把 IPv6 租期重置为 now_ms+lease_ms，IPv4 池、
+        地址与租期、空闲期限、QoS 账本与计费累计均不变；所有目标均无法承载时
+        该项结果固定为 ResourceError、原前缀和租期不变，其余项继续，不留双重
+        租约或半释放。源池无有效承载会话后状态变为“已排空”，仍拒绝新委派直至
+        取消。取消：移除排空记录、恢复后续选池，不迁回已迁出的前缀，状态记
+        “已取消”。
+
+        仅成功结果以独立域缓存（失败不改状态、租约、缓存与审计）：同键同参
+        重放返回逐字节相同的 JSON，异参复用抛 ValueError；三种操作的成功首果
+        及同参重放逐项（无项目的开始/取消/空推进记一条源池事件）写入既有批量
+        防篡改审计链（操作“前缀池排空”，原子恒 False）并投影到合规链。返回
+        顶层键序 时刻/源池/状态/剩余/项目，项键序 会话/目标池/结果；失败项目
+        标池为空串。单次推进 O(S log S+limit×T log L)、辅助 O(S+limit)，T 为
+        目标池数、L 为前缀池活动与归还租约数。
+        """
+        _check_credential("key", key)
+
+        cached = self._prefix_pool_drain_cache.get(key)
+        if cached is not None:
+            c_op, c_source, c_targets, c_now_ms, c_limit, output = cached
+            if not _strict_equal(
+                (op, source, targets, now_ms, limit),
+                (c_op, c_source, c_targets, c_now_ms, c_limit),
+            ):
+                raise ValueError(f"key {key!r} reused with different parameters")
+            # 成功同参重放：按首果项目逐记入批量链（结果“重放”、原序号逐项
+            # 指认首次事件），不老化、不改态，原样返回首果字节。
+            self._v6_drain_record_chain(
+                key, c_op, c_source, c_now_ms, output, replay=True
+            )
+            return output
+
+        # 新 key：任何失败（含状态冲突）均不占 key、不改状态/租约/审计。
+        self._validate_prefix_drain_params(op, source, targets, now_ms, limit)
+        targets = tuple(targets)
+
+        # 未知前缀池：源池先于各目标池（按给定目标序）。
+        if source not in self._v6_pools:
+            raise KeyError(f"unknown IPv6 prefix pool: {source!r}")
+        for target in targets:
+            if target not in self._v6_pools:
+                raise KeyError(f"unknown target IPv6 prefix pool: {target!r}")
+
+        if op == _DRAIN_OP_START:
+            output = self._v6_drain_start(source, targets, now_ms)
+        elif op == _DRAIN_OP_ADVANCE:
+            output = self._v6_drain_advance(source, targets, now_ms, limit)
+        else:
+            output = self._v6_drain_cancel(source, targets, now_ms)
+
+        self._prefix_pool_drain_cache[key] = (
+            op, source, targets, now_ms, limit, output
+        )
+        self._v6_drain_record_chain(key, op, source, now_ms, output, replay=False)
+        return output
+
+    def _validate_prefix_drain_params(self, op, source, targets, now_ms, limit):
+        """prefix_pool_drain 参数两阶段校验：类型错 TypeError 先于任何取值/
+        状态错。取值口径与 pool_drain 一致。"""
+        # 类型阶段。
+        if isinstance(op, bool) or not isinstance(op, str):
+            raise TypeError(f"op must be a str, got {type(op).__name__}")
+        if not isinstance(source, str):
+            raise TypeError(f"source must be a str, got {type(source).__name__}")
+        if not isinstance(targets, tuple):
+            raise TypeError(
+                f"targets must be a tuple, got {type(targets).__name__}"
+            )
+        for target in targets:
+            if not isinstance(target, str):
+                raise TypeError(
+                    f"target pool must be a str, got {type(target).__name__}"
+                )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(f"now_ms must be an int, got {type(now_ms).__name__}")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+
+        # 取值阶段。
+        if op not in _DRAIN_OPS:
+            raise ValueError(f"op must be one of {_DRAIN_OPS}, got {op!r}")
+        _check_credential("source", source)
+        if len(targets) == 0:
+            raise ValueError("targets must contain at least one target pool")
+        for target in targets:
+            _check_credential("target pool", target)
+        if len(set(targets)) != len(targets):
+            raise ValueError("targets must not contain duplicate pool")
+        if source in targets:
+            raise ValueError("source pool must not be among the target pools")
+        if now_ms < 0:
+            raise ValueError(f"now_ms must be >= 0, got {now_ms}")
+        if not (_DRAIN_MIN_LIMIT <= limit <= _DRAIN_MAX_LIMIT):
+            raise ValueError(
+                f"limit must be in {_DRAIN_MIN_LIMIT}..{_DRAIN_MAX_LIMIT}, "
+                f"got {limit}"
+            )
+
+    def _v6_drain_holders(self, source, now_ms):
+        """源前缀池中此刻持有有效 IPv6 租约的在线会话标识，按 Unicode 码点
+        升序。
+
+        不老化；有效即在线、委派前缀池为源池、持前缀且 v6_lease > now_ms
+        （挂起/下线/已到期待老化，或前缀已因老化单独释出的会话不计；IPv4 址
+        是否已单独老化释出不影响判定）。O(S log S) 时间、O(S) 辅助空间。
+        """
+        holders = [
+            sid
+            for sid, session in self._sessions.items()
+            if (
+                session["state"] == _STATE_ONLINE
+                and session.get("v6") is not None
+                and session["v6_pool"] == source
+                and session["v6_lease"] > now_ms
+            )
+        ]
+        holders.sort()
+        return holders
+
+    def _v6_drain_holder_count(self, source, now_ms):
+        """源前缀池此刻有效持前缀会话数（口径同 _v6_drain_holders），O(S)
+        时间、O(1) 辅助空间；供开始/取消/状态取“剩余”，无需排序。"""
+        count = 0
+        for session in self._sessions.values():
+            if (
+                session["state"] == _STATE_ONLINE
+                and session.get("v6") is not None
+                and session["v6_pool"] == source
+                and session["v6_lease"] > now_ms
+            ):
+                count += 1
+        return count
+
+    @staticmethod
+    def _render_v6_drain(now_ms, source, state, remaining, items):
+        """顶层键序 时刻/源池/状态/剩余/项目；项键序 会话/目标池/结果。与
+        pool_drain 同形（源池/目标池标识为 IPv6 前缀池标识）。"""
+        payload = {
+            "时刻": now_ms,
+            "源池": source,
+            "状态": state,
+            "剩余": remaining,
+            "项目": items,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def _v6_drain_start(self, source, targets, now_ms):
+        """开始排空：已存在同序同集记录为空操作，异序/异集 StateError；不老化。"""
+        record = self._v6_drains.get(source)
+        if record is not None:
+            if tuple(targets) != record[1]:
+                raise StateError(
+                    f"prefix pool {source!r} is already draining with a different "
+                    "target order"
+                )
+            # 同序同集重开始：幂等空操作，回报当前状态与剩余持前缀数。
+            state = record[0]
+        else:
+            self._v6_drains[source] = [_DRAIN_STATE_DRAINING, tuple(targets)]
+            state = _DRAIN_STATE_DRAINING
+        remaining = self._v6_drain_holder_count(source, now_ms)
+        return self._render_v6_drain(now_ms, source, state, remaining, [])
+
+    def _v6_drain_cancel(self, source, targets, now_ms):
+        """取消排空：目标序列须与开始时一致，否则 StateError；不老化、不迁回。"""
+        record = self._v6_drains.get(source)
+        if record is None:
+            raise StateError(f"prefix pool {source!r} is not being drained")
+        if tuple(targets) != record[1]:
+            raise StateError(
+                f"drain of prefix pool {source!r} was started with a different "
+                "target order"
+            )
+        remaining = self._v6_drain_holder_count(source, now_ms)
+        del self._v6_drains[source]
+        return self._render_v6_drain(
+            now_ms, source, _DRAIN_STATE_CANCELLED, remaining, []
+        )
+
+    def _v6_drain_choose_target(self, user, targets):
+        """按目标池序为 user 选首个可承载 (目标池, 前缀 int)；全不可用返回
+        None。
+
+        跳过：自身正在排空（含已排空）的前缀池（任何排水源前缀池不接收新委派
+        ）。可承载判定沿用 _V6PrefixPool.peek：静态绑定优先（该用户专属静态
+        前缀被占用即试下一池，不回落本池动态前缀）；非静态用户取池内数值最小
+        空闲动态前缀（保留与静态前缀从不入动态选择），无空闲返回 None。只窥视、
+        不改任何水位。
+        """
+        for target in targets:
+            if target in self._v6_drains:
+                continue
+            pool = self._v6_pools[target]
+            prefix = pool.peek(user)
+            if prefix is not None:
+                return target, prefix
+        return None
+
+    def _v6_drain_advance(self, source, targets, now_ms, limit):
+        """推进一次：先老化，再按码点序迁移前 limit 个有效持前缀会话。"""
+        record = self._v6_drains.get(source)
+        if record is None:
+            raise StateError(f"prefix pool {source!r} is not being drained")
+        if tuple(targets) != record[1]:
+            raise StateError(
+                f"drain of prefix pool {source!r} was started with a different "
+                "target order"
+            )
+
+        # 先完成一次既有老化（到期挂起/分族退租），与其他写接口一致。
+        self._age(now_ms)
+
+        items = []
+        holders = self._v6_drain_holders(source, now_ms)
+        for sid in holders[:limit]:
+            session = self._sessions[sid]
+            user = session["user"]
+            choice = self._v6_drain_choose_target(user, targets)
+            if choice is None:
+                # 无目标可承载：原前缀与租期不变，固定 ResourceError，继续后项。
+                items.append(
+                    {"会话": sid, "目标池": "", "结果": _V6_DRAIN_ITEM_FAILED}
+                )
+                continue
+            target, new_prefix = choice
+            target_pool = self._v6_pools[target]
+            source_pool = self._v6_pools[source]
+            old_prefix = session["v6"]
+
+            # 全部判定通过：先在目标池登记新前缀（静态仅登记，动态弹堆/推进
+            # 游标），再释原前缀（动态回源池归还堆、静态仅退租），最后改会话。
+            # 目标池与源池互异、新前缀不属原池，步骤皆为不失败的本地操作，故
+            # 不会双重租用或半释放。
+            self._commit_v6(user, target, new_prefix, sid)
+            del source_pool.leases[old_prefix]
+            if old_prefix not in source_pool.static_ips:
+                source_pool.release_dynamic(old_prefix)
+            session["v6"] = new_prefix
+            session["v6_pool"] = target
+            # 仅重置 IPv6 租期；IPv4 池/地址/租期、空闲期限、QoS 账本与计费
+            # 累计均不变。
+            session["v6_lease"] = now_ms + self._lease_ms
+            items.append(
+                {"会话": sid, "目标池": target, "结果": _V6_DRAIN_ITEM_MOVED}
+            )
+
+        remaining = self._v6_drain_holder_count(source, now_ms)
+        state = (
+            _DRAIN_STATE_DRAINED if remaining == 0 else _DRAIN_STATE_DRAINING
+        )
+        record[0] = state
+        return self._render_v6_drain(now_ms, source, state, remaining, items)
+
+    def _v6_drain_record_chain(self, key, op, source, now_ms, output, replay):
+        """把一次成功 IPv6 前缀池排空（首果或同参重放）逐项写入批量审计链并
+        投影合规链。口径同 _drain_record_chain：有项目逐会话记一条，无项目
+        （开始/取消/空推进）记一条源池事件；首调原序号 0，重放结果恒“重放”
+        并逐项指认对应首次事件。操作名恒为“前缀池排空”、原子恒 False。"""
+        doc = json.loads(output)
+        items = doc["项目"]
+        if items:
+            sids = [item["会话"] for item in items]
+            results = [item["结果"] for item in items]
+        else:
+            sids = [source]
+            results = [doc["状态"]]
+        origin = 0 if not replay else self._prefix_pool_drain_chain_index[key]
+        self._batch_chain_record(
+            key,
+            _BATCH_AUDIT_V6_DRAIN,
+            sids,
+            False,
+            now_ms,
+            origin,
+            self._prefix_pool_drain_chain_index,
+            results,
+        )
+
+    def prefix_pool_drain_status(self, source, now_ms):
+        """只读查询某源前缀池的排空状态与剩余持前缀数，返回 LF 结尾紧凑 JSON。
+
+        source 沿凭据约束，now_ms 为非 bool 非负 int；不老化、不改态、不缓存、
+        不审计。未知前缀池 KeyError，该池无排空记录 StateError。剩余为此刻在
+        源池持有有效 IPv6 租约（v6_lease > now_ms）的在线会话数。键序
+        源池/状态/剩余。
+        """
+        _check_credential("source", source)
+        _check_int("now_ms", now_ms, 0)
+        if source not in self._v6_pools:
+            raise KeyError(f"unknown IPv6 prefix pool: {source!r}")
+        record = self._v6_drains.get(source)
+        if record is None:
+            raise StateError(f"prefix pool {source!r} is not being drained")
+        remaining = self._v6_drain_holder_count(source, now_ms)
+        payload = {"源池": source, "状态": record[0], "剩余": remaining}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
     def _checkpoint_session_row(self, sid, session):
         """构造单个会话检查点行：双栈会话（dual）在租期后以固定键序追加
         IPv6池/IPv6前缀/IPv6租期（无在租前缀时三值为 ""/""/0）；纯 IPv4
@@ -12183,13 +12543,15 @@ class Sessions:
 
     def _runtime_payload(self, now_ms):
         """组装运行态检查点文档 dict（无排空时顶层键序：版本/时刻/容量/配额/
-        摘要；存在排空时于配额后、摘要前插入“排空”）。
+        摘要；存在 IPv4 排空时于配额后、摘要前插入“排空”；存在 IPv6 前缀池
+        排空时紧邻摘要前插入“IPv6排空”）。
 
         容量为同刻 clog 对象（其时刻等于顶层时刻），配额为同刻
-        quota_checkpoint 对象；排空为按源池 Unicode 升序的项（项键序
+        quota_checkpoint 对象；两类排空均为按源池 Unicode 升序的项（项键序
         源池/状态/目标，目标为开始时的有序目标池列表）。摘要为除末键外全部
-        键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。无排空时形态
-        与基线逐字节一致（旧版本检查点缺“排空”，恢复时视为无排空池）。纯渲染，
+        键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写十六进制串。无任何排空时
+        形态与基线逐字节一致（旧版本检查点缺两类排空键，恢复时视为无排空；
+        仅无 IPv6 排空时不含“IPv6排空”键，亦与既有版本逐字节一致）。纯渲染，
         不老化、不改态。
         """
         doc = {
@@ -12207,6 +12569,15 @@ class Sessions:
                 }
                 for source, record in sorted(self._drains.items())
             ]
+        if self._v6_drains:
+            doc[_V6_DRAIN_CP_KEY] = [
+                {
+                    "源池": source,
+                    "状态": record[0],
+                    "目标": list(record[1]),
+                }
+                for source, record in sorted(self._v6_drains.items())
+            ]
         blob = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         doc["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return doc
@@ -12221,7 +12592,10 @@ class Sessions:
         """输出运行态检查点：先验参再老化一次，返回 LF 结尾的基线 JSON。
 
         now_ms 为非 bool 非负 int，类型错 TypeError、取值错 ValueError。
-        顶层键序为“版本/时刻/容量/配额/摘要”，版本为 1；容量沿用同刻
+        顶层键序为“版本/时刻/容量/配额/摘要”，版本为 1；存在 IPv4 排空时于
+        配额后插入“排空”，存在 IPv6 前缀池排空时紧邻摘要前插入“IPv6排空”
+        （两类排空并存时先“排空”后“IPv6排空”，均无时与基线逐字节一致）；
+        容量沿用同刻
         clog 对象契约（时刻等于顶层时刻），配额沿用同刻 quota_checkpoint
         对象契约；摘要为前四键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写
         值。检查点覆盖会话/租约、容量队列/事件与共享 QoS 账本，供续租、
@@ -12260,9 +12634,16 @@ class Sessions:
             raise TypeError(f"text must be a str, got {type(text).__name__}")
 
         # 全部校验在新数据上进行，通过后一次性替换；任何失败实例不变。
-        now_ms, events, sessions, queued, quota_rows, drain_rows, summary = (
-            self._parse_runtime_checkpoint(text)
-        )
+        (
+            now_ms,
+            events,
+            sessions,
+            queued,
+            quota_rows,
+            drain_rows,
+            v6_drain_rows,
+            summary,
+        ) = self._parse_runtime_checkpoint(text)
 
         # 同摘要（以当前实况、不老化重算规范化前四键）：会话（含墓碑）、队列、
         # 账本与现存模板账本已与检查点逐字段一致，空操作不替换；租约表为在租
@@ -12305,7 +12686,7 @@ class Sessions:
                     f"令牌 for {(user, template_id)!r} exceeds template bucket "
                     f"capacity {(template[0] + template[1]) * 1000}"
                 )
-        # 排空气载力：源池与各目标池均须为现存池。
+        # 排空气载力：源池与各目标池均须为现存 IPv4 池。
         for drain_source, _state, drain_targets in drain_rows:
             if drain_source not in self._pools:
                 raise ResourceError(
@@ -12318,6 +12699,19 @@ class Sessions:
                         "runtime checkpoint references unknown drain target "
                         f"pool: {drain_target!r}"
                     )
+        # IPv6 排空气载力：源池与各目标池均须为现存前缀池。
+        for drain_source, _state, drain_targets in v6_drain_rows:
+            if drain_source not in self._v6_pools:
+                raise ResourceError(
+                    "runtime checkpoint references unknown IPv6 drain pool: "
+                    f"{drain_source!r}"
+                )
+            for drain_target in drain_targets:
+                if drain_target not in self._v6_pools:
+                    raise ResourceError(
+                        "runtime checkpoint references unknown IPv6 drain target "
+                        f"pool: {drain_target!r}"
+                    )
 
         # 覆盖状态（StateError）：目标持有待替换的会话（含墓碑）、排队项、
         # 事件、现存模板账本或排空记录，且摘要与包不同（同摘要已在上方空操作
@@ -12327,6 +12721,7 @@ class Sessions:
             or self._capacity_queue
             or self._capacity_events
             or self._drains
+            or self._v6_drains
             or any(
                 template_id in self._templates
                 for _user, template_id in self._meter_ledgers
@@ -12376,6 +12771,11 @@ class Sessions:
             drain_source: [drain_state, tuple(drain_targets)]
             for drain_source, drain_state, drain_targets in drain_rows
         }
+        # IPv6 前缀池排空态同口径整体替换（旧检查点无该键即视为无 IPv6 排空）。
+        self._v6_drains = {
+            drain_source: [drain_state, tuple(drain_targets)]
+            for drain_source, drain_state, drain_targets in v6_drain_rows
+        }
 
         result = self._runtime_checkpoint_text(now_ms)
         self._runtime_restore_cache[key] = (text, result)
@@ -12383,20 +12783,23 @@ class Sessions:
 
     def _parse_runtime_checkpoint(self, text):
         """解析并全量校验运行态检查点文本，返回 (时刻, 事件七元组, 会话行,
-        排队行, 配额行, 排平行, 摘要)；任何文本非法均抛 ValueError。
+        排队行, 配额行, IPv4 排平行, IPv6 排平行, 摘要)；任何文本非法均抛
+        ValueError。
 
-        顶层键序恰为“版本/时刻/容量/配额/摘要”（基线，无排空）或
-        “版本/时刻/容量/配额/排空/摘要”（含排空）；版本为 1，时刻为
-        非 bool 非负 int，容量/配额分别沿用 clog/quota_checkpoint 对象契约
-        （嵌套键序按原文校验后，经 _parse_checkpoint/_parse_quota_checkpoint
-        全量校验），容量时刻
-        须等于顶层时刻，摘要须为规范化除末键外各键紧凑 JSON（无 LF）UTF-8
-        字节的 sha256 小写值（与原文排版无关）。排空为按源池升序的列表，项
-        键序源池/状态/目标：源池为凭据 str，状态仅排空中/已排空，目标为
-        1..个互异且不含源池的凭据 str（保持开始时的优先顺序）。旧版本（无
-        “排空”键）恢复时排平行为空，即视为无排空池。仅做结构自洽校验；用户
-        注册、模板存在、令牌桶容、上限、池址与排空池引用的承载力由
-        runtime_restore 判定。
+        顶层键序为下列四种形态之一：“版本/时刻/容量/配额/摘要”（基线，无
+        排空）、“版本/时刻/容量/配额/排空/摘要”（仅 IPv4 排空）、
+        “版本/时刻/容量/配额/IPv6排空/摘要”（仅 IPv6 前缀池排空）或
+        “版本/时刻/容量/配额/排空/IPv6排空/摘要”（两类排空并存）；版本为
+        1，时刻为非 bool 非负 int，容量/配额分别沿用 clog/quota_checkpoint
+        对象契约（嵌套键序按原文校验后，经 _parse_checkpoint/
+        _parse_quota_checkpoint 全量校验），容量时刻须等于顶层时刻，摘要须为
+        规范化除末键外各键紧凑 JSON（无 LF）UTF-8 字节的 sha256 小写值（与
+        原文排版无关）。两类排空均为按源池升序的列表，项键序
+        源池/状态/目标：源池为凭据 str，状态仅排空中/已排空，目标为 1..个
+        互异且不含源池的凭据 str（保持开始时的优先顺序）；IPv4 节目标引用
+        IPv4 池、IPv6 节目标引用前缀池。旧版本（无对应排空键）恢复时该类排空
+        行为空，即视为无该类排空。仅做结构自洽校验；用户注册、模板存在、
+        令牌桶容、上限、池址与排空池引用的承载力由 runtime_restore 判定。
         """
         try:
             doc = json.loads(text, object_pairs_hook=_unique_object)
@@ -12404,18 +12807,33 @@ class Sessions:
             raise ValueError(f"runtime checkpoint is not valid JSON: {exc}") from exc
         if not isinstance(doc, dict):
             raise ValueError("runtime checkpoint top level must be an object")
-        # 键集与键序：无排空为基线五键，含排空为配额后插入“排空”的六键。
+        # 键集与键序：基线五键；IPv4 排空在配额后插入“排空”；IPv6 前缀池排空
+        # 紧邻摘要前插入“IPv6排空”（两类并存时先 IPv4 后 IPv6）。
         base_keys = ["版本", "时刻", "容量", "配额", "摘要"]
         with_drain_keys = ["版本", "时刻", "容量", "配额", "排空", "摘要"]
+        with_v6_drain_keys = [
+            "版本", "时刻", "容量", "配额", _V6_DRAIN_CP_KEY, "摘要"
+        ]
+        with_both_drain_keys = [
+            "版本", "时刻", "容量", "配额", "排空", _V6_DRAIN_CP_KEY, "摘要"
+        ]
         top_keys = list(doc)
         if top_keys == base_keys:
             has_drain = False
+            has_v6_drain = False
         elif top_keys == with_drain_keys:
             has_drain = True
+            has_v6_drain = False
+        elif top_keys == with_v6_drain_keys:
+            has_drain = False
+            has_v6_drain = True
+        elif top_keys == with_both_drain_keys:
+            has_drain = True
+            has_v6_drain = True
         else:
             raise ValueError(
                 "runtime checkpoint top-level keys must be "
-                "版本/时刻/容量/配额/[排空/]摘要 in order"
+                "版本/时刻/容量/配额/[排空/][IPv6排空/]摘要 in order"
             )
         version = doc["版本"]
         if isinstance(version, bool) or not isinstance(version, int):
@@ -12429,10 +12847,16 @@ class Sessions:
         if not isinstance(doc["配额"], dict):
             raise ValueError("配额 must be an object")
 
-        # 排平行结构自洽校验（池是否存在交由 runtime_restore 判 ResourceError）。
+        # 两类排平行结构自洽校验（池是否存在交由 runtime_restore 判
+        # ResourceError）；节形态相同，仅源池/目标池所属址族不同。
         drain_rows = []
+        v6_drain_rows = []
         if has_drain:
             drain_rows = self._parse_drain_section(doc["排空"])
+        if has_v6_drain:
+            v6_drain_rows = self._parse_drain_section(
+                doc[_V6_DRAIN_CP_KEY], label=_V6_DRAIN_CP_KEY
+            )
 
         # 嵌套键序按原文校验（dict 保序），先于规范化与摘要重算：容量顶层
         # 及事件/会话/排队各项沿用 clog 键序，配额沿用 quota_checkpoint
@@ -12515,15 +12939,28 @@ class Sessions:
                 for source, state, targets in drain_rows
             ]
             canonical_head["排空"] = canonical_drains
+        if has_v6_drain:
+            canonical_head[_V6_DRAIN_CP_KEY] = [
+                {"源池": source, "状态": state, "目标": list(targets)}
+                for source, state, targets in v6_drain_rows
+            ]
         blob = json.dumps(canonical_head, ensure_ascii=False, separators=(",", ":"))
         if hashlib.sha256(blob.encode("utf-8")).hexdigest() != summary:
             raise ValueError("摘要 does not match the canonical runtime checkpoint")
         return (
-            now_ms, events, sessions, queued, quota_rows, drain_rows, summary
+            now_ms,
+            events,
+            sessions,
+            queued,
+            quota_rows,
+            drain_rows,
+            v6_drain_rows,
+            summary,
         )
 
-    def _parse_drain_section(self, raw):
-        """校验运行态检查点的“排空”节，返回 (源池, 状态, 目标 tuple) 列表。
+    def _parse_drain_section(self, raw, label="排空"):
+        """校验运行态检查点的排空节（IPv4“排空”或 IPv6“IPv6排空”同形），返回
+        (源池, 状态, 目标 tuple) 列表。
 
         须为列表；项恰含 源池/状态/目标 三键且依此序；源池为凭据 str，状态
         仅排空中/已排空，目标为非空 list（JSON 无 tuple，规范化后为列表）、
@@ -12531,53 +12968,55 @@ class Sessions:
         任何不符抛 ValueError。
         """
         if not isinstance(raw, list):
-            raise ValueError("排空 must be a list")
+            raise ValueError(f"{label} must be a list")
         if not raw:
-            # 键存在即承载非空排空态：无排空池的规范包不含“排空”键，空列表
-            # 既无法由生成端产生，也会令规范化往返丢键，故拒绝。
-            raise ValueError("排空 must be non-empty when present")
+            # 键存在即承载非空排空态：无排空池的规范包不含该键，空列表既无法
+            # 由生成端产生，也会令规范化往返丢键，故拒绝。
+            raise ValueError(f"{label} must be non-empty when present")
         rows = []
         last_source = None
         for index, item in enumerate(raw):
             if not isinstance(item, dict) or list(item) != ["源池", "状态", "目标"]:
                 raise ValueError(
-                    "排空 item keys must be 源池/状态/目标 in order"
+                    f"{label} item keys must be 源池/状态/目标 in order"
                 )
             source = item["源池"]
             state = item["状态"]
             targets = item["目标"]
             if not isinstance(source, str):
                 raise ValueError(
-                    f"排空[{index}].源池 must be a str, got "
+                    f"{label}[{index}].源池 must be a str, got "
                     f"{type(source).__name__}"
                 )
-            _check_credential("排空源池", source)
+            _check_credential(f"{label}源池", source)
             if not isinstance(state, str) or state not in _DRAIN_STATES:
                 raise ValueError(
-                    f"排空[{index}].状态 must be one of {_DRAIN_STATES}, "
+                    f"{label}[{index}].状态 must be one of {_DRAIN_STATES}, "
                     f"got {state!r}"
                 )
             if not isinstance(targets, list) or not targets:
                 raise ValueError(
-                    f"排空[{index}].目标 must be a non-empty list"
+                    f"{label}[{index}].目标 must be a non-empty list"
                 )
             for target in targets:
                 if not isinstance(target, str):
                     raise ValueError(
-                        f"排空[{index}] target must be a str, got "
+                        f"{label}[{index}] target must be a str, got "
                         f"{type(target).__name__}"
                     )
-                _check_credential("排空目标池", target)
+                _check_credential(f"{label}目标池", target)
             if len(set(targets)) != len(targets):
                 raise ValueError(
-                    f"排空[{index}] targets must not contain duplicates"
+                    f"{label}[{index}] targets must not contain duplicates"
                 )
             if source in targets:
                 raise ValueError(
-                    f"排空[{index}] source must not be among its targets"
+                    f"{label}[{index}] source must not be among its targets"
                 )
             if last_source is not None and not (source > last_source):
-                raise ValueError("排空 rows must be sorted by 源池 and unique")
+                raise ValueError(
+                    f"{label} rows must be sorted by 源池 and unique"
+                )
             last_source = source
             rows.append((source, state, tuple(targets)))
         return rows
@@ -12712,7 +13151,8 @@ class Sessions:
         config_summary = parsed["config_summary"]
         auth_summary, auth_rows = parsed["auth"]
         (
-            rt_summary, events, sessions, queued, quota_rows, drain_rows
+            rt_summary, events, sessions, queued, quota_rows, drain_rows,
+            v6_drain_rows,
         ) = parsed["runtime"]
         (
             until, backoff_rows, fail_pair, pool_rows, waiting, trigger
@@ -12781,6 +13221,19 @@ class Sessions:
                         "service checkpoint references unknown drain target "
                         f"pool: {drain_target!r}"
                     )
+        # IPv6 排空气载：源池与各目标前缀池均须现存。
+        for drain_source, _state, drain_targets in v6_drain_rows:
+            if drain_source not in self._v6_pools:
+                raise ResourceError(
+                    "service checkpoint references unknown IPv6 drain pool: "
+                    f"{drain_source!r}"
+                )
+            for drain_target in drain_targets:
+                if drain_target not in self._v6_pools:
+                    raise ResourceError(
+                        "service checkpoint references unknown IPv6 drain target "
+                        f"pool: {drain_target!r}"
+                    )
         # 统计引用：用户失败行与用户计量行的标识须注册；模板计量不验引用。
         for user, _a, _r, _st, _b in fail_rows:
             if user not in self._auth:
@@ -12830,6 +13283,7 @@ class Sessions:
             or self._capacity_queue
             or self._capacity_events
             or self._drains
+            or self._v6_drains
             or any(
                 template_id in self._templates
                 for _user, template_id in self._meter_ledgers
@@ -12899,6 +13353,11 @@ class Sessions:
         self._drains = {
             drain_source: [drain_state, tuple(drain_targets)]
             for drain_source, drain_state, drain_targets in drain_rows
+        }
+        # IPv6 前缀池排空态同口径整体替换（旧检查点无该键即视为无 IPv6 排空）。
+        self._v6_drains = {
+            drain_source: [drain_state, tuple(drain_targets)]
+            for drain_source, drain_state, drain_targets in v6_drain_rows
         }
 
         self._establish_total = total
@@ -13257,10 +13716,11 @@ class Sessions:
             )
 
         # 运行态：解析返回 (时刻, 事件七元组, 会话行, 排队行, 配额行,
-        # 排平行, 摘要)；旧版本运行态无“排空”，排平行为空。
+        # IPv4 排平行, IPv6 排平行, 摘要)；旧版本运行态无两类排空键时对应
+        # 排平行为空。
         (
             runtime_now, events, sessions, queued, quota_rows, drain_rows,
-            rt_summary,
+            v6_drain_rows, rt_summary,
         ) = self._parse_runtime_checkpoint(recode(raw_runtime))
         if runtime_now != now_ms:
             raise ValueError(
@@ -13298,6 +13758,12 @@ class Sessions:
                 {"源池": drain_source, "状态": drain_state,
                  "目标": list(drain_targets)}
                 for drain_source, drain_state, drain_targets in drain_rows
+            ]
+        if v6_drain_rows:
+            canon_runtime[_V6_DRAIN_CP_KEY] = [
+                {"源池": drain_source, "状态": drain_state,
+                 "目标": list(drain_targets)}
+                for drain_source, drain_state, drain_targets in v6_drain_rows
             ]
         canon_runtime["摘要"] = hashlib.sha256(
             recode(canon_runtime).encode("utf-8")
@@ -13420,7 +13886,8 @@ class Sessions:
             "config_summary": config_summary,
             "auth": (auth_summary, auth_rows),
             "runtime": (
-                rt_summary, events, sessions, queued, quota_rows, drain_rows
+                rt_summary, events, sessions, queued, quota_rows, drain_rows,
+                v6_drain_rows,
             ),
             "fault": (
                 fault_summary, until, backoff_rows, fail_pair, pool_rows,
@@ -13620,6 +14087,21 @@ class Sessions:
                 if drain_target not in new_pool_ids:
                     raise ResourceError(
                         "new config deletes target pool "
+                        f"{drain_target!r} of drain on {drain_source!r}"
+                    )
+        # IPv6 前缀池排空同口径：活动排空的源前缀池与全部目标前缀池均不得被
+        # 配置变更删除（IPv6 池集合独立于 IPv4 池集合，两类排空互不影响）。
+        new_v6_pool_ids = {v6_id for v6_id, *_rest in v6_pool_specs}
+        for drain_source, (_state, drain_targets) in self._v6_drains.items():
+            if drain_source not in new_v6_pool_ids:
+                raise ResourceError(
+                    "new config deletes draining source IPv6 prefix pool "
+                    f"{drain_source!r}"
+                )
+            for drain_target in drain_targets:
+                if drain_target not in new_v6_pool_ids:
+                    raise ResourceError(
+                        "new config deletes target IPv6 prefix pool "
                         f"{drain_target!r} of drain on {drain_source!r}"
                     )
         total_count = 0
