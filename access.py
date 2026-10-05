@@ -57,9 +57,10 @@
   只读分页（after 非 bool 非负 int、limit 1..1000，型错 TypeError、界错
   ValueError，链尾后空页），顶层键序版本/起点/下页/事件/尾序号/尾哈希，LF
   尾紧凑 JSON，同状态逐字节一致，时空 O(limit)。
-  fault 注入/恢复后端故障：do 建立/迁移/前缀迁移/接管与 capacity 申请在验
-  参后、老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
-  后端故障统计（含按类累计的失败次数），查询不老化、不改态。
+  fault 注入/恢复后端故障：do 建立/迁移/前缀迁移/双栈迁移/接管与
+  capacity 申请在验参后、老化前查后端，故障期按用户指数退避抛
+  BackendError；fault_stats 查询后端故障统计（含按类累计的失败次数），
+  查询不老化、不改态。
   backend_checkpoint/backend_restore 提供后端故障态（故障截至、按用户
   退避、失败计数）检查点（版本 1，摘要覆盖前五键）与按 key 原子恢复：
   检查点只读、不清到期退避，恢复全验后原子替换，仅缓存首次成功、同参
@@ -1401,6 +1402,7 @@ _OP_TAKEOVER = "接管"
 _OP_SUSPEND = "挂起"
 _OP_RESUME = "恢复"
 _OP_V6_MIGRATE = "前缀迁移"
+_OP_DUAL_MIGRATE = "双栈迁移"
 
 _DEFAULT_POOL_ID = "default"
 
@@ -2153,7 +2155,18 @@ class Sessions:
     目标池数值最小的可用动态前缀，再释原前缀并把 IPv6 租期重置为
     now_ms+lease_ms；未知 sid/目标池 KeyError，非在线、纯 IPv4、已无在租
     前缀或目标即原池 StateError，认证失败 AuthError，静态占用或无动态前缀
-    ResourceError，失败不改两池水位。接管先老化：旧会话持址则新会话继承其池/地址/租约，
+    ResourceError，失败不改两池水位。双栈迁移（"双栈迁移"）args 为
+    （目标 IPv4 池、目标 IPv6 前缀池、口令）三元组，仅受理同时持有 IPv4
+    地址与 IPv6 委派前缀的在线会话，一次认证、一次请求原子换两族资源：认证
+    通过后先无副作用地窥视两类目标资源（两族均静态绑定优先、否则取最小
+    动态），任一目标池故障/排空、静态占用或动态耗尽抛 ResourceError 且两族
+    水位均不改；成功才一次登记两族新租约并释放两族旧资源，把两类租期都重置
+    为 now_ms+lease_ms，空闲期限、dual 属性、QoS 账本与活动计费不变，不产生
+    计费停止/开始事件。未知 sid、未知任一目标池 KeyError，会话已老化、缺少
+    任一租约或目标与当前同族池相同 StateError，认证失败 AuthError；返回 LF
+    尾紧凑 JSON，键序为会话/状态/时刻/期限/原池/原地址/目标池/目标地址/
+    租期/原IPv6池/原IPv6前缀/目标IPv6池/目标IPv6前缀/IPv6租期，单次
+    O(log A+log P) 时间、O(1) 额外空间。接管先老化：旧会话持址则新会话继承其池/地址/租约，
     无址则自 default 池新分配（不应用后备序列），租期 = now_ms+lease_ms；认证或资源失败仅保留
     老化结果。按 key 永久缓存重放。takeover_audit 记录首次成功/认证失败/资源
     失败及同参重放，查询不老化。do 验参后的首次结果（成功或
@@ -2958,12 +2971,12 @@ class Sessions:
         self._pools[pool_id] = _Pool(parsed)
 
     def do(self, key, op, sid, args, now_ms):
-        """执行一次建立/续租/下线/迁移/前缀迁移/接管/挂起/恢复操作，返回 LF
-        结尾的 JSON 字符串。
+        """执行一次建立/续租/下线/迁移/前缀迁移/双栈迁移/接管/挂起/恢复操作，
+        返回 LF 结尾的 JSON 字符串。
 
-        建立/迁移/前缀迁移/接管/恢复在验参后、老化前查后端：故障期按用户
-        指数退避抛 BackendError（只入缓存，不老化、不认证、不审计），健康才
-        老化。
+        建立/迁移/前缀迁移/双栈迁移/接管/恢复在验参后、老化前查后端：故障期
+        按用户指数退避抛 BackendError（只入缓存，不老化、不认证、不审计），
+        健康才老化。
         """
         _check_credential("key", key)
 
@@ -3016,13 +3029,13 @@ class Sessions:
         if count_establish:
             self._establish_total += 1
 
-        # 建立/迁移/前缀迁移/接管/恢复：验参后、老化前查后端。迁移/前缀
-        # 迁移/接管/恢复由 sid/old 只读定位，未知 KeyError（不退避，仍缓存
-        # 并入链）；定位后 BackendError 先于状态、目标池与新 sid 错误；健康
-        # 才老化并循旧序。
+        # 建立/迁移/前缀迁移/双栈迁移/接管/恢复：验参后、老化前查后端。迁移/
+        # 前缀迁移/双栈迁移/接管/恢复由 sid/old 只读定位，未知 KeyError（不退
+        # 避，仍缓存并入链）；定位后 BackendError 先于状态、目标池与新 sid
+        # 错误；健康才老化并循旧序。
         if op == _OP_ESTABLISH:
             backend_user = args[0]
-        elif op == _OP_MIGRATE or op == _OP_V6_MIGRATE:
+        elif op == _OP_MIGRATE or op == _OP_V6_MIGRATE or op == _OP_DUAL_MIGRATE:
             session = self._sessions.get(sid)
             if session is None:
                 exc = KeyError(f"unknown sid: {sid!r}")
@@ -3066,8 +3079,9 @@ class Sessions:
             backend_user = session["user"]
         else:
             backend_user = None
-        # 停用态用户：建立/迁移/接管/恢复先于后端检查与认证拒绝，只入缓存；
-        # 不老化、不退避、不认证、不计失败、不入审计链（重放自然不重记入链）。
+        # 停用态用户：建立/迁移/前缀迁移/双栈迁移/接管/恢复先于后端检查与认证
+        # 拒绝，只入缓存；不老化、不退避、不认证、不计失败、不入审计链（重放
+        # 自然不重记入链）。
         if backend_user is not None and backend_user in self._disabled_users:
             exc = AuthError(f"user {backend_user!r} is disabled")
             self._cache[key] = (
@@ -3107,6 +3121,10 @@ class Sessions:
                 result = self._migrate(sid, args[0], args[1], now_ms)
             elif op == _OP_V6_MIGRATE:
                 result = self._v6_migrate(sid, args[0], args[1], now_ms)
+            elif op == _OP_DUAL_MIGRATE:
+                result = self._dual_migrate(
+                    sid, args[0], args[1], args[2], now_ms
+                )
             elif is_takeover:
                 result = self._takeover(sid, args[0], args[1], now_ms)
             elif op == _OP_SUSPEND:
@@ -3156,13 +3174,14 @@ class Sessions:
         老化后抛 StateError 或 KeyError），续租仅在已有地址池时受理。"""
         if isinstance(op, bool) or not isinstance(op, str):
             raise TypeError(f"op must be a str, got {type(op).__name__}")
-        # 迁移、前缀迁移、接管、挂起与恢复在零池模式下亦通过验参，状态类
-        # 异常延后到老化之后。
+        # 迁移、前缀迁移、双栈迁移、接管、挂起与恢复在零池模式下亦通过验参，
+        # 状态类异常延后到老化之后。
         valid_ops = (
             _OP_ESTABLISH,
             _OP_OFFLINE,
             _OP_MIGRATE,
             _OP_V6_MIGRATE,
+            _OP_DUAL_MIGRATE,
             _OP_TAKEOVER,
             _OP_SUSPEND,
             _OP_RESUME,
@@ -3174,6 +3193,7 @@ class Sessions:
                 _OP_OFFLINE,
                 _OP_MIGRATE,
                 _OP_V6_MIGRATE,
+                _OP_DUAL_MIGRATE,
                 _OP_TAKEOVER,
                 _OP_SUSPEND,
                 _OP_RESUME,
@@ -3203,6 +3223,17 @@ class Sessions:
                 )
             _check_credential(first_label, args[0])
             _check_credential("password", args[1])
+        elif op == _OP_DUAL_MIGRATE:
+            if not isinstance(args, tuple):
+                raise TypeError(f"args must be a tuple, got {type(args).__name__}")
+            if len(args) != 3:
+                raise ValueError(
+                    "args must be a 3-tuple (target, target prefix pool, "
+                    f"password), got {len(args)} items"
+                )
+            _check_credential("target", args[0])
+            _check_credential("target prefix pool", args[1])
+            _check_credential("password", args[2])
         elif op == _OP_TAKEOVER:
             if not isinstance(args, tuple):
                 raise TypeError(f"args must be a tuple, got {type(args).__name__}")
@@ -3967,6 +3998,140 @@ class Sessions:
             target,
             new_prefix_str,
             new_v6_lease,
+        )
+
+    def _dual_migrate(self, sid, target, target_v6, password, now_ms):
+        """在线双栈会话一次请求同时迁移 IPv4 地址与 IPv6 委派前缀；失败不改
+        两族租约，老化不回滚，成功才一次释放旧资源并登记新资源。
+
+        两族目标资源在认证通过后先无副作用地窥视选定：IPv4 沿用静态绑定
+        优先、否则最小动态地址；IPv6 沿用专属静态前缀优先、否则最小动态
+        前缀。任一目标池处于故障或排空状态、静态资源被占用或动态资源耗尽即
+        ResourceError，此刻两族水位均未改。提交只做不可失败的本地堆/字典
+        操作：先登记两类新租约，再释放两类旧资源，最后改会话字段，故不会两
+        池双占用、半迁移或分阶段残留。成功把两类租期都重置为
+        now_ms+lease_ms；空闲期限（期限）、dual 属性、QoS 账本与活动计费
+        累计不变，也不产生计费停止或开始事件。依次：未知 sid、未知 IPv4 或
+        IPv6 目标池 KeyError，会话已老化（非在线）、缺少任一租约或目标与
+        当前同族池相同 StateError，认证非 ok AuthError，资源类 ResourceError。
+        单次 O(log A+log P) 时间、O(1) 额外空间，A/P 为两个目标池的可分配
+        资源规模（IPv6 游标推进摊薄于历次选择）。
+        """
+        session = self._sessions.get(sid)
+        if session is None:
+            raise KeyError(f"unknown sid: {sid!r}")
+        target_pool = self._pools.get(target)
+        if target_pool is None:
+            raise KeyError(f"unknown target pool: {target!r}")
+        target_v6_pool = self._v6_pools.get(target_v6)
+        if target_v6_pool is None:
+            raise KeyError(f"unknown target IPv6 prefix pool: {target_v6!r}")
+        if (
+            session["state"] != _STATE_ONLINE
+            or session["ip"] is None
+            or session.get("v6") is None
+        ):
+            raise StateError(
+                f"cannot dual-migrate sid {sid!r} in state "
+                f"{session['state']!r} without both address and delegated prefix"
+            )
+        source_id = session["pool"]
+        source_v6_id = session["v6_pool"]
+        if source_id == target:
+            raise StateError(f"sid {sid!r} already in target pool {target!r}")
+        if source_v6_id == target_v6:
+            raise StateError(
+                f"sid {sid!r} already in target IPv6 prefix pool {target_v6!r}"
+            )
+
+        user = session["user"]
+        _, status, _ = self._auth.authenticate(user, password, now_ms)
+        if status != "ok":
+            raise AuthError(f"authentication not ok for user {user!r}: {status}")
+
+        # 认证通过后先无副作用地选择两类目标资源，任一不可用即失败、两族水位
+        # 均不改。IPv4：耗尽演练与排空池不承接显式双栈迁入（与显式 IPv4 迁移
+        # 的耗尽口径及自动选址的排空口径一致），静态绑定优先（被占用不回落
+        # 动态），否则取动态堆顶（仅窥视不弹出）。
+        if self._pool_is_exhausted(target, now_ms) or target in self._drains:
+            raise ResourceError(f"target pool {target!r} unavailable")
+        new_ip = target_pool.static.get(user)
+        if new_ip is None:
+            if not target_pool.free:
+                raise ResourceError(f"target pool {target!r} exhausted")
+        elif new_ip in target_pool.leases:
+            raise ResourceError(
+                f"static address {ipaddress.IPv4Address(new_ip)} for {user!r} "
+                "already in use"
+            )
+        # IPv6：排空（含已排空）前缀池不承接新委派；peek 静态优先（被占用
+        # 返回 None 且不回落动态），否则取最小可用动态前缀，均只窥视。
+        if target_v6 in self._v6_drains:
+            raise ResourceError(
+                f"target IPv6 prefix pool {target_v6!r} is draining and accepts "
+                "no new delegation"
+            )
+        new_prefix = target_v6_pool.peek(user)
+        if new_prefix is None:
+            raise ResourceError(
+                f"no IPv6 prefix available in target pool {target_v6!r} "
+                f"for {user!r}"
+            )
+
+        # 全部校验通过：原子提交。先登记两类新租约（IPv4 动态弹堆、静态仅
+        # 登记；IPv6 由 _commit_v6 弹堆/推进游标或仅登记），再一次释放两类
+        # 旧资源（动态各自回原池空闲结构、静态仅退租），最后改会话。两个目
+        # 标池与各自源池互异，且窥视与提交之间无其他变更，各步皆为不可失败
+        # 的本地操作，故不存在分阶段结果。
+        source_pool = self._pools[source_id]
+        source_v6_pool = self._v6_pools[source_v6_id]
+        old_ip = session["ip"]
+        old_prefix = session["v6"]
+
+        if new_ip is None:
+            # 非静态用户：提交窥视所得动态堆顶。
+            new_ip = heapq.heappop(target_pool.free)
+        target_pool.leases[new_ip] = sid
+        self._commit_v6(user, target_v6, new_prefix, sid)
+
+        del source_pool.leases[old_ip]
+        if old_ip not in source_pool.static_ips:
+            heapq.heappush(source_pool.free, old_ip)
+        del source_v6_pool.leases[old_prefix]
+        if old_prefix not in source_v6_pool.static_ips:
+            source_v6_pool.release_dynamic(old_prefix)
+
+        old_address = str(ipaddress.IPv4Address(old_ip))
+        new_address = str(ipaddress.IPv4Address(new_ip))
+        old_prefix_str = str(
+            ipaddress.IPv6Network((old_prefix, source_v6_pool.deleg_len))
+        )
+        new_prefix_str = str(
+            ipaddress.IPv6Network((new_prefix, target_v6_pool.deleg_len))
+        )
+        session["ip"] = new_ip
+        session["pool"] = target
+        session["v6"] = new_prefix
+        session["v6_pool"] = target_v6
+        # 两类租期同刻重置；空闲期限（期限）、QoS 账本与活动计费均不变。
+        new_lease = now_ms + self._lease_ms
+        session["lease"] = new_lease
+        session["v6_lease"] = new_lease
+        return self._render_dual_migration(
+            sid,
+            _STATE_ONLINE,
+            now_ms,
+            session["deadline"],
+            source_id,
+            old_address,
+            target,
+            new_address,
+            new_lease,
+            source_v6_id,
+            old_prefix_str,
+            target_v6,
+            new_prefix_str,
+            new_lease,
         )
 
     def _takeover(self, sid, old, password, now_ms):
@@ -17838,6 +18003,35 @@ class Sessions:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     @staticmethod
+    def _render_dual_migration(
+        sid, state, now_ms, deadline,
+        source, old_address, target, new_address, lease,
+        source_v6, old_prefix, target_v6, new_prefix, v6_lease,
+    ):
+        # 双栈迁移同时换两族资源：IPv4 段沿用迁移键序，其后追加 IPv6 段
+        # （原IPv6池/原IPv6前缀/目标IPv6池/目标IPv6前缀/IPv6租期），不呈现
+        # 纯 IPv4 输出中的 IPv6池/IPv6前缀 键。键序固定为会话/状态/时刻/
+        # 期限/原池/原地址/目标池/目标地址/租期/原IPv6池/原IPv6前缀/
+        # 目标IPv6池/目标IPv6前缀/IPv6租期。
+        payload = {
+            "会话": sid,
+            "状态": state,
+            "时刻": now_ms,
+            "期限": deadline,
+            "原池": source,
+            "原地址": old_address,
+            "目标池": target,
+            "目标地址": new_address,
+            "租期": lease,
+            "原IPv6池": source_v6,
+            "原IPv6前缀": old_prefix,
+            "目标IPv6池": target_v6,
+            "目标IPv6前缀": new_prefix,
+            "IPv6租期": v6_lease,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    @staticmethod
     def _render_takeover(
         old,
         old_address,
@@ -17919,6 +18113,7 @@ _CLI_RUN_OPS = (
     _OP_RENEW,
     _OP_MIGRATE,
     _OP_V6_MIGRATE,
+    _OP_DUAL_MIGRATE,
     _OP_TAKEOVER,
     _OP_SUSPEND,
     _OP_RESUME,
@@ -18165,10 +18360,34 @@ def _run_args_to_tuple(index, op, args):
     """把会话请求的 args 数组转成 Sessions.do 原接口元组。
 
     建立/迁移/前缀迁移/接管/恢复须为恰含两个凭据字符串的数组（转为二元
-    tuple）；续租/挂起/下线须为 null；其余形态按非法处理：非数组容器
-    （tuple 等）为 ValueError，非数组标量为 TypeError，长度/字段类型/取值
-    错分别为 ValueError/TypeError/ValueError。
+    tuple）；双栈迁移须为恰含三个凭据字符串（目标 IPv4 池、目标 IPv6 前缀
+    池、口令）的数组（转为三元 tuple）；续租/挂起/下线须为 null；其余形态
+    按非法处理：非数组容器（tuple 等）为 ValueError，非数组标量为
+    TypeError，长度/字段类型/取值错分别为 ValueError/TypeError/ValueError。
     """
+    if op == _OP_DUAL_MIGRATE:
+        if isinstance(args, tuple):
+            raise ValueError(
+                f"requests[{index}].args must be an array, not a tuple"
+            )
+        if not isinstance(args, list):
+            raise TypeError(
+                f"requests[{index}].args must be an array, "
+                f"got {type(args).__name__}"
+            )
+        if len(args) != 3:
+            raise ValueError(
+                f"requests[{index}].args must have exactly 3 items, "
+                f"got {len(args)}"
+            )
+        first = _run_args_to_tuple_cred(
+            index, 0, "target", args[0]
+        )
+        second = _run_args_to_tuple_cred(
+            index, 1, "target prefix pool", args[1]
+        )
+        third = _run_args_to_tuple_cred(index, 2, "password", args[2])
+        return first, second, third
     if op in (
         _OP_ESTABLISH,
         _OP_MIGRATE,
@@ -18227,7 +18446,7 @@ def _run_args_to_tuple_cred(index, field_index, field_name, value):
 
 def _check_run_requests(requests):
     """校验 session-run 的 requests：1..1000 个对象，键依次且仅为
-    key/op/sid/args/now_ms；key/sid 沿凭据约束，op 仅八个会话操作，
+    key/op/sid/args/now_ms；key/sid 沿凭据约束，op 仅九个会话操作，
     args 形态随 op（见 _run_args_to_tuple），now_ms 为非 bool 非负 int。
     返回 [(key, op, sid, args_tuple, now_ms), ...]，保持请求顺序。
     requests 非 list 抛 TypeError；长度、键集/键序、op、args 形态或取值
