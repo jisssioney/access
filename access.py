@@ -57,6 +57,16 @@
   只读分页（after 非 bool 非负 int、limit 1..1000，型错 TypeError、界错
   ValueError，链尾后空页），顶层键序版本/起点/下页/事件/尾序号/尾哈希，LF
   尾紧凑 JSON，同状态逐字节一致，时空 O(limit)。
+  accounting_stats(user) 只读折叠计费链生成单用户确定性汇总：user 沿凭据
+  约束且须为已注册用户（型错 TypeError、值错 ValueError、未注册 KeyError），
+  不接收时钟、不老化、不补账（旧检查点惰性建账前的活动会话无事件即不计）、
+  不改任何状态与缓存；顶层键序版本/用户/会话/事件/累计字节/最近时刻/尾序号/
+  尾哈希/摘要，版本恒 1，会话为总数/活动/停止（按该用户事件中不同会话标识，
+  每会话取最大序号事件定末态，停止计停止、其余计活动），事件为开始/中间/
+  停止条数，累计字节仅累加每会话末条事件累计值，最近时刻取该用户事件最大
+  时刻，无事件时计数与累计/最近时刻均 0；尾序号/尾哈希恒取全局链尾，摘要为
+  前八键紧凑 JSON UTF-8 字节 SHA-256 小写值，LF 尾紧凑 JSON，同状态同 user
+  逐字节一致，时间 O(E)、辅助空间 O(S)（E 全局事件数、S 该用户不同会话数）。
   fault 注入/恢复后端故障：do 建立/迁移/前缀迁移/双栈迁移/接管与 capacity 申请在验
   参后、老化前查后端，故障期按用户指数退避抛 BackendError；fault_stats 查询
   后端故障统计（含按类累计的失败次数），查询不老化、不改态。
@@ -4940,6 +4950,82 @@ class Sessions:
             "尾序号": len(self._account_events),
             "尾哈希": self._account_tail,
         }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    def accounting_stats(self, user):
+        """只读折叠计费哈希链，返回指定用户的确定性汇总 JSON；不接收时钟、
+        不老化、不补账、不改会话/租约/计费链/统计/审计/检查点与任何幂等缓存。
+
+        user 沿用凭据约束（str、UTF-8 1..256 字节、不含 U+0000）：类型错抛
+        TypeError，取值错抛 ValueError，未注册用户抛 KeyError；任何失败不产生
+        输出状态或副作用。仅统计已落入链中的开始/中间/停止事件；旧检查点恢复
+        后尚未惰性建账的活动会话无事件，自然不计入。顶层键序固定为
+        “版本/用户/会话/事件/累计字节/最近时刻/尾序号/尾哈希/摘要”，版本恒 1：
+        会话键序“总数/活动/停止”，总数按该用户事件中不同会话标识计数，每个
+        会话以序号最大的事件定末态，末态为停止计停止、其余计活动；事件键序
+        “开始/中间/停止”，为该用户各类型事件条数；累计字节只累加每个不同会话
+        末条事件的累计字节；最近时刻为该用户全部事件的最大时刻，无事件时计数、
+        累计字节与最近时刻均为 0。尾序号/尾哈希恒取查询时全局链尾（空链为
+        64 个 0）。摘要为前八个顶层字段紧凑 JSON（无 LF）UTF-8 字节的 sha256
+        小写值。LF 尾紧凑 JSON，同状态同 user 逐字节一致；时间 O(E)、辅助
+        空间 O(S)（E 全局事件数、S 该用户不同会话数）。
+        """
+        _check_credential("user", user)
+        if user not in self._auth:
+            raise KeyError(f"unknown user: {user!r}")
+
+        # 单扫全链：仅为该用户保留每会话末态（链按序号追加，覆写即末态）。
+        # sid -> (末序号, 末类型, 末累计字节)
+        last_by_sid = {}
+        start_count = 0
+        interim_count = 0
+        stop_count = 0
+        latest_ms = 0
+        for event in self._account_events:
+            (seq, kind, now_ms, sid, event_user, _pool_id, _address,
+             total, _reason, _prev_hash, _digest) = event
+            if event_user != user:
+                continue
+            if kind == _ACCOUNT_START:
+                start_count += 1
+            elif kind == _ACCOUNT_INTERIM:
+                interim_count += 1
+            else:
+                stop_count += 1
+            if now_ms > latest_ms:
+                latest_ms = now_ms
+            last_by_sid[sid] = (seq, kind, total)
+
+        active = 0
+        stopped = 0
+        total_bytes = 0
+        for _seq, kind, total in last_by_sid.values():
+            total_bytes += total
+            if kind == _ACCOUNT_STOP:
+                stopped += 1
+            else:
+                active += 1
+
+        payload = {
+            "版本": 1,
+            "用户": user,
+            "会话": {
+                "总数": len(last_by_sid),
+                "活动": active,
+                "停止": stopped,
+            },
+            "事件": {
+                "开始": start_count,
+                "中间": interim_count,
+                "停止": stop_count,
+            },
+            "累计字节": total_bytes,
+            "最近时刻": latest_ms,
+            "尾序号": len(self._account_events),
+            "尾哈希": self._account_tail,
+        }
+        blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        payload["摘要"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def _auth_payload(self, now_ms):
