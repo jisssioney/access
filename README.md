@@ -89,6 +89,32 @@
   相同输入逐字节同输出，时间
   O(L+R(Q log Q+S+Q log A)+S log S)、空间 O(L+U+R+S+Q+A)（L 输入字节
   数、U 用户数、R 请求数、S 会话数、Q 排队峰值、A 地址总数）。
+- `python access.py batch-online-run`（不带额外参数）：stdin 读入
+  UTF-8 JSON 对象，对象前不得有空白、尾部仅许空白，顶层键依次且仅为
+  `users,config,batches,query_ms`。`users` 与版本 12 `config` 沿
+  session-run 规则（含 default 地址池、用户模板引用须在 users 内）；
+  `batches` 为 1..100 个对象，键依次且仅为 `key,items,now_ms,atomic`，
+  `key` 沿凭据约束，`items` 为 1..1000 个三字符串数组
+  （会话标识、用户名、口令，三串沿凭据约束、批内会话标识互异），全部批次
+  合计不超过 1000 项，`now_ms` 为非 bool 非负 int，`atomic` 为 bool。
+  完整信封通过校验后才注册用户、加载配置并按顺序调用
+  `Sessions.batch_online`（数组转原接口三元 tuple），格式或配置非法时不
+  执行任何批次；非原子批保留成功项，原子批任一项失败即整批回滚，不留下该
+  批新会话、IPv4 租约或 IPv6 前缀，认证计数、退避与老化沿用既有语义；
+  同一 key 同参重放首果且不重复建会话，异参复用记为该批 ValueError 后
+  继续。批内业务失败封在 batch_online 返回对象内（批次结果仍为 true）。
+  结束后以 query_ms 取会话全量查询（只读视图）与地址池统计（先老化）。
+  成功 stdout 为 LF 尾紧凑 JSON，顶层键序 `版本,项目,会话,地址池,摘要`，
+  版本 1；项目保持批次顺序，项键序 `序号,结果,输出,类型`，成功结果为
+  true、输出为 batch_online 返回的 JSON 对象、类型为空串，失败结果为
+  false、输出为 null、类型为异常类名；摘要为前四个顶层字段紧凑编码
+  UTF-8 字节的 SHA-256 小写值。合法信封即使含批次失败也退出 0、stderr
+  空；编码、JSON、重键、键序、类型、数量、配置或参数形态错误时 stdout
+  为空，stderr 写键序 `错误,类型`（错误值为 batch-online-run）的 LF 尾
+  紧凑 JSON，TypeError/ValueError 退出 2、ResourceError 退出 3、
+  StateError 退出 4。相同输入逐字节同输出，时间
+  O(L+R*S+B log A+S log S)、空间 O(L+U+B+S+A)（L 输入字节数、U 用户数、
+  R 批数、S 会话/总项数、B 批项总数、A 地址总数）。
 
 ## 测试
 
