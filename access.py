@@ -18146,7 +18146,7 @@ class Sessions:
 # ---------------------------------------------------------------------------
 # 命令行入口：python access.py <子命令>
 #
-# 四个无额外参数的子命令，均从 stdin 读入 UTF-8 JSON 请求对象（对象前不得
+# 五个无额外参数的子命令，均从 stdin 读入 UTF-8 JSON 请求对象（对象前不得
 # 有空白、尾部仅许 JSON 空白）：
 # - stats-merge：顶层键依次 key/users/base/left/right，在不加载地址池/模板/
 #   持久状态的临时实例中注册 users 后调用 Sessions.stats_merge；
@@ -18160,6 +18160,12 @@ class Sessions:
 #   配置（须含 default 池），依序调用 Sessions.capacity（op 仅申请/取消/
 #   推进），业务失败记录后继续，最后以 query_ms 调 capacity_stats 老化再取
 #   会话全量第一页，输出版本/项目/会话/容量/摘要。
+# - batch-online-run：顶层键依次 users/config/batches/query_ms，在全新实例
+#   中注册 users、加载版本 12 配置（须含 default 池），依序调用
+#   Sessions.batch_online（每批 key/items/now_ms/atomic，items 为三元串
+#   数组，全部批次合计不超过 1000 项），业务失败（含同 key 异参复用的
+#   ValueError）记异常类名后继续，最后按 query_ms 取会话全量查询与地址池
+#   统计，输出版本/项目/会话/地址池/摘要。
 # 成功把返回值原字节写 stdout（退出 0、stderr 空），失败 stdout 空、
 # stderr 写 LF 尾紧凑 JSON {"错误":<子命令名>,"类型":<异常类名>}，
 # TypeError/ValueError 退出 2、ResourceError 退出 3、StateError 退出 4；
@@ -18167,22 +18173,32 @@ class Sessions:
 # 逐字节同结果。stats-merge/stats-delta 时间 O(L+n log n)、空间 O(L+n)，
 # L 为输入字节长度、n 为 users 与检查点明细总数；session-run 时间
 # O(L+A+R(S+log A)+S log S)、空间 O(L+U+R+S+A)；capacity-run 时间
-# O(L+R(Q log Q+S+Q log A)+S log S)、空间 O(L+U+R+S+Q+A)
-# （R 请求数、S 会话数、Q 排队峰值、A 地址总数、U 用户数）。
+# O(L+R(Q log Q+S+Q log A)+S log S)、空间 O(L+U+R+S+Q+A)；
+# batch-online-run 时间 O(L+R*S+B*log A+S*log S)、空间
+# O(L+U+B+S+A)（B 批次数、R 全部批次项目总数、S 会话数、A 地址总数、
+# U 用户数）。
 # ---------------------------------------------------------------------------
 
 _CLI_MERGE_COMMAND = "stats-merge"
 _CLI_DELTA_COMMAND = "stats-delta"
 _CLI_RUN_COMMAND = "session-run"
 _CLI_CAPACITY_COMMAND = "capacity-run"
+_CLI_BATCH_COMMAND = "batch-online-run"
 _CLI_MERGE_REQUEST_KEYS = ("key", "users", "base", "left", "right")
 _CLI_DELTA_REQUEST_KEYS = ("users", "base", "current")
 _CLI_RUN_REQUEST_KEYS = ("users", "config", "requests", "query_ms")
 _CLI_CAPACITY_REQUEST_KEYS = ("users", "config", "requests", "query_ms")
+_CLI_BATCH_REQUEST_KEYS = ("users", "config", "batches", "query_ms")
 _CLI_USERS_MIN = 1
 _CLI_USERS_MAX = 10000
 _CLI_RUN_REQUESTS_MIN = 1
 _CLI_RUN_REQUESTS_MAX = 1000
+# batch-online-run：1..100 个批次，全部批次 items 合计不超过 1000（单项批
+# 次数与每批项数因此也自动落在 batch_online 的 1..1000 约束内）。
+_CLI_BATCH_BATCHES_MIN = 1
+_CLI_BATCH_BATCHES_MAX = 100
+_CLI_BATCH_ITEMS_MAX = _CLI_RUN_REQUESTS_MAX
+_CLI_BATCH_ITEM_KEYS = ("key", "items", "now_ms", "atomic")
 # session-run 每个会话必由 requests 建立，故会话数不超过请求数；全量查询
 # 一页（limit 上限 1000）即可取全。
 _CLI_RUN_QUERY_LIMIT = _CLI_RUN_REQUESTS_MAX
@@ -18906,6 +18922,243 @@ def _run_capacity_run(users, config, requests, query_ms):
     )
 
 
+def _check_batch_batches(batches):
+    """校验 batch-online-run 的 batches：1..100 个对象，键依次且仅为
+    key/items/now_ms/atomic；key 沿凭据约束；items 为 1..1000 个三元字符串
+    数组（依次为会话标识、用户名、口令，三串沿凭据约束、批内 sid 互异），
+    全部批次合计不超过 1000 项；now_ms 为非 bool 非负 int；atomic 为 bool。
+    返回 [(key, items_tuple, now_ms, atomic), ...]，保持批次顺序，items 与
+    每项均转为原接口要求的 tuple。batches 非 list 抛 TypeError；批次数、键集/
+    键序、项数、合计、项长度、取值或批内重复 sid 错抛 ValueError，字段类型
+    错抛 TypeError。
+    """
+    if not isinstance(batches, list):
+        raise TypeError(
+            f"batches must be an array, got {type(batches).__name__}"
+        )
+    if not (
+        _CLI_BATCH_BATCHES_MIN
+        <= len(batches)
+        <= _CLI_BATCH_BATCHES_MAX
+    ):
+        raise ValueError(
+            f"batches must contain {_CLI_BATCH_BATCHES_MIN}.."
+            f"{_CLI_BATCH_BATCHES_MAX} items, got {len(batches)}"
+        )
+    parsed = []
+    total_items = 0
+    for index, batch in enumerate(batches):
+        if not isinstance(batch, dict):
+            raise TypeError(
+                f"batches[{index}] must be an object, "
+                f"got {type(batch).__name__}"
+            )
+        if list(batch) != list(_CLI_BATCH_ITEM_KEYS):
+            raise ValueError(
+                "batches[%d] keys must be exactly and in order: "
+                "key, items, now_ms, atomic" % index
+            )
+        key = batch["key"]
+        items = batch["items"]
+        now_ms = batch["now_ms"]
+        atomic = batch["atomic"]
+        _check_credential(f"batches[{index}].key", key)
+        # 类型阶段先于取值阶段（沿 _validate_batch_online_params 次序）：
+        # items 容器、各项容器、三个串、now_ms、atomic 的类型先全部查清。
+        if isinstance(items, tuple):
+            raise ValueError(
+                f"batches[{index}].items must be an array, not a tuple"
+            )
+        if not isinstance(items, list):
+            raise TypeError(
+                f"batches[{index}].items must be an array, "
+                f"got {type(items).__name__}"
+            )
+        for item_index, item in enumerate(items):
+            if isinstance(item, tuple):
+                raise ValueError(
+                    f"batches[{index}].items[{item_index}] must be an array, "
+                    "not a tuple"
+                )
+            if not isinstance(item, list):
+                raise TypeError(
+                    f"batches[{index}].items[{item_index}] must be an array, "
+                    f"got {type(item).__name__}"
+                )
+            for field_index, field in enumerate(item):
+                if not isinstance(field, str):
+                    raise TypeError(
+                        f"batches[{index}].items[{item_index}]"
+                        f"[{field_index}] must be a string, got "
+                        f"{type(field).__name__}"
+                    )
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise TypeError(
+                f"batches[{index}].now_ms must be an int, "
+                f"got {type(now_ms).__name__}"
+            )
+        if not isinstance(atomic, bool):
+            raise TypeError(
+                f"batches[{index}].atomic must be a bool, "
+                f"got {type(atomic).__name__}"
+            )
+        # 取值阶段：项长度、三串取值、now_ms 下界、项数上下界、合计上界、
+        # 批内 sid 重复（次序沿 _validate_batch_online_params，合计校验插在
+        # 单批项数之后）。
+        for item_index, item in enumerate(items):
+            if len(item) != 3:
+                raise ValueError(
+                    f"batches[{index}].items[{item_index}] must have exactly "
+                    f"3 items, got {len(item)}"
+                )
+            _check_credential(
+                f"batches[{index}].items[{item_index}][0]", item[0]
+            )
+            _check_credential(
+                f"batches[{index}].items[{item_index}][1]", item[1]
+            )
+            _check_credential(
+                f"batches[{index}].items[{item_index}][2]", item[2]
+            )
+        if now_ms < 0:
+            raise ValueError(
+                f"batches[{index}].now_ms must be >= 0, got {now_ms}"
+            )
+        if not (1 <= len(items) <= _CLI_BATCH_ITEMS_MAX):
+            raise ValueError(
+                f"batches[{index}].items must contain 1.."
+                f"{_CLI_BATCH_ITEMS_MAX} items, got {len(items)}"
+            )
+        total_items += len(items)
+        if total_items > _CLI_BATCH_ITEMS_MAX:
+            raise ValueError(
+                f"batches must contain at most {_CLI_BATCH_ITEMS_MAX} items "
+                f"in total, got {total_items}"
+            )
+        sids = [item[0] for item in items]
+        if len(set(sids)) != len(sids):
+            raise ValueError(
+                f"batches[{index}].items must not contain duplicate sid"
+            )
+        parsed.append(
+            (key, tuple(tuple(item) for item in items), now_ms, atomic)
+        )
+    return parsed
+
+
+def _parse_cli_batch_request(raw):
+    """解析 batch-online-run 请求字节，返回 (users, config, batches, query_ms)。
+
+    raw 须为 UTF-8 编码的单个 JSON 对象，对象前不得有空白、对象后仅许
+    空白；编码、JSON、重键、顶层形态、键集或键序错抛 ValueError。users 为
+    按用户名 Unicode 码点升序且互异的 [user, password] 二元数组；config 为
+    版本 12 配置对象且含 default 池；batches 为 1..100 个批量上线请求（见
+    _check_batch_batches，全部批次合计不超过 1000 项）；query_ms 为非 bool
+    非负 int。类型错抛 TypeError，其余形态/取值/排序/重复/配置非法抛
+    ValueError。信封整体校验通过前不执行任何批次。
+    """
+    text = _decode_cli_request(raw)
+    doc = _decode_cli_object(text)
+    if list(doc) != list(_CLI_BATCH_REQUEST_KEYS):
+        raise ValueError(
+            "request keys must be exactly and in order: "
+            "users, config, batches, query_ms"
+        )
+    users = doc["users"]
+    config = doc["config"]
+    batches = doc["batches"]
+    query_ms = doc["query_ms"]
+    _check_run_users(users)
+    registered_users = {user for user, _password in users}
+    _check_run_config(config, registered_users)
+    parsed_batches = _check_batch_batches(batches)
+    _check_int("query_ms", query_ms, 0)
+    return users, config, parsed_batches, query_ms
+
+
+def _run_batch_online_run(users, config, batches, query_ms):
+    """在全新实例中注册 users、加载 v12 配置并依序执行 Sessions.batch_online。
+
+    注册与配置加载均已在输入校验阶段静态通过，此处不会失败。时间只取各批
+    自带 now_ms：业务失败（AuthError/ResourceError/StateError/KeyError/
+    BackendError，以及同 key 异参复用的 ValueError）记录异常类名后继续；
+    非原子批保留成功项，原子批任一项失败时由 batch_online 回滚该批全部新会话
+    与 IPv4/IPv6 租约，老化、认证计数、退避与幂等副作用沿用其既有语义；同
+    key 同参重放首果且不重复建立。全部结束后按 query_ms 取会话全量查询
+    （只读视图，不老化）与地址池统计（pool_stats 先老化），组装 LF 尾紧凑
+    JSON：顶层键序版本/项目/会话/地址池/摘要，版本 1；项目保持批次顺序，
+    项键序序号/结果/输出/类型，成功输出为 batch_online 返回对象，失败输出
+    为 null、类型为异常类名；摘要为前四顶层字段紧凑编码 UTF-8 字节的
+    SHA-256 小写值。
+    """
+    auth = Authenticator(1, 0)
+    for user, password in users:
+        auth.add(user, password)
+    sessions = Sessions(auth, 1, 1, 0, lease_ms=1)
+    # v12 直载：键、结构、引用、承载力与 default 池均已静态校验，必成功。
+    config_text = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    sessions.load_config(config_text)
+
+    items = []
+    for index, (key, batch_items, now_ms, atomic) in enumerate(batches):
+        try:
+            output_text = sessions.batch_online(
+                key, batch_items, now_ms, atomic
+            )
+        except (
+            AuthError,
+            ResourceError,
+            StateError,
+            KeyError,
+            BackendError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            # 业务失败统一记异常类名后继续。批次形态已在执行前静态校验，
+            # 故执行期出现的 ValueError/TypeError 只可能是幂等域冲突
+            # （同一 key 异参复用按 batch_online 既有语义抛 ValueError），
+            # 属业务结果而非输入非法；原子批的回滚由 batch_online 自身在
+            # 返回“回滚”结果时完成，不会以异常形式到达此处。
+            items.append(
+                {
+                    "序号": index,
+                    "结果": False,
+                    "输出": None,
+                    "类型": type(exc).__name__,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "序号": index,
+                    "结果": True,
+                    "输出": json.loads(output_text),
+                    "类型": "",
+                }
+            )
+
+    # 会话全量查询：所有会话均由本次批次建立，总数不超过全部批次项目数
+    # （<=1000），单页取全；只读视图，不老化、不认证、不写审计/缓存/计数。
+    sessions_view = json.loads(
+        sessions.sessions(query_ms, "", _CLI_RUN_QUERY_LIMIT)
+    )
+    # 地址池统计：pool_stats 先按 query_ms 老化一次再统计。
+    pool_view = json.loads(sessions.pool_stats(query_ms))
+
+    document = {
+        "版本": 1,
+        "项目": items,
+        "会话": sessions_view,
+        "地址池": pool_view,
+    }
+    head = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    document["摘要"] = hashlib.sha256(head.encode("utf-8")).hexdigest()
+    return (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+
+
 def _write_cli_error(command, exc):
     """向 stderr 写 LF 尾紧凑 JSON 信封，键序“错误/类型”，UTF-8 字节。"""
     envelope = json.dumps(
@@ -18918,8 +19171,8 @@ def _write_cli_error(command, exc):
 
 
 def main(argv):
-    """命令行分派：受理无额外参数的 stats-merge、stats-delta、session-run
-    与 capacity-run。
+    """命令行分派：受理无额外参数的 stats-merge、stats-delta、session-run、
+    capacity-run 与 batch-online-run。
 
     缺失或未知子命令（含多余参数）沿用 stats-merge 名写 ValueError
     信封，退出 2；其余失败信封的“错误”取实际子命令名。
@@ -18932,6 +19185,7 @@ def main(argv):
             _CLI_DELTA_COMMAND,
             _CLI_RUN_COMMAND,
             _CLI_CAPACITY_COMMAND,
+            _CLI_BATCH_COMMAND,
         )
     ):
         _write_cli_error(_CLI_MERGE_COMMAND, ValueError("missing or unknown subcommand"))
@@ -18948,9 +19202,12 @@ def main(argv):
         elif command == _CLI_RUN_COMMAND:
             users, config, requests, query_ms = _parse_cli_run_request(raw)
             result = _run_session_run(users, config, requests, query_ms)
-        else:
+        elif command == _CLI_CAPACITY_COMMAND:
             users, config, requests, query_ms = _parse_cli_capacity_request(raw)
             result = _run_capacity_run(users, config, requests, query_ms)
+        else:
+            users, config, batches, query_ms = _parse_cli_batch_request(raw)
+            result = _run_batch_online_run(users, config, batches, query_ms)
     except (TypeError, ValueError, ResourceError, StateError) as exc:
         # 失败：stdout 保持空，信封仅含命令名与异常类名。
         _write_cli_error(command, exc)
